@@ -5,17 +5,38 @@ use tokio::sync::mpsc;
 
 use crate::{
     agent::{Agent, AgentEvent, MessageRole},
+    command::{CommandEffect, execute, parse},
     provider::Provider,
+    session::SessionStore,
 };
 
-pub async fn run_prompt<P>(agent: &mut Agent<P>, prompt: String) -> Result<()>
+pub async fn run_prompt<P>(
+    agent: &mut Agent<P>,
+    prompt: String,
+    session_store: &SessionStore,
+    session_id: &mut Option<String>,
+) -> Result<()>
 where
     P: Provider,
 {
-    agent.prompt(prompt).await.map(|_| ())
+    match parse(&prompt)? {
+        Some(command) => {
+            let result = execute(command, agent, session_store, session_id).await?;
+            if result.effect == CommandEffect::ReplaceView {
+                println!("[context] {} chars", agent.context_chars());
+            }
+            println!("{}", result.message);
+            Ok(())
+        }
+        None => agent.prompt(prompt).await.map(|_| ()),
+    }
 }
 
-pub async fn run_repl<P>(agent: &mut Agent<P>) -> Result<()>
+pub async fn run_repl<P>(
+    agent: &mut Agent<P>,
+    session_store: &SessionStore,
+    session_id: &mut Option<String>,
+) -> Result<()>
 where
     P: Provider,
 {
@@ -41,8 +62,22 @@ where
             continue;
         }
 
-        if agent.prompt(input).await.is_err() {
-            continue;
+        match parse(input) {
+            Ok(Some(command)) => match execute(command, agent, session_store, session_id).await {
+                Ok(result) => {
+                    if result.effect == CommandEffect::ReplaceView {
+                        println!("[context] {} chars", agent.context_chars());
+                    }
+                    println!("{}", result.message);
+                }
+                Err(error) => eprintln!("Zex command error: {error:#}"),
+            },
+            Ok(None) => {
+                if agent.prompt(input).await.is_err() {
+                    continue;
+                }
+            }
+            Err(error) => eprintln!("Zex command error: {error:#}"),
         }
     }
 
@@ -81,6 +116,10 @@ fn print_event(event: AgentEvent) -> Result<()> {
             println!("\n[tool] {name}: {status}");
         }
         AgentEvent::Error { message } => eprintln!("\nZex error: {message}"),
+        AgentEvent::ContextCompacted { stats } => eprintln!(
+            "\n[compact] freed approximately {} chars; kept {} recent turn(s)",
+            stats.freed_chars, stats.kept_turns
+        ),
         AgentEvent::TurnCancelled => eprintln!("\nZex turn interrupted."),
         AgentEvent::TurnEnd => println!(),
     }

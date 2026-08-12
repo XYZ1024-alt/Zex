@@ -2,7 +2,7 @@
 
 Zex 是一个极简、可单二进制运行的通用 coding harness。它提供最小 Agent 循环与可观测终端界面，而不是大而全的 IDE 或实验管理平台。
 
-Zex 当前只包含 OpenAI 兼容模型接入、ReAct 循环、四个本地工具、核心事件流、ratatui TUI、headless 模式、TOML 配置和 JSONL 会话管理。它不包含 MCP、子 Agent、Plan Mode、插件市场、IDE、科研指标、实验记录、向量库、RAG 或长期记忆。
+Zex 当前只包含 OpenAI 兼容模型接入、ReAct 循环、六个开箱可用的本地工具、核心事件流、ratatui TUI、headless 模式、斜杠命令、规则式上下文 compact、TOML 配置和 JSONL 会话管理。它不包含 MCP、子 Agent、Plan Mode、权限审批流、插件市场、IDE、科研指标、实验记录、向量库、RAG 或长期记忆。
 
 ## 构建
 
@@ -30,7 +30,7 @@ Zex 按以下顺序合并配置，后者覆盖前者：
 
 可用 `ZEX_CONFIG_DIR` 覆盖整个全局目录，便于便携安装和隔离测试。
 
-会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建与更新时间；后续每行是一条 Agent 消息。会话只保存消息，不保存 API Key 或其他运行配置。
+会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建/更新时间和当前 model；后续每行是一条 Agent 消息。会话不保存 API Key、base URL 或其他敏感运行配置。旧的 format 1 会话若没有 model 字段，恢复时继续使用当前配置的 model。
 
 项目配置示例：
 
@@ -40,9 +40,11 @@ model = "gpt-4.1-mini"
 base_url = "https://api.openai.com/v1"
 openai_api = "responses"
 max_turns = 12
-bash_timeout_seconds = 60
+tool_timeout_seconds = 60
 agent_timeout_seconds = 600
 max_tool_output_chars = 32000
+max_context_chars = 120000
+compact_keep_turns = 6
 ```
 
 支持的 TOML 字段：
@@ -54,9 +56,11 @@ max_tool_output_chars = 32000
 | `base_url` | `https://api.openai.com/v1` | OpenAI 兼容 API 根地址 |
 | `openai_api` | `chat-completions` | `chat-completions` 或 `responses` |
 | `max_turns` | `12` | 单轮最大 Provider 调用次数 |
-| `bash_timeout_seconds` | `60` | 单次 `bash` 工具超时 |
+| `tool_timeout_seconds` | `60` | 所有内置工具的默认单次超时；每次调用可用 `timeout_seconds` 覆盖 |
 | `agent_timeout_seconds` | `600` | 单轮 Agent 总超时 |
-| `max_tool_output_chars` | `32000` | `read`/`bash` 返回内容上限 |
+| `max_tool_output_chars` | `32000` | 所有内置工具返回内容的统一字符上限 |
+| `max_context_chars` | `120000` | 上下文字符预算近似值；达到 85% 时自动 compact |
+| `compact_keep_turns` | `6` | compact 时完整保留的最近用户轮次数 |
 | `session_dir` | 全局 `sessions` 目录 | 自定义会话目录；相对路径基于项目工作目录 |
 
 环境变量优先级高于两个 TOML 文件。API Key 使用 `ZEX_API_KEY`，未设置或为空时再读 `OPENAI_API_KEY`；因此可把非敏感配置提交到项目配置，同时保证密钥不进入仓库。
@@ -69,9 +73,11 @@ max_tool_output_chars = 32000
 | `ZEX_BASE_URL` | `OPENAI_BASE_URL` | `base_url` |
 | `ZEX_OPENAI_API` | 无 | `openai_api` |
 | `ZEX_MAX_TURNS` | 无 | `max_turns` |
-| `ZEX_BASH_TIMEOUT_SECONDS` | 无 | `bash_timeout_seconds` |
+| `ZEX_TOOL_TIMEOUT_SECONDS` | 无 | `tool_timeout_seconds` |
 | `ZEX_AGENT_TIMEOUT_SECONDS` | 无 | `agent_timeout_seconds` |
 | `ZEX_MAX_TOOL_OUTPUT_CHARS` | 无 | `max_tool_output_chars` |
+| `ZEX_MAX_CONTEXT_CHARS` | 无 | `max_context_chars` |
+| `ZEX_COMPACT_KEEP_TURNS` | 无 | `compact_keep_turns` |
 | `ZEX_SESSION_DIR` | 无 | `session_dir` |
 
 PowerShell 示例：
@@ -154,6 +160,20 @@ tool 调用默认只显示名称、状态和单行摘要。选中后可展开格
 
 粘贴使用终端 bracketed paste，允许直接粘贴多行内容。当前 turn 运行时输入区锁定，避免草稿与执行中状态混淆；Ctrl-C 中断后，已输入的用户消息保留，未完成的 assistant/tool 状态不会进入后续 Provider 上下文。
 
+### 斜杠命令
+
+TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令解析与执行模块。命中的斜杠命令不会作为普通用户消息发给模型；未知命令返回可读错误。
+
+| 命令 | 行为 |
+| --- | --- |
+| `/help` | 在当前界面列出全部命令与简短说明 |
+| `/model` | 显示当前会话正在使用的 model |
+| `/model <name>` | 立即切换后续 Provider 请求使用的 model；保存会话时一并记录 |
+| `/clear` | 清空当前 TUI/REPL 上下文；TUI 同时清空对话视图。不删除磁盘会话，下一条普通消息创建新会话 |
+| `/sessions` | 复用 `SessionStore::list` 列出 ID、更新时间、消息数和预览 |
+| `/resume [id]` | 恢复指定会话；省略 ID 时恢复最近的非当前会话。恢复消息及该会话保存的 model |
+| `/compact` | 立即压缩旧上下文，显示压缩前后字符数、约释放字符数、保留轮次和摘要数量 |
+
 stdin 或 stdout 不是 TTY 时自动保留普通终端 REPL：
 
 ```bash
@@ -194,20 +214,34 @@ zex resume 20260812-143012-1a2b3c4d -p "继续上一轮工作并给出结论"
 zex resume -p "继续上一轮工作并给出结论"
 ```
 
-新运行在退出时创建一个 JSONL 文件；恢复已有会话时原位更新同一文件，不复制分叉会话。若命令、Provider 或工具报错，Zex 仍会保存当前消息历史，再返回错误。
+新运行在退出时创建一个 JSONL 文件；恢复已有会话时原位更新同一文件，不复制分叉会话。若 Provider 或工具报错，Zex 仍会保存当前消息历史，再返回错误；无效斜杠命令只在当前界面显示错误，不写入模型上下文。
 
 ## 内置工具
 
-工具通过统一的 `Tool` trait 注册，Agent loop 不包含工具名称分支。
+工具通过统一的 `Tool` trait 注册，Agent loop 不包含工具名称分支。六个工具全部编译进 Zex，不调用 `rg`、`fd` 或其他可选外部二进制。每个 schema 都接受可选正整数 `timeout_seconds`；未指定时使用 `tool_timeout_seconds`。Registry 对所有成功输出统一执行 `max_tool_output_chars` 截断，并给参数、超时、I/O 和执行错误补充工具名上下文。
 
 - `read`：读取 UTF-8 文件；相对路径基于启动 Zex 时的工作目录。长内容会截断。
 - `write`：创建或完整覆盖 UTF-8 文件，并自动创建父目录。
 - `edit`：在 UTF-8 文件中执行一次精确文本替换；目标缺失或出现多次时拒绝修改，避免含糊编辑。
-- `bash`：在启动工作目录中通过系统 shell 执行命令。Windows 使用 `cmd /D /S /C`，其他平台使用 `sh -c`。命令有超时，stdout/stderr 会合并为结构化文本并截断。
+- `grep`：使用 Rust `regex` + `ignore` 递归搜索 UTF-8 文件内容，返回 `path:line:content`。主要 schema：`pattern`、`path`、`case_sensitive`、`file_glob`、`hidden`、`max_results`。默认尊重 `.gitignore`、全局 gitignore 和 `.git/info/exclude`；二进制或非 UTF-8 文件跳过。
+- `glob`：使用 Rust `globset` + `ignore` 按路径 glob 查找文件或目录。主要 schema：`pattern`、`path`、`hidden`、`max_results`。无 `/` 的模式在任意深度匹配，目录结果带 `/`；默认尊重 Git ignore。
+- `bash`：仅用于其他系统命令。在启动工作目录中通过系统 shell 执行；Windows 使用 `cmd /D /S /C`，其他平台使用 `sh -c`。stdout/stderr 合并为结构化文本后执行统一截断。
+
+工具描述明确约定：搜文件内容用 `grep`；找文件或目录用 `glob`；其他系统命令才用 `bash`。
 
 ## Agent 循环
 
 每轮用户输入进入统一消息列表。Provider 返回普通文本时结束该轮；返回 tool calls 时，Zex 逐个执行已注册工具，将每个结果作为 `tool` 消息回灌，再请求模型继续。循环受到最大步数和整轮超时限制。
+
+### 上下文 compact
+
+Compact 是 core 的确定性规则，不调用外部总结模型：
+
+1. system prompt 始终完整保留。
+2. 最近 `compact_keep_turns` 个用户轮次及其 assistant/tool 消息完整保留。
+3. 更早轮次压成一条 system 摘要：用户和 assistant 文本保留首尾关键片段；旧 tool 输出优先压成工具名、首尾各 180 字符、原省略长度。
+4. 上下文字符数达到 `max_context_chars` 的 85% 时，在 TUI 和 headless 共用的 Agent core 中自动 compact；`/compact` 可随时手动触发。若保留配置轮数后仍超过预算，会逐步减少完整保留轮次，但至少保留最近 1 轮。
+5. TUI/REPL 反馈约释放字符数、compact 前后字符数、保留完整轮次、摘要旧轮次和 tool 输出数量。Compact 后的消息直接用于后续 Provider 请求和会话持久化。
 
 OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两种协议都优先请求流式响应，并兼容网关忽略 `stream` 后返回普通 JSON。Responses 模式使用扁平 function tool 定义、`function_call`/`function_call_output` 输入项，并保留 Provider 输出项以支持推理模型的连续工具调用。
 
@@ -219,6 +253,7 @@ OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两�
 - `ToolStart { call_id, name, arguments }`：工具开始；`call_id` 用于关联完成事件，参数仅由消费者决定是否展示。
 - `ToolEnd { call_id, name, output, is_error }`：工具完成、输出与失败状态。
 - `Error { message }`：Provider、超时、步数上限等轮次错误。
+- `ContextCompacted { stats }`：core 自动 compact 后的字符数、释放量和保留轮次统计。
 - `TurnCancelled`：调用方中断当前轮；核心丢弃未完成的 assistant/tool 上下文并恢复可继续输入状态。
 - `TurnEnd`：一轮正常结束。
 
@@ -236,7 +271,7 @@ TUI 不调用工具、不解析 Provider 响应，也不持有 Agent 业务状�
 
 Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令审核。模型能够通过 `write`、`edit` 和 `bash` 修改文件或运行危险命令，其权限与当前操作系统用户相同。请只在可信目录与可接受的账户权限下运行，并自行检查重要数据备份。
 
-`bash` 超时和输出截断用于限制挂起进程与上下文膨胀，不构成安全隔离。
+工具超时、输出截断与 compact 用于限制挂起执行和上下文膨胀，不构成安全隔离。
 
 ## 最小自测
 
@@ -319,11 +354,23 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 
    预期：第一条命令显示刚保存的会话 ID；第二条命令加载最近的 JSONL 会话并回答 `37`。
 
+10. 验证内置搜索：在 TUI 或非 TTY REPL 中要求模型“必须用 `grep` 搜索 `Cargo.toml` 中的 `name`，再用 `glob` 查找 `src/**/*.rs`”。预期出现两个内置 tool 事件，不调用 `rg`/`fd`，并且 `.gitignore` 中排除的路径不出现在结果里。
+
+11. 验证斜杠命令：在 TUI 中依次输入 `/help`、`/model`、`/model <另一个可用模型>`、`/sessions`。预期均只出现 INFO 行，不出现 YOU 消息；状态栏 model 在切换后更新。输入 `/resume <id>` 后视图替换成保存的会话，省略 ID 时恢复最近的非当前会话。输入 `/clear` 后对话区只保留清空反馈，磁盘会话文件仍存在。
+
+12. 验证 `/compact` 前后上下文变化：
+
+    1. 临时设置 `compact_keep_turns = 2`，进行至少 4 轮对话，其中早期一轮让模型读取一个较长文件。
+    2. 输入 `/compact`。预期 INFO 行显示类似 `freed approximately N chars (before → after); kept 2 recent turn(s)`，其中有足够旧内容时 `N > 0`。
+    3. 再询问最近两轮的信息，预期能完整回答；询问早期任务时应基于 compact 摘要回答。退出后检查会话 JSONL，可看到一条以 `[Compacted earlier conversation:` 开头的 system 消息，旧的大段 tool 输出不再完整保存。
+    4. 临时把 `max_context_chars` 调低后重复长输出，预期无需输入 `/compact` 即出现自动 compact 反馈；TUI 与非 TTY REPL 行为一致。
+
 ## 模块
 
 - `src/provider`：Provider 抽象、OpenAI 兼容 Chat Completions/Responses 与流式解析
 - `src/agent`：消息类型、事件、带最大 Provider 轮次和超时的 Agent loop
-- `src/tools`：统一 Tool trait、注册表和四个内置工具
+- `src/tools`：统一 Tool trait、注册表和六个纯 Rust/本地内置工具
+- `src/command.rs`：TUI 与 headless REPL 共用的斜杠命令解析和执行
 - `src/tui.rs`：ratatui/crossterm 可观测界面
 - `src/headless.rs`：一次性任务与无 TTY 的文本界面
 - `src/session.rs`：版本化 JSONL 会话保存、列表与恢复

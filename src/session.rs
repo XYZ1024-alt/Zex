@@ -18,6 +18,7 @@ pub struct SessionStore {
 #[derive(Debug, Clone)]
 pub struct LoadedSession {
     pub id: String,
+    pub model: Option<String>,
     pub messages: Vec<Message>,
 }
 
@@ -35,6 +36,8 @@ struct SessionHeader {
     id: String,
     created_at: String,
     updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,7 +52,12 @@ impl SessionStore {
         Self { directory }
     }
 
-    pub async fn save(&self, session_id: Option<&str>, messages: &[Message]) -> Result<String> {
+    pub async fn save(
+        &self,
+        session_id: Option<&str>,
+        model: &str,
+        messages: &[Message],
+    ) -> Result<String> {
         tokio::fs::create_dir_all(&self.directory)
             .await
             .with_context(|| {
@@ -74,6 +82,7 @@ impl SessionStore {
             id: id.clone(),
             created_at,
             updated_at: format_timestamp(now)?,
+            model: Some(model.to_owned()),
         };
         let content = serialize_session(header, messages)?;
         let temporary_path = self.directory.join(format!("{id}.jsonl.tmp"));
@@ -113,6 +122,7 @@ impl SessionStore {
         match read_session(&path).await {
             Ok((header, messages)) => Ok(Some(LoadedSession {
                 id: header.id,
+                model: header.model,
                 messages,
             })),
             Err(error)
@@ -123,6 +133,28 @@ impl SessionStore {
                 Ok(None)
             }
             Err(error) => Err(error),
+        }
+    }
+
+    pub async fn load_excluding(
+        &self,
+        session_id: Option<&str>,
+        excluded_id: Option<&str>,
+    ) -> Result<Option<LoadedSession>> {
+        match session_id {
+            Some(id) => self.load(Some(id)).await,
+            None => {
+                let id = self
+                    .list()
+                    .await?
+                    .into_iter()
+                    .find(|session| Some(session.id.as_str()) != excluded_id)
+                    .map(|session| session.id);
+                match id {
+                    Some(id) => self.load(Some(&id)).await,
+                    None => Ok(None),
+                }
+            }
         }
     }
 
@@ -180,6 +212,30 @@ impl SessionStore {
     fn path_for(&self, id: &str) -> PathBuf {
         self.directory.join(format!("{id}.jsonl"))
     }
+}
+
+pub fn format_session_summaries(sessions: &[SessionSummary]) -> Result<String> {
+    if sessions.is_empty() {
+        return Ok("No saved sessions.".to_owned());
+    }
+
+    let mut output = format!(
+        "{:<28}  {:<25}  {:>8}  Preview\n",
+        "ID", "Updated", "Messages"
+    );
+    let local_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    for session in sessions {
+        let updated_at = session
+            .updated_at
+            .to_offset(local_offset)
+            .format(&Rfc3339)
+            .context("failed to format session timestamp")?;
+        output.push_str(&format!(
+            "{:<28}  {:<25}  {:>8}  {}\n",
+            session.id, updated_at, session.message_count, session.preview
+        ));
+    }
+    Ok(output.trim_end().to_owned())
 }
 
 fn validate_session_id(id: &str) -> Result<&str> {
@@ -332,12 +388,13 @@ mod tests {
             },
         ];
 
-        let id = store.save(None, &first).await.unwrap();
+        let id = store.save(None, "model-a", &first).await.unwrap();
         let resumed = store.load(Some(&id)).await.unwrap().unwrap();
         assert_eq!(resumed.id, id);
+        assert_eq!(resumed.model.as_deref(), Some("model-a"));
         assert_eq!(resumed.messages, first);
 
-        store.save(Some(&id), &second).await.unwrap();
+        store.save(Some(&id), "model-b", &second).await.unwrap();
         let sessions = store.list().await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, id);
@@ -355,6 +412,7 @@ mod tests {
         let id = store
             .save(
                 None,
+                "model",
                 &[Message::User {
                     content: "hello".to_owned(),
                 }],
@@ -367,6 +425,66 @@ mod tests {
 
         assert!(content.contains("\"hello\""));
         assert!(!content.contains(secret));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loads_version_one_sessions_without_a_saved_model() {
+        let directory = temp_directory("legacy-model");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let id = "20260812-120000-deadbeef";
+        let content = concat!(
+            "{\"type\":\"session\",\"session\":{\"format\":1,\"id\":\"20260812-120000-deadbeef\",\"created_at\":\"2026-08-12T12:00:00Z\",\"updated_at\":\"2026-08-12T12:00:00Z\"}}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"legacy\"}}\n"
+        );
+        tokio::fs::write(directory.join(format!("{id}.jsonl")), content)
+            .await
+            .unwrap();
+        let store = SessionStore::new(directory.clone());
+
+        let loaded = store.load(Some(id)).await.unwrap().unwrap();
+
+        assert!(loaded.model.is_none());
+        assert!(matches!(
+            &loaded.messages[0],
+            Message::User { content } if content == "legacy"
+        ));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_resume_can_exclude_the_current_session() {
+        let directory = temp_directory("exclude-current");
+        let store = SessionStore::new(directory.clone());
+        let older = store
+            .save(
+                None,
+                "older-model",
+                &[Message::User {
+                    content: "older".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let current = store
+            .save(
+                None,
+                "current-model",
+                &[Message::User {
+                    content: "current".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_excluding(None, Some(&current))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded.id, older);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }

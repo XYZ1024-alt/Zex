@@ -42,3 +42,31 @@ pub enum PromptOutcome {
     Completed(AssistantMessage),
     Cancelled,
 }
+
+impl Message {
+    pub fn character_count(&self) -> usize {
+        match self {
+            Self::System { content } | Self::User { content } | Self::Tool { content, .. } => {
+                content.chars().count()
+            }
+            Self::Assistant {
+                content,
+                tool_calls,
+                provider_state,
+            } => {
+                content.chars().count()
+                    + tool_calls
+                        .iter()
+                        .map(|call| {
+                            call.id.chars().count()
+                                + call.name.chars().count()
+                                + call.arguments.chars().count()
+                        })
+                        .sum::<usize>()
+                    + provider_state
+                        .as_ref()
+                        .map_or(0, |state| state.to_string().chars().count())
+            }
+        }
+    }
+}

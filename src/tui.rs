@@ -28,7 +28,9 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     agent::{Agent, AgentEvent, Message, MessageRole, PromptOutcome},
+    command::{CommandEffect, execute, parse},
     provider::Provider,
+    session::SessionStore,
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -45,7 +47,8 @@ pub fn is_available() -> bool {
 pub async fn run<P>(
     agent: &mut Agent<P>,
     event_receiver: mpsc::UnboundedReceiver<AgentEvent>,
-    model: String,
+    session_store: &SessionStore,
+    session_id: &mut Option<String>,
 ) -> Result<()>
 where
     P: Provider,
@@ -56,7 +59,8 @@ where
         agent,
         event_receiver,
         EventStream::new(),
-        model,
+        session_store,
+        session_id,
     )
     .await;
     let restore_result = terminal.restore();
@@ -73,12 +77,13 @@ async fn run_loop<P>(
     agent: &mut Agent<P>,
     mut event_receiver: mpsc::UnboundedReceiver<AgentEvent>,
     mut terminal_events: EventStream,
-    model: String,
+    session_store: &SessionStore,
+    session_id: &mut Option<String>,
 ) -> Result<()>
 where
     P: Provider,
 {
-    let mut app = App::new(agent.messages(), model);
+    let mut app = App::new(agent.messages(), agent.model().to_owned());
     let mut redraw = tokio::time::interval(FRAME_INTERVAL);
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
@@ -108,15 +113,37 @@ where
                         InputAction::Quit => return Ok(()),
                         InputAction::Interrupt => {}
                         InputAction::Submit(prompt) => {
-                            run_turn(
-                                terminal,
-                                &mut app,
-                                agent,
-                                &mut event_receiver,
-                                &mut terminal_events,
-                                prompt,
-                            )
-                            .await?;
+                            match parse(&prompt) {
+                                Ok(Some(command)) => {
+                                    match execute(command, agent, session_store, session_id).await {
+                                        Ok(result) => {
+                                            app.model = agent.model().to_owned();
+                                            match result.effect {
+                                                CommandEffect::None => {}
+                                                CommandEffect::ClearView => app.reset_transcript(),
+                                                CommandEffect::ReplaceView => {
+                                                    app.replace_transcript(agent.messages());
+                                                }
+                                            }
+                                            app.transcript.push(TranscriptEntry::Notice(result.message));
+                                            app.scroll_to_bottom();
+                                        }
+                                        Err(error) => app.record_error(format!("{error:#}")),
+                                    }
+                                }
+                                Ok(None) => {
+                                    run_turn(
+                                        terminal,
+                                        &mut app,
+                                        agent,
+                                        &mut event_receiver,
+                                        &mut terminal_events,
+                                        prompt,
+                                    )
+                                    .await?;
+                                }
+                                Err(error) => app.record_error(format!("{error:#}")),
+                            }
                         }
                     },
                     Some(Err(error)) => return Err(error).context("failed to read terminal event"),
@@ -632,6 +659,12 @@ impl App {
                 self.record_error(message);
                 self.status = Status::Error;
             }
+            AgentEvent::ContextCompacted { stats } => {
+                self.transcript.push(TranscriptEntry::Notice(format!(
+                    "Auto-compacted context: freed approximately {} chars; kept {} recent turn(s).",
+                    stats.freed_chars, stats.kept_turns
+                )));
+            }
             AgentEvent::TurnCancelled => {
                 for entry in &mut self.transcript {
                     if let TranscriptEntry::Tool(tool) = entry
@@ -664,6 +697,20 @@ impl App {
             role,
             content: delta,
         });
+    }
+
+    fn reset_transcript(&mut self) {
+        self.transcript.clear();
+        self.active_tools.clear();
+        self.errors.clear();
+        self.selected_tool = None;
+        self.status = Status::Idle;
+        self.scroll_to_bottom();
+    }
+
+    fn replace_transcript(&mut self, messages: &[Message]) {
+        let model = self.model.clone();
+        *self = Self::new(messages, model);
     }
 
     fn find_tool_mut(&mut self, call_id: &str) -> Option<&mut ToolEntry> {
@@ -1168,7 +1215,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let vertical_scroll = metrics.cursor_row.saturating_sub(visible_rows - 1);
     let content = if app.input.is_empty() {
         Text::from(Line::from(Span::styled(
-            "Type a message…",
+            "Type a message or /help…",
             Style::default().fg(Color::DarkGray),
         )))
     } else {
@@ -1583,6 +1630,24 @@ mod tests {
     #[test]
     fn long_tool_details_are_truncated() {
         assert_eq!(truncate_chars("abcdef", 4), "abcd\n… truncated");
+    }
+
+    #[test]
+    fn slash_command_notices_render_readably_without_user_messages() {
+        let mut app = App::new(&[], "gpt-test".to_owned());
+        app.transcript.push(TranscriptEntry::Notice(
+            "/help\n/model\n/clear\n/sessions\n/resume [id]\n/compact".to_owned(),
+        ));
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+
+        assert!(screen.contains("INFO"));
+        assert!(screen.contains("/help"));
+        assert!(screen.contains("/compact"));
+        assert!(!screen.contains("YOU"));
     }
 
     #[test]

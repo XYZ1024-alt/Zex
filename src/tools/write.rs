@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -43,26 +43,36 @@ impl Tool for WriteTool {
         }
     }
 
-    fn execute(&self, arguments: Value) -> ToolFuture<'_> {
+    fn execute(&self, arguments: Value, timeout: Duration) -> ToolFuture<'_> {
         Box::pin(async move {
             let arguments: WriteArguments =
                 serde_json::from_value(arguments).context("invalid write arguments")?;
             let path = resolve_path(&self.working_dir, &arguments.path);
 
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent)
+            tokio::time::timeout(timeout, async {
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .with_context(|| format!("failed to create {}", parent.display()))?;
+                }
+                tokio::fs::write(&path, arguments.content.as_bytes())
                     .await
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
-            }
-            tokio::fs::write(&path, arguments.content.as_bytes())
-                .await
-                .with_context(|| format!("failed to write {}", path.display()))?;
+                    .with_context(|| format!("failed to write {}", path.display()))?;
 
-            Ok(format!(
-                "wrote {} bytes to {}",
-                arguments.content.len(),
-                path.display()
-            ))
+                Ok(format!(
+                    "wrote {} bytes to {}",
+                    arguments.content.len(),
+                    path.display()
+                ))
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "write exceeded its {} second timeout for {}",
+                    timeout.as_secs(),
+                    path.display()
+                )
+            })?
         })
     }
 }

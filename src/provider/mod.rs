@@ -58,6 +58,7 @@ pub struct ToolDefinition {
 pub trait Provider: Send + Sync {
     async fn complete(
         &self,
+        model: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
         events: &EventSender,

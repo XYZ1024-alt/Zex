@@ -15,7 +15,6 @@ pub struct OpenAiProvider {
     client: Client,
     api_key: String,
     endpoint: String,
-    model: String,
     api: OpenAiApi,
 }
 
@@ -23,7 +22,6 @@ impl OpenAiProvider {
     pub fn new(
         base_url: &str,
         api_key: String,
-        model: String,
         api: OpenAiApi,
         request_timeout: Duration,
     ) -> Result<Self> {
@@ -37,24 +35,20 @@ impl OpenAiProvider {
             client,
             api_key,
             endpoint,
-            model,
             api,
         })
     }
 
     async fn send_request(
         &self,
+        model: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<reqwest::Response> {
         let request = self.client.post(&self.endpoint).bearer_auth(&self.api_key);
         let response = match self.api {
-            OpenAiApi::ChatCompletions => {
-                request.json(&ChatRequest::new(&self.model, messages, tools))
-            }
-            OpenAiApi::Responses => {
-                request.json(&ResponsesRequest::new(&self.model, messages, tools))
-            }
+            OpenAiApi::ChatCompletions => request.json(&ChatRequest::new(model, messages, tools)),
+            OpenAiApi::Responses => request.json(&ResponsesRequest::new(model, messages, tools)),
         }
         .send()
         .await
@@ -76,11 +70,12 @@ impl OpenAiProvider {
 impl Provider for OpenAiProvider {
     async fn complete(
         &self,
+        model: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
         events: &EventSender,
     ) -> Result<AssistantMessage> {
-        let response = self.send_request(messages, tools).await?;
+        let response = self.send_request(model, messages, tools).await?;
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -6,20 +6,16 @@ use serde_json::{Value, json};
 
 use crate::{
     provider::ToolDefinition,
-    tools::{Tool, ToolFuture, resolve_path, truncate_output},
+    tools::{Tool, ToolFuture, resolve_path},
 };
 
 pub struct ReadTool {
     working_dir: PathBuf,
-    max_output_chars: usize,
 }
 
 impl ReadTool {
-    pub fn new(working_dir: PathBuf, max_output_chars: usize) -> Self {
-        Self {
-            working_dir,
-            max_output_chars,
-        }
+    pub fn new(working_dir: PathBuf) -> Self {
+        Self { working_dir }
     }
 }
 
@@ -43,15 +39,21 @@ impl Tool for ReadTool {
         }
     }
 
-    fn execute(&self, arguments: Value) -> ToolFuture<'_> {
+    fn execute(&self, arguments: Value, _timeout: Duration) -> ToolFuture<'_> {
         Box::pin(async move {
             let arguments: ReadArguments =
                 serde_json::from_value(arguments).context("invalid read arguments")?;
             let path = resolve_path(&self.working_dir, &arguments.path);
-            let content = tokio::fs::read_to_string(&path)
+            tokio::time::timeout(_timeout, tokio::fs::read_to_string(&path))
                 .await
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            Ok(truncate_output(content, self.max_output_chars))
+                .with_context(|| {
+                    format!(
+                        "read exceeded its {} second timeout for {}",
+                        _timeout.as_secs(),
+                        path.display()
+                    )
+                })?
+                .with_context(|| format!("failed to read {}", path.display()))
         })
     }
 }

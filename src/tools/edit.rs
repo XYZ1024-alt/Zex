@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
@@ -48,7 +48,7 @@ impl Tool for EditTool {
         }
     }
 
-    fn execute(&self, arguments: Value) -> ToolFuture<'_> {
+    fn execute(&self, arguments: Value, timeout: Duration) -> ToolFuture<'_> {
         Box::pin(async move {
             let arguments: EditArguments =
                 serde_json::from_value(arguments).context("invalid edit arguments")?;
@@ -57,25 +57,35 @@ impl Tool for EditTool {
             }
 
             let path = resolve_path(&self.working_dir, &arguments.path);
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            let match_count = content.matches(&arguments.old_text).count();
+            tokio::time::timeout(timeout, async {
+                let content = tokio::fs::read_to_string(&path)
+                    .await
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                let match_count = content.matches(&arguments.old_text).count();
 
-            match match_count {
-                0 => bail!("old_text was not found in {}", path.display()),
-                1 => {}
-                count => bail!(
-                    "old_text occurs {count} times in {}; make the edit more specific",
+                match match_count {
+                    0 => bail!("old_text was not found in {}", path.display()),
+                    1 => {}
+                    count => bail!(
+                        "old_text occurs {count} times in {}; make the edit more specific",
+                        path.display()
+                    ),
+                }
+
+                let edited = content.replacen(&arguments.old_text, &arguments.new_text, 1);
+                tokio::fs::write(&path, edited.as_bytes())
+                    .await
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                Ok(format!("edited {}", path.display()))
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "edit exceeded its {} second timeout for {}",
+                    timeout.as_secs(),
                     path.display()
-                ),
-            }
-
-            let edited = content.replacen(&arguments.old_text, &arguments.new_text, 1);
-            tokio::fs::write(&path, edited.as_bytes())
-                .await
-                .with_context(|| format!("failed to write {}", path.display()))?;
-            Ok(format!("edited {}", path.display()))
+                )
+            })?
         })
     }
 }

@@ -10,22 +10,16 @@ use tokio::{
 
 use crate::{
     provider::ToolDefinition,
-    tools::{Tool, ToolFuture, truncate_output},
+    tools::{Tool, ToolFuture},
 };
 
 pub struct BashTool {
     working_dir: PathBuf,
-    timeout: Duration,
-    max_output_chars: usize,
 }
 
 impl BashTool {
-    pub fn new(working_dir: PathBuf, timeout: Duration, max_output_chars: usize) -> Self {
-        Self {
-            working_dir,
-            timeout,
-            max_output_chars,
-        }
+    pub fn new(working_dir: PathBuf) -> Self {
+        Self { working_dir }
     }
 }
 
@@ -33,10 +27,7 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".to_owned(),
-            description: format!(
-                "Run a shell command in the working directory. The command times out after {} seconds.",
-                self.timeout.as_secs()
-            ),
+            description: "Run other system commands in the working directory. Use grep to search file contents and glob to find files instead of shell search commands.".to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -51,7 +42,7 @@ impl Tool for BashTool {
         }
     }
 
-    fn execute(&self, arguments: Value) -> ToolFuture<'_> {
+    fn execute(&self, arguments: Value, timeout: Duration) -> ToolFuture<'_> {
         Box::pin(async move {
             let arguments: BashArguments =
                 serde_json::from_value(arguments).context("invalid bash arguments")?;
@@ -73,14 +64,14 @@ impl Tool for BashTool {
             let stdout_reader = tokio::spawn(read_output(stdout));
             let stderr_reader = tokio::spawn(read_output(stderr));
 
-            let status = match tokio::time::timeout(self.timeout, child.wait()).await {
+            let status = match tokio::time::timeout(timeout, child.wait()).await {
                 Ok(status) => status.context("failed to wait for shell command")?,
                 Err(_) => {
                     terminate_process_tree(&mut child, process_id).await;
                     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
                     bail!(
                         "shell command exceeded its {} second timeout",
-                        self.timeout.as_secs()
+                        timeout.as_secs()
                     );
                 }
             };
@@ -104,7 +95,7 @@ impl Tool for BashTool {
                 stdout,
                 stderr
             );
-            Ok(truncate_output(result, self.max_output_chars))
+            Ok(result)
         })
     }
 }

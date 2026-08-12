@@ -11,10 +11,12 @@ use serde::Deserialize;
 use crate::provider::OpenAiApi;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_BASH_TIMEOUT_SECONDS: u64 = 60;
+const DEFAULT_TOOL_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_AGENT_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_MAX_TURNS: usize = 12;
 const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 32_000;
+const DEFAULT_MAX_CONTEXT_CHARS: usize = 120_000;
+const DEFAULT_COMPACT_KEEP_TURNS: usize = 6;
 const PROJECT_CONFIG_PATH: &str = ".zex/config.toml";
 
 #[derive(Debug, Clone)]
@@ -24,10 +26,12 @@ pub struct Config {
     pub model: String,
     pub openai_api: OpenAiApi,
     pub working_dir: PathBuf,
-    pub bash_timeout: Duration,
+    pub tool_timeout: Duration,
     pub agent_timeout: Duration,
     pub max_turns: usize,
     pub max_tool_output_chars: usize,
+    pub max_context_chars: usize,
+    pub compact_keep_turns: usize,
 }
 
 impl Config {
@@ -73,12 +77,12 @@ impl Config {
             model,
             openai_api,
             working_dir: working_dir.to_path_buf(),
-            bash_timeout: Duration::from_secs(positive_u64(
-                "bash_timeout_seconds",
+            tool_timeout: Duration::from_secs(positive_u64(
+                "tool_timeout_seconds",
                 env_or_file(
-                    "ZEX_BASH_TIMEOUT_SECONDS",
-                    file.bash_timeout_seconds,
-                    DEFAULT_BASH_TIMEOUT_SECONDS,
+                    "ZEX_TOOL_TIMEOUT_SECONDS",
+                    file.tool_timeout_seconds,
+                    DEFAULT_TOOL_TIMEOUT_SECONDS,
                 )?,
             )?),
             agent_timeout: Duration::from_secs(positive_u64(
@@ -99,6 +103,22 @@ impl Config {
                     "ZEX_MAX_TOOL_OUTPUT_CHARS",
                     file.max_tool_output_chars,
                     DEFAULT_MAX_TOOL_OUTPUT_CHARS,
+                )?,
+            )?,
+            max_context_chars: positive(
+                "max_context_chars",
+                env_or_file(
+                    "ZEX_MAX_CONTEXT_CHARS",
+                    file.max_context_chars,
+                    DEFAULT_MAX_CONTEXT_CHARS,
+                )?,
+            )?,
+            compact_keep_turns: positive(
+                "compact_keep_turns",
+                env_or_file(
+                    "ZEX_COMPACT_KEEP_TURNS",
+                    file.compact_keep_turns,
+                    DEFAULT_COMPACT_KEEP_TURNS,
                 )?,
             )?,
         })
@@ -123,9 +143,11 @@ struct FileConfig {
     base_url: Option<String>,
     openai_api: Option<OpenAiApi>,
     max_turns: Option<usize>,
-    bash_timeout_seconds: Option<u64>,
+    tool_timeout_seconds: Option<u64>,
     agent_timeout_seconds: Option<u64>,
     max_tool_output_chars: Option<usize>,
+    max_context_chars: Option<usize>,
+    compact_keep_turns: Option<usize>,
     session_dir: Option<String>,
 }
 
@@ -137,9 +159,11 @@ impl FileConfig {
             base_url: project.base_url.or(self.base_url),
             openai_api: project.openai_api.or(self.openai_api),
             max_turns: project.max_turns.or(self.max_turns),
-            bash_timeout_seconds: project.bash_timeout_seconds.or(self.bash_timeout_seconds),
+            tool_timeout_seconds: project.tool_timeout_seconds.or(self.tool_timeout_seconds),
             agent_timeout_seconds: project.agent_timeout_seconds.or(self.agent_timeout_seconds),
             max_tool_output_chars: project.max_tool_output_chars.or(self.max_tool_output_chars),
+            max_context_chars: project.max_context_chars.or(self.max_context_chars),
+            compact_keep_turns: project.compact_keep_turns.or(self.compact_keep_turns),
             session_dir: project.session_dir.or(self.session_dir),
         }
     }
@@ -281,9 +305,11 @@ mod tests {
         "OPENAI_BASE_URL",
         "ZEX_OPENAI_API",
         "ZEX_MAX_TURNS",
-        "ZEX_BASH_TIMEOUT_SECONDS",
+        "ZEX_TOOL_TIMEOUT_SECONDS",
         "ZEX_AGENT_TIMEOUT_SECONDS",
         "ZEX_MAX_TOOL_OUTPUT_CHARS",
+        "ZEX_MAX_CONTEXT_CHARS",
+        "ZEX_COMPACT_KEEP_TURNS",
         "ZEX_SESSION_DIR",
     ];
 

@@ -9,15 +9,39 @@ use crate::{
     tools::ToolRegistry,
 };
 
-const SYSTEM_PROMPT: &str = "You are Zex, a minimal AI agent core. Be concise and accurate. Use the available tools when they are needed, then use their results to finish the task.";
+const SYSTEM_PROMPT: &str = "You are Zex, a minimal AI agent core. Be concise and accurate. Use grep to search file contents, glob to find files, and bash only for other system commands. Use read, write, and edit for file operations. Use tool results to finish the task.";
+const AUTO_COMPACT_PERCENT: usize = 85;
+const SUMMARY_ITEM_CHARS: usize = 480;
+const TOOL_SUMMARY_EDGE_CHARS: usize = 180;
 
 pub struct Agent<P> {
     provider: P,
     tools: ToolRegistry,
+    model: String,
     messages: Vec<Message>,
     events: EventSender,
     turn_timeout: Duration,
     max_turns: usize,
+    max_context_chars: usize,
+    compact_keep_turns: usize,
+}
+
+pub struct AgentOptions {
+    pub model: String,
+    pub turn_timeout: Duration,
+    pub max_turns: usize,
+    pub max_context_chars: usize,
+    pub compact_keep_turns: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactStats {
+    pub before_chars: usize,
+    pub after_chars: usize,
+    pub freed_chars: usize,
+    pub kept_turns: usize,
+    pub summarized_turns: usize,
+    pub summarized_tool_outputs: usize,
 }
 
 impl<P> Agent<P>
@@ -28,28 +52,58 @@ where
         provider: P,
         tools: ToolRegistry,
         events: EventSender,
-        turn_timeout: Duration,
-        max_turns: usize,
+        options: AgentOptions,
         messages: Option<Vec<Message>>,
     ) -> Self {
         Self {
             provider,
             tools,
-            messages: messages
-                .filter(|messages| !messages.is_empty())
-                .unwrap_or_else(|| {
-                    vec![Message::System {
-                        content: SYSTEM_PROMPT.to_owned(),
-                    }]
-                }),
+            model: options.model,
+            messages: normalize_messages(messages.unwrap_or_default()),
             events,
-            turn_timeout,
-            max_turns,
+            turn_timeout: options.turn_timeout,
+            max_turns: options.max_turns,
+            max_context_chars: options.max_context_chars,
+            compact_keep_turns: options.compact_keep_turns,
         }
     }
 
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn set_model(&mut self, model: String) {
+        self.model = model;
+    }
+
+    pub fn clear(&mut self) {
+        self.messages = fresh_messages();
+    }
+
+    pub fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.messages = normalize_messages(messages);
+        self.compact_if_needed();
+    }
+
+    pub fn context_chars(&self) -> usize {
+        context_chars(&self.messages)
+    }
+
+    pub fn compact(&mut self) -> CompactStats {
+        let mut stats = compact_messages(&mut self.messages, self.compact_keep_turns);
+        while stats.after_chars > self.max_context_chars && stats.kept_turns > 1 {
+            let next = compact_messages(&mut self.messages, stats.kept_turns - 1);
+            stats.after_chars = next.after_chars;
+            stats.freed_chars = stats.before_chars.saturating_sub(next.after_chars);
+            stats.kept_turns = next.kept_turns;
+            stats.summarized_turns += 1;
+            stats.summarized_tool_outputs += next.summarized_tool_outputs;
+        }
+        stats
     }
 
     pub fn has_conversation(&self) -> bool {
@@ -93,6 +147,7 @@ where
     where
         F: Future<Output = ()>,
     {
+        self.compact_if_needed();
         let checkpoint = self.messages.len();
         let prompt = prompt.into();
         self.messages.push(Message::User {
@@ -117,18 +172,18 @@ where
 
         match resolution {
             None => {
-                self.messages.truncate(checkpoint + 1);
+                retain_user_prompt(&mut self.messages, checkpoint);
                 let _ = self.events.send(AgentEvent::TurnCancelled);
                 Ok(PromptOutcome::Cancelled)
             }
             Some(result) => match result {
                 Ok(Ok(message)) => Ok(PromptOutcome::Completed(message)),
                 Ok(Err(error)) => {
-                    self.messages.truncate(checkpoint + 1);
+                    retain_user_prompt(&mut self.messages, checkpoint);
                     Err(error)
                 }
                 Err(_) => {
-                    self.messages.truncate(checkpoint + 1);
+                    retain_user_prompt(&mut self.messages, checkpoint);
                     let message = format!(
                         "agent turn exceeded its {} second timeout",
                         self.turn_timeout.as_secs()
@@ -147,9 +202,10 @@ where
         let definitions = self.tools.definitions();
 
         for _ in 0..self.max_turns {
+            self.compact_if_needed();
             let assistant = match self
                 .provider
-                .complete(&self.messages, &definitions, &self.events)
+                .complete(&self.model, &self.messages, &definitions, &self.events)
                 .await
             {
                 Ok(assistant) => assistant,
@@ -201,6 +257,7 @@ where
                     tool_call_id: call_id,
                     content,
                 });
+                self.compact_if_needed();
             }
         }
 
@@ -213,6 +270,215 @@ where
         });
         bail!(message)
     }
+
+    fn compact_if_needed(&mut self) -> Option<CompactStats> {
+        let threshold = self.max_context_chars.saturating_mul(AUTO_COMPACT_PERCENT) / 100;
+        if self.context_chars() < threshold {
+            return None;
+        }
+        let stats = self.compact();
+        if stats.freed_chars > 0 {
+            let _ = self.events.send(AgentEvent::ContextCompacted {
+                stats: stats.clone(),
+            });
+        }
+        Some(stats)
+    }
+}
+
+fn retain_user_prompt(messages: &mut Vec<Message>, checkpoint: usize) {
+    let user_prompt = messages.get(checkpoint).cloned();
+    messages.truncate(checkpoint);
+    if let Some(user_prompt) = user_prompt {
+        messages.push(user_prompt);
+    }
+}
+
+fn fresh_messages() -> Vec<Message> {
+    vec![Message::System {
+        content: SYSTEM_PROMPT.to_owned(),
+    }]
+}
+
+fn normalize_messages(messages: Vec<Message>) -> Vec<Message> {
+    if messages.is_empty() {
+        return fresh_messages();
+    }
+    if matches!(messages.first(), Some(Message::System { .. })) {
+        messages
+    } else {
+        let mut normalized = fresh_messages();
+        normalized.extend(messages);
+        normalized
+    }
+}
+
+fn context_chars(messages: &[Message]) -> usize {
+    messages.iter().map(Message::character_count).sum()
+}
+
+fn compact_messages(messages: &mut Vec<Message>, keep_turns: usize) -> CompactStats {
+    let before_chars = context_chars(messages);
+    let user_indices = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| matches!(message, Message::User { .. }).then_some(index))
+        .collect::<Vec<_>>();
+    let existing_summary = matches!(
+        messages.get(1),
+        Some(Message::System { content })
+            if content.starts_with("[Compacted earlier conversation:")
+    );
+    let kept_turns = user_indices.len().min(keep_turns);
+    let summarized_turns = user_indices.len().saturating_sub(kept_turns);
+    if summarized_turns == 0 {
+        return CompactStats {
+            before_chars,
+            after_chars: before_chars,
+            freed_chars: 0,
+            kept_turns,
+            summarized_turns: 0,
+            summarized_tool_outputs: 0,
+        };
+    }
+
+    let keep_start = user_indices[summarized_turns];
+    let mut tool_names = std::collections::HashMap::new();
+    let mut summary_lines = Vec::new();
+    if existing_summary && let Message::System { content } = &messages[1] {
+        let prior_body = content
+            .split_once('\n')
+            .map(|(_, body)| body)
+            .unwrap_or(content);
+        summary_lines.push(prior_body.to_owned());
+    }
+    let mut summarized_tool_outputs = 0usize;
+    for message in &messages[1..keep_start] {
+        match message {
+            Message::System { content }
+                if !content.starts_with("[Compacted earlier conversation:") =>
+            {
+                summary_lines.push(format!("Prior context: {}", summarize_text(content)));
+            }
+            Message::System { .. } => {}
+            Message::User { content } => {
+                summary_lines.push(format!("User: {}", summarize_text(content)));
+            }
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                if !content.trim().is_empty() {
+                    summary_lines.push(format!("Assistant: {}", summarize_text(content)));
+                }
+                for call in tool_calls {
+                    tool_names.insert(call.id.clone(), call.name.clone());
+                    summary_lines.push(format!(
+                        "Tool call {}: {}",
+                        call.name,
+                        summarize_text(&call.arguments)
+                    ));
+                }
+            }
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                summarized_tool_outputs += 1;
+                summary_lines.push(format!(
+                    "Tool result {}: {}",
+                    tool_names
+                        .get(tool_call_id)
+                        .map(String::as_str)
+                        .unwrap_or("unknown"),
+                    summarize_tool_output(content)
+                ));
+            }
+        }
+    }
+
+    let total_summarized_turns = prior_summary_turns(messages).saturating_add(summarized_turns);
+    let summary = Message::System {
+        content: format!(
+            "[Compacted earlier conversation: {} turn(s)]\n{}",
+            total_summarized_turns,
+            summary_lines.join("\n")
+        ),
+    };
+    let mut compacted = Vec::with_capacity(messages.len() - keep_start + 2);
+    compacted.push(messages[0].clone());
+    compacted.push(summary);
+    compacted.extend(messages[keep_start..].iter().cloned());
+    *messages = compacted;
+
+    let after_chars = context_chars(messages);
+    CompactStats {
+        before_chars,
+        after_chars,
+        freed_chars: before_chars.saturating_sub(after_chars),
+        kept_turns,
+        summarized_turns,
+        summarized_tool_outputs,
+    }
+}
+
+fn prior_summary_turns(messages: &[Message]) -> usize {
+    let Some(Message::System { content }) = messages.get(1) else {
+        return 0;
+    };
+    content
+        .strip_prefix("[Compacted earlier conversation: ")
+        .and_then(|content| content.split_once(" turn(s)]"))
+        .and_then(|(turns, _)| turns.parse().ok())
+        .unwrap_or(0)
+}
+
+fn summarize_text(content: &str) -> String {
+    truncate_middle(&content.replace(['\r', '\n'], " "), SUMMARY_ITEM_CHARS)
+}
+
+fn summarize_tool_output(content: &str) -> String {
+    let count = content.chars().count();
+    if count <= TOOL_SUMMARY_EDGE_CHARS * 2 {
+        return content.replace(['\r', '\n'], " ");
+    }
+    let head = content
+        .chars()
+        .take(TOOL_SUMMARY_EDGE_CHARS)
+        .collect::<String>();
+    let tail = content
+        .chars()
+        .rev()
+        .take(TOOL_SUMMARY_EDGE_CHARS)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!(
+        "{} … [{} chars omitted] … {}",
+        head.replace(['\r', '\n'], " "),
+        count.saturating_sub(TOOL_SUMMARY_EDGE_CHARS * 2),
+        tail.replace(['\r', '\n'], " ")
+    )
+}
+
+fn truncate_middle(content: &str, max_chars: usize) -> String {
+    let count = content.chars().count();
+    if count <= max_chars {
+        return content.to_owned();
+    }
+    let edge = max_chars / 2;
+    let head = content.chars().take(edge).collect::<String>();
+    let tail = content
+        .chars()
+        .rev()
+        .take(edge)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{head} … {tail}")
 }
 
 #[cfg(test)]
@@ -229,7 +495,7 @@ mod tests {
         tools::{Tool, ToolFuture, ToolRegistry},
     };
 
-    use super::Agent;
+    use super::{AUTO_COMPACT_PERCENT, Agent, AgentOptions};
 
     struct SequenceProvider {
         messages: Mutex<VecDeque<AssistantMessage>>,
@@ -238,6 +504,7 @@ mod tests {
     impl Provider for SequenceProvider {
         async fn complete(
             &self,
+            _model: &str,
             _messages: &[crate::agent::Message],
             _tools: &[ToolDefinition],
             events: &crate::agent::EventSender,
@@ -263,6 +530,7 @@ mod tests {
     impl Provider for FailingProvider {
         async fn complete(
             &self,
+            _model: &str,
             _messages: &[crate::agent::Message],
             _tools: &[ToolDefinition],
             _events: &crate::agent::EventSender,
@@ -276,6 +544,7 @@ mod tests {
     impl Provider for PendingProvider {
         async fn complete(
             &self,
+            _model: &str,
             _messages: &[crate::agent::Message],
             _tools: &[ToolDefinition],
             _events: &crate::agent::EventSender,
@@ -292,10 +561,15 @@ mod tests {
         let (events, _) = mpsc::unbounded_channel();
         let agent = Agent::new(
             provider,
-            ToolRegistry::new(),
+            ToolRegistry::new(Duration::from_secs(1), 32_000),
             events,
-            Duration::from_secs(1),
-            1,
+            AgentOptions {
+                model: "test-model".to_owned(),
+                turn_timeout: Duration::from_secs(1),
+                max_turns: 1,
+                max_context_chars: 120_000,
+                compact_keep_turns: 6,
+            },
             None,
         );
 
@@ -319,7 +593,7 @@ mod tests {
             }
         }
 
-        fn execute(&self, arguments: Value) -> ToolFuture<'_> {
+        fn execute(&self, arguments: Value, _timeout: Duration) -> ToolFuture<'_> {
             Box::pin(async move {
                 Ok(arguments
                     .get("value")
@@ -350,10 +624,22 @@ mod tests {
                 },
             ])),
         };
-        let mut tools = ToolRegistry::new();
+        let mut tools = ToolRegistry::new(Duration::from_secs(1), 32_000);
         tools.register(EchoTool);
         let (events, mut receiver) = mpsc::unbounded_channel();
-        let mut agent = Agent::new(provider, tools, events, Duration::from_secs(1), 3, None);
+        let mut agent = Agent::new(
+            provider,
+            tools,
+            events,
+            AgentOptions {
+                model: "test-model".to_owned(),
+                turn_timeout: Duration::from_secs(1),
+                max_turns: 3,
+                max_context_chars: 120_000,
+                compact_keep_turns: 6,
+            },
+            None,
+        );
 
         agent.prompt("inspect").await.unwrap();
 
@@ -396,10 +682,15 @@ mod tests {
         let (events, mut receiver) = mpsc::unbounded_channel();
         let mut agent = Agent::new(
             FailingProvider,
-            ToolRegistry::new(),
+            ToolRegistry::new(Duration::from_secs(1), 32_000),
             events,
-            Duration::from_secs(1),
-            1,
+            AgentOptions {
+                model: "test-model".to_owned(),
+                turn_timeout: Duration::from_secs(1),
+                max_turns: 1,
+                max_context_chars: 120_000,
+                compact_keep_turns: 6,
+            },
             None,
         );
 
@@ -426,10 +717,15 @@ mod tests {
         let (events, mut receiver) = mpsc::unbounded_channel();
         let mut agent = Agent::new(
             PendingProvider,
-            ToolRegistry::new(),
+            ToolRegistry::new(Duration::from_secs(1), 32_000),
             events,
-            Duration::from_secs(60),
-            1,
+            AgentOptions {
+                model: "test-model".to_owned(),
+                turn_timeout: Duration::from_secs(60),
+                max_turns: 1,
+                max_context_chars: 120_000,
+                compact_keep_turns: 6,
+            },
             None,
         );
         let (cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
@@ -459,5 +755,130 @@ mod tests {
             }
         );
         assert_eq!(receiver.try_recv().unwrap(), AgentEvent::TurnCancelled);
+    }
+
+    #[test]
+    fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
+        let provider = SequenceProvider {
+            messages: Mutex::new(VecDeque::new()),
+        };
+        let (events, _) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::new(Duration::from_secs(1), 32_000),
+            events,
+            AgentOptions {
+                model: "test-model".to_owned(),
+                turn_timeout: Duration::from_secs(1),
+                max_turns: 1,
+                max_context_chars: 120_000,
+                compact_keep_turns: 2,
+            },
+            Some(vec![
+                crate::agent::Message::User {
+                    content: "old task".to_owned(),
+                },
+                crate::agent::Message::Assistant {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "old-call".to_owned(),
+                        name: "read".to_owned(),
+                        arguments: r#"{"path":"large.txt"}"#.to_owned(),
+                    }],
+                    provider_state: None,
+                },
+                crate::agent::Message::Tool {
+                    tool_call_id: "old-call".to_owned(),
+                    content: "x".repeat(4_000),
+                },
+                crate::agent::Message::User {
+                    content: "recent one".to_owned(),
+                },
+                crate::agent::Message::Assistant {
+                    content: "answer one".to_owned(),
+                    tool_calls: Vec::new(),
+                    provider_state: None,
+                },
+                crate::agent::Message::User {
+                    content: "recent two".to_owned(),
+                },
+                crate::agent::Message::Assistant {
+                    content: "answer two".to_owned(),
+                    tool_calls: Vec::new(),
+                    provider_state: None,
+                },
+            ]),
+        );
+
+        let before = agent.context_chars();
+        let stats = agent.compact();
+
+        assert_eq!(stats.kept_turns, 2);
+        assert_eq!(stats.summarized_turns, 1);
+        assert_eq!(stats.summarized_tool_outputs, 1);
+        assert!(stats.freed_chars > 3_000);
+        assert!(agent.context_chars() < before);
+        println!(
+            "compact verification: before={} after={} freed={} kept={} summarized_turns={} summarized_tools={}",
+            stats.before_chars,
+            stats.after_chars,
+            stats.freed_chars,
+            stats.kept_turns,
+            stats.summarized_turns,
+            stats.summarized_tool_outputs
+        );
+        assert!(matches!(
+            &agent.messages()[1],
+            crate::agent::Message::System { content }
+                if content.contains("Compacted earlier conversation")
+                    && content.contains("Tool result read")
+        ));
+        assert!(agent.messages().iter().any(
+            |message| matches!(message, crate::agent::Message::User { content } if content == "recent one")
+        ));
+        assert!(agent.messages().iter().any(
+            |message| matches!(message, crate::agent::Message::User { content } if content == "recent two")
+        ));
+    }
+
+    #[test]
+    fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
+        let provider = SequenceProvider {
+            messages: Mutex::new(VecDeque::new()),
+        };
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::new(Duration::from_secs(1), 32_000),
+            events,
+            AgentOptions {
+                model: "test-model".to_owned(),
+                turn_timeout: Duration::from_secs(1),
+                max_turns: 1,
+                max_context_chars: 1_000,
+                compact_keep_turns: 1,
+            },
+            Some(vec![
+                crate::agent::Message::User {
+                    content: "old".repeat(AUTO_COMPACT_PERCENT * 5),
+                },
+                crate::agent::Message::Assistant {
+                    content: "old answer".to_owned(),
+                    tool_calls: Vec::new(),
+                    provider_state: None,
+                },
+                crate::agent::Message::User {
+                    content: "recent".to_owned(),
+                },
+            ]),
+        );
+
+        let stats = agent.compact_if_needed().expect("context should compact");
+
+        assert!(stats.freed_chars > 0);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::ContextCompacted { stats: emitted } if emitted == stats
+        ));
     }
 }

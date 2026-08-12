@@ -1,5 +1,7 @@
 use tokio::sync::mpsc;
 
+use crate::agent::CompactStats;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRole {
     User,
@@ -25,6 +27,9 @@ pub enum AgentEvent {
     },
     Error {
         message: String,
+    },
+    ContextCompacted {
+        stats: CompactStats,
     },
     TurnCancelled,
     TurnEnd,
