@@ -67,6 +67,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Show, set, or cycle thinking level",
         accepts_arguments: true,
     },
+    CommandSpec {
+        name: "/thinking",
+        usage: "/thinking [show|hide]",
+        description: "Show or set thinking-card visibility",
+        accepts_arguments: true,
+    },
 ];
 
 pub fn command_specs() -> &'static [CommandSpec] {
@@ -82,6 +88,7 @@ pub enum SlashCommand {
     Resume(Option<String>),
     Compact,
     Think(Option<ThinkingLevel>),
+    Thinking(Option<bool>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,11 +132,22 @@ pub fn parse(input: &str) -> Result<Option<SlashCommand>> {
         "/think" if arguments.len() <= 1 => {
             SlashCommand::Think(arguments.first().map(|value| value.parse()).transpose()?)
         }
+        "/thinking" if arguments.len() <= 1 => SlashCommand::Thinking(
+            arguments
+                .first()
+                .map(|value| match value.to_ascii_lowercase().as_str() {
+                    "show" | "on" => Ok(true),
+                    "hide" | "off" => Ok(false),
+                    _ => bail!("/thinking expects show or hide"),
+                })
+                .transpose()?,
+        ),
         "/help" | "/clear" | "/new" | "/sessions" | "/compact" => {
             bail!("{name} does not accept arguments")
         }
         "/resume" => bail!("/resume accepts at most one session ID"),
         "/think" => bail!("/think accepts at most one level"),
+        "/thinking" => bail!("/thinking accepts at most one value"),
         _ => bail!("unknown slash command {name:?}; use /help"),
     };
     Ok(Some(command))
@@ -247,6 +265,9 @@ where
                 effect: CommandEffect::None,
             })
         }
+        SlashCommand::Thinking(_) => {
+            unreachable!("thinking visibility is handled by the TUI")
+        }
     }
 }
 
@@ -288,6 +309,7 @@ mod execution_tests {
                 .pop_front()
                 .unwrap_or(AssistantMessage {
                     content: String::new(),
+                    thinking: None,
                     tool_calls: Vec::new(),
                     provider_state: None,
                 }))
@@ -606,6 +628,7 @@ mod execution_tests {
             },
             Message::Assistant {
                 content: String::new(),
+                thinking: None,
                 tool_calls: vec![crate::agent::ToolCall {
                     id: "call".to_owned(),
                     name: "read".to_owned(),
@@ -714,10 +737,24 @@ mod tests {
             parse("/think high").unwrap(),
             Some(SlashCommand::Think(Some(ThinkingLevel::High)))
         );
+        assert_eq!(
+            parse("/thinking hide").unwrap(),
+            Some(SlashCommand::Thinking(Some(false)))
+        );
+        assert_eq!(
+            parse("/thinking").unwrap(),
+            Some(SlashCommand::Thinking(None))
+        );
+        assert!(parse("/thinking maybe").is_err());
         assert!(
             command_specs()
                 .iter()
                 .any(|command| command.name == "/think")
+        );
+        assert!(
+            command_specs()
+                .iter()
+                .any(|command| command.name == "/thinking")
         );
         assert_eq!(command_specs(), COMMANDS);
         assert_eq!(

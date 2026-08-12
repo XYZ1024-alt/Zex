@@ -33,6 +33,7 @@ pub struct Config {
     pub max_context_chars: usize,
     pub compact_keep_turns: usize,
     pub thinking_level: ThinkingLevel,
+    pub show_thinking: bool,
 }
 
 impl Config {
@@ -127,6 +128,7 @@ impl Config {
                 file.thinking_level,
                 ThinkingLevel::default(),
             )?,
+            show_thinking: env_or_file("ZEX_SHOW_THINKING", file.show_thinking, true)?,
         })
     }
 
@@ -155,6 +157,7 @@ struct FileConfig {
     max_context_chars: Option<usize>,
     compact_keep_turns: Option<usize>,
     thinking_level: Option<ThinkingLevel>,
+    show_thinking: Option<bool>,
     session_dir: Option<String>,
 }
 
@@ -172,6 +175,7 @@ impl FileConfig {
             max_context_chars: project.max_context_chars.or(self.max_context_chars),
             compact_keep_turns: project.compact_keep_turns.or(self.compact_keep_turns),
             thinking_level: project.thinking_level.or(self.thinking_level),
+            show_thinking: project.show_thinking.or(self.show_thinking),
             session_dir: project.session_dir.or(self.session_dir),
         }
     }
@@ -199,6 +203,38 @@ pub async fn persist_thinking_level(
     table.insert(
         "thinking_level".to_owned(),
         toml::Value::String(thinking_level.to_string()),
+    );
+    let serialized =
+        toml::to_string_pretty(&table).context("failed to serialize project config")?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    tokio::fs::write(&path, serialized)
+        .await
+        .with_context(|| format!("failed to write config file {}", path.display()))
+}
+
+pub async fn persist_show_thinking(working_dir: &Path, show_thinking: bool) -> Result<()> {
+    let path = working_dir.join(PROJECT_CONFIG_PATH);
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read config file {}", path.display()));
+        }
+    };
+    let mut table = if content.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        toml::from_str::<toml::Table>(&content)
+            .with_context(|| format!("failed to parse config file {}", path.display()))?
+    };
+    table.insert(
+        "show_thinking".to_owned(),
+        toml::Value::Boolean(show_thinking),
     );
     let serialized =
         toml::to_string_pretty(&table).context("failed to serialize project config")?;
@@ -354,6 +390,7 @@ mod tests {
         "ZEX_MAX_CONTEXT_CHARS",
         "ZEX_COMPACT_KEEP_TURNS",
         "ZEX_THINKING_LEVEL",
+        "ZEX_SHOW_THINKING",
         "ZEX_SESSION_DIR",
     ];
 
@@ -455,6 +492,33 @@ max_turns = 8
             .await
             .unwrap();
         assert!(content.contains("thinking_level = \"high\""));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loads_and_persists_thinking_visibility() {
+        let _environment = EnvGuard::clear();
+        let root = temp_directory("show-thinking");
+        let project = root.join("project");
+        let global = root.join("global");
+        write_config(
+            &project.join(".zex/config.toml"),
+            r#"
+api_key = "secret"
+model = "model"
+show_thinking = false
+"#,
+        )
+        .await;
+
+        let config = Config::load_from(&project, &global).await.unwrap();
+        assert!(!config.show_thinking);
+
+        super::persist_show_thinking(&project, true).await.unwrap();
+        let content = tokio::fs::read_to_string(project.join(".zex/config.toml"))
+            .await
+            .unwrap();
+        assert!(content.contains("show_thinking = true"));
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 

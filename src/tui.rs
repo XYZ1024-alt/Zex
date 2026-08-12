@@ -30,7 +30,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     agent::{Agent, AgentEvent, Message, MessageRole, PromptOutcome},
-    command::{CommandEffect, CommandOutput, CommandSpec, command_specs, execute, parse},
+    command::{
+        CommandEffect, CommandOutput, CommandSpec, SlashCommand, command_specs, execute, parse,
+    },
+    config::persist_show_thinking,
     provider::{Provider, ThinkingLevel},
     session::{SessionStore, SessionSummary},
 };
@@ -39,6 +42,7 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const TOAST_DURATION: Duration = Duration::from_secs(4);
 const MAX_ERRORS: usize = 3;
 const MAX_ERROR_DETAIL_CHARS: usize = 4_000;
+const MAX_THINKING_DETAIL_CHARS: usize = 16_000;
 const MAX_TOOL_DETAIL_CHARS: usize = 4_000;
 const MAX_TOOL_ARGUMENT_CHARS: usize = 2_000;
 const MAX_INPUT_HISTORY: usize = 100;
@@ -69,6 +73,7 @@ pub async fn run<P>(
     session_store: &SessionStore,
     session_id: &mut Option<String>,
     working_dir: &Path,
+    show_thinking: bool,
 ) -> Result<()>
 where
     P: Provider,
@@ -81,7 +86,10 @@ where
         EventStream::new(),
         session_store,
         session_id,
-        working_dir,
+        RunContext {
+            working_dir,
+            show_thinking,
+        },
     )
     .await;
     let restore_result = terminal.restore();
@@ -93,6 +101,12 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RunContext<'a> {
+    working_dir: &'a Path,
+    show_thinking: bool,
+}
+
 async fn run_loop<P>(
     terminal: &mut DefaultTerminal,
     agent: &mut Agent<P>,
@@ -100,7 +114,7 @@ async fn run_loop<P>(
     mut terminal_events: EventStream,
     session_store: &SessionStore,
     session_id: &mut Option<String>,
-    working_dir: &Path,
+    context: RunContext<'_>,
 ) -> Result<()>
 where
     P: Provider,
@@ -110,12 +124,13 @@ where
         agent.model().to_owned(),
         session_id.clone(),
         AppContext {
-            working_dir: working_dir.to_path_buf(),
+            working_dir: context.working_dir.to_path_buf(),
             thinking_level: agent.thinking_level(),
             thinking_preference: agent.thinking_preference(),
             context_chars: agent.context_chars(),
             max_context_chars: agent.max_context_chars(),
             default_tool_timeout: agent.default_tool_timeout(),
+            show_thinking: context.show_thinking,
         },
     );
     let mut redraw = tokio::time::interval(FRAME_INTERVAL);
@@ -162,7 +177,7 @@ where
                                 agent,
                                 session_store,
                                 session_id,
-                                working_dir,
+                                context.working_dir,
                             )
                             .await
                             {
@@ -185,13 +200,34 @@ where
                         InputAction::Submit(prompt) => {
                             app.remember_submission(&prompt);
                             match parse(&prompt) {
+                                Ok(Some(SlashCommand::Thinking(requested))) => {
+                                    if let Some(show_thinking) = requested {
+                                        match persist_show_thinking(
+                                            context.working_dir,
+                                            show_thinking,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => app.set_show_thinking(show_thinking),
+                                            Err(error) => app.record_error(format!("{error:#}")),
+                                        }
+                                    } else {
+                                        app.show_toast(
+                                            format!(
+                                                "Thinking cards · {}",
+                                                if app.show_thinking { "shown" } else { "hidden" }
+                                            ),
+                                            ToastTone::Success,
+                                        );
+                                    }
+                                }
                                 Ok(Some(command)) => {
                                     match execute(
                                         command,
                                         agent,
                                         session_store,
                                         session_id,
-                                        working_dir,
+                                        context.working_dir,
                                     )
                                     .await
                                     {
@@ -684,11 +720,18 @@ struct ToolEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ThinkingEntry {
+    content: String,
+    expanded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TranscriptEntry {
     Message {
         role: MessageRole,
         content: String,
     },
+    Thinking(ThinkingEntry),
     Tool(ToolEntry),
     Error {
         summary: String,
@@ -821,6 +864,7 @@ struct AppContext {
     context_chars: usize,
     max_context_chars: usize,
     default_tool_timeout: Duration,
+    show_thinking: bool,
 }
 
 #[derive(Debug)]
@@ -831,7 +875,7 @@ struct App {
     input: InputBuffer,
     active_tools: BTreeMap<String, String>,
     errors: VecDeque<String>,
-    selected_tool: Option<String>,
+    selected_card: Option<usize>,
     status: Status,
     busy: bool,
     scroll_top: usize,
@@ -845,6 +889,7 @@ struct App {
     context_chars: usize,
     max_context_chars: usize,
     default_tool_timeout: Duration,
+    show_thinking: bool,
     completion: CompletionState,
     input_history: VecDeque<String>,
     history_cursor: Option<usize>,
@@ -869,7 +914,7 @@ impl App {
             input: InputBuffer::default(),
             active_tools: BTreeMap::new(),
             errors: VecDeque::new(),
-            selected_tool: None,
+            selected_card: None,
             status: Status::Idle,
             busy: false,
             scroll_top: 0,
@@ -883,6 +928,7 @@ impl App {
             context_chars: context.context_chars,
             max_context_chars: context.max_context_chars,
             default_tool_timeout: context.default_tool_timeout,
+            show_thinking: context.show_thinking,
             completion: CompletionState {
                 selected: 0,
                 dismissed: false,
@@ -904,9 +950,19 @@ impl App {
                 }),
                 Message::Assistant {
                     content,
+                    thinking,
                     tool_calls,
                     ..
                 } => {
+                    if let Some(thinking) =
+                        thinking.as_deref().filter(|thinking| !thinking.is_empty())
+                    {
+                        app.transcript
+                            .push(TranscriptEntry::Thinking(ThinkingEntry {
+                                content: truncate_chars(thinking, MAX_THINKING_DETAIL_CHARS),
+                                expanded: false,
+                            }));
+                    }
                     if !content.is_empty() {
                         app.transcript.push(TranscriptEntry::Message {
                             role: MessageRole::Assistant,
@@ -967,6 +1023,12 @@ impl App {
             AgentEvent::MessageDelta { role, delta } => {
                 self.append_message(role, delta);
                 if role == MessageRole::Assistant && self.status != Status::Cancelling {
+                    self.status = Status::Thinking;
+                }
+            }
+            AgentEvent::ThinkingDelta { delta } => {
+                self.append_thinking(delta);
+                if self.status != Status::Cancelling {
                     self.status = Status::Thinking;
                 }
             }
@@ -1068,11 +1130,27 @@ impl App {
         });
     }
 
+    fn append_thinking(&mut self, delta: String) {
+        if let Some(TranscriptEntry::Thinking(thinking)) = self.transcript.last_mut() {
+            thinking.content.push_str(&delta);
+            if thinking.content.chars().count() > MAX_THINKING_DETAIL_CHARS {
+                thinking.content = truncate_chars(&thinking.content, MAX_THINKING_DETAIL_CHARS);
+            }
+            return;
+        }
+
+        self.transcript
+            .push(TranscriptEntry::Thinking(ThinkingEntry {
+                content: truncate_chars(&delta, MAX_THINKING_DETAIL_CHARS),
+                expanded: false,
+            }));
+    }
+
     fn reset_transcript(&mut self) {
         self.transcript.clear();
         self.active_tools.clear();
         self.errors.clear();
-        self.selected_tool = None;
+        self.selected_card = None;
         self.status = Status::Idle;
         self.toast = None;
         self.help_open = false;
@@ -1093,6 +1171,7 @@ impl App {
                 context_chars: self.context_chars,
                 max_context_chars: self.max_context_chars,
                 default_tool_timeout: self.default_tool_timeout,
+                show_thinking: self.show_thinking,
             },
         );
     }
@@ -1127,6 +1206,19 @@ impl App {
         }
         self.errors.push_back(message.to_owned());
         true
+    }
+
+    fn set_show_thinking(&mut self, show_thinking: bool) {
+        self.show_thinking = show_thinking;
+        self.selected_card = None;
+        self.show_toast(
+            format!(
+                "Thinking cards · {}",
+                if show_thinking { "shown" } else { "hidden" }
+            ),
+            ToastTone::Success,
+        );
+        self.scroll_to_bottom();
     }
 
     fn record_error_if_new(&mut self, message: String) {
@@ -1189,45 +1281,51 @@ impl App {
         self.scroll_top = self.max_scroll;
     }
 
-    fn tool_ids(&self) -> Vec<&str> {
+    fn card_indices(&self) -> Vec<usize> {
         self.transcript
             .iter()
-            .filter_map(|entry| match entry {
-                TranscriptEntry::Tool(tool) => Some(tool.call_id.as_str()),
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                TranscriptEntry::Thinking(_) if self.show_thinking => Some(index),
+                TranscriptEntry::Tool(_) => Some(index),
                 _ => None,
             })
             .collect()
     }
 
     fn select_tool(&mut self, reverse: bool) {
-        let ids = self.tool_ids();
-        if ids.is_empty() {
-            self.selected_tool = None;
+        let indices = self.card_indices();
+        if indices.is_empty() {
+            self.selected_card = None;
             return;
         }
 
         let index = self
-            .selected_tool
-            .as_deref()
-            .and_then(|selected| ids.iter().position(|id| *id == selected));
+            .selected_card
+            .and_then(|selected| indices.iter().position(|index| *index == selected));
         let next = match (index, reverse) {
-            (Some(0), true) | (None, true) => ids.len() - 1,
+            (Some(0), true) | (None, true) => indices.len() - 1,
             (Some(index), true) => index - 1,
-            (Some(index), false) => (index + 1) % ids.len(),
+            (Some(index), false) => (index + 1) % indices.len(),
             (None, false) => 0,
         };
-        self.selected_tool = Some(ids[next].to_owned());
+        self.selected_card = Some(indices[next]);
     }
 
     fn toggle_selected_tool(&mut self) {
-        if self.selected_tool.is_none() {
-            self.selected_tool = self.tool_ids().last().map(|id| (*id).to_owned());
+        if self.selected_card.is_none() {
+            self.selected_card = self.card_indices().last().copied();
         }
-        let selected = self.selected_tool.clone();
-        if let Some(selected) = selected
-            && let Some(tool) = self.find_tool_mut(&selected)
-        {
-            tool.expanded = !tool.expanded;
+        if let Some(selected) = self.selected_card {
+            match self.transcript.get_mut(selected) {
+                Some(TranscriptEntry::Thinking(thinking)) => {
+                    thinking.expanded = !thinking.expanded;
+                }
+                Some(TranscriptEntry::Tool(tool)) => {
+                    tool.expanded = !tool.expanded;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1255,14 +1353,19 @@ impl App {
             self.help_open = false;
             return true;
         }
-        if let Some(selected) = self.selected_tool.clone() {
-            if let Some(tool) = self.find_tool_mut(&selected)
-                && tool.expanded
-            {
-                tool.expanded = false;
-                return true;
+        if let Some(selected) = self.selected_card {
+            match self.transcript.get_mut(selected) {
+                Some(TranscriptEntry::Thinking(thinking)) if thinking.expanded => {
+                    thinking.expanded = false;
+                    return true;
+                }
+                Some(TranscriptEntry::Tool(tool)) if tool.expanded => {
+                    tool.expanded = false;
+                    return true;
+                }
+                _ => {}
             }
-            self.selected_tool = None;
+            self.selected_card = None;
             return true;
         }
         if let Some(TranscriptEntry::Error { expanded, .. }) = self
@@ -1554,6 +1657,10 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let thinking = app.thinking_level.map_or_else(
         || format!("n/a ({})", app.thinking_preference),
         |level| level.to_string(),
+    );
+    let thinking = format!(
+        "{thinking}/{}",
+        if app.show_thinking { "show" } else { "hide" }
     );
     let location = match &app.git_status {
         Some(git) => format!(
@@ -2023,7 +2130,7 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn transcript_text(app: &App) -> Text<'static> {
     let mut lines = Vec::new();
-    for entry in &app.transcript {
+    for (index, entry) in app.transcript.iter().enumerate() {
         match entry {
             TranscriptEntry::Message { role, content } => {
                 if *role == MessageRole::User {
@@ -2035,11 +2142,14 @@ fn transcript_text(app: &App) -> Text<'static> {
                 append_markdown_lines(&mut lines, content, *role);
                 lines.push(Line::default());
             }
-            TranscriptEntry::Tool(tool) => append_tool_lines(
-                &mut lines,
-                tool,
-                app.selected_tool.as_deref() == Some(tool.call_id.as_str()),
-            ),
+            TranscriptEntry::Thinking(thinking) => {
+                if app.show_thinking {
+                    append_thinking_lines(&mut lines, thinking, app.selected_card == Some(index));
+                }
+            }
+            TranscriptEntry::Tool(tool) => {
+                append_tool_lines(&mut lines, tool, app.selected_card == Some(index))
+            }
             TranscriptEntry::Error {
                 summary,
                 detail,
@@ -2286,6 +2396,64 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
     }
 }
 
+fn append_thinking_lines(lines: &mut Vec<Line<'static>>, thinking: &ThinkingEntry, selected: bool) {
+    let marker = if selected { "›" } else { " " };
+    let fold = if thinking.expanded { "▾" } else { "▸" };
+    let rail_color = if selected {
+        ACCENT
+    } else {
+        Color::Rgb(55, 65, 74)
+    };
+    let card_style = Style::default().bg(SURFACE);
+    lines.push(
+        Line::from(vec![
+            Span::styled(
+                format!("{marker} {fold} "),
+                Style::default().fg(rail_color).bg(SURFACE),
+            ),
+            Span::styled(
+                "Thinking",
+                Style::default()
+                    .fg(TEXT_STRONG)
+                    .bg(SURFACE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+        .style(card_style),
+    );
+
+    if thinking.expanded {
+        for line in thinking.content.split('\n') {
+            lines.push(
+                Line::from(vec![
+                    Span::styled("  │  ", Style::default().fg(rail_color).bg(SURFACE)),
+                    Span::styled(line.to_owned(), Style::default().fg(TEXT).bg(SURFACE)),
+                ])
+                .style(card_style),
+            );
+        }
+        lines.push(
+            Line::from(Span::styled(
+                "  └  ",
+                Style::default().fg(rail_color).bg(SURFACE),
+            ))
+            .style(card_style),
+        );
+    } else {
+        lines.push(
+            Line::from(vec![
+                Span::styled("  │  ", Style::default().fg(rail_color).bg(SURFACE)),
+                Span::styled(
+                    single_line(&thinking.content, 120),
+                    Style::default().fg(DIM).bg(SURFACE),
+                ),
+            ])
+            .style(card_style),
+        );
+    }
+    lines.push(Line::default());
+}
+
 fn append_tool_lines(lines: &mut Vec<Line<'static>>, tool: &ToolEntry, selected: bool) {
     let marker = if selected { "›" } else { " " };
     let fold = if tool.expanded { "▾" } else { "▸" };
@@ -2514,10 +2682,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let metrics = input_metrics(&app.input.content, app.input.cursor, editor_width);
     let vertical_scroll = metrics.cursor_row.saturating_sub(visible_rows - 1);
     let editor = if app.input.is_empty() {
-        Text::from(Line::from(Span::styled(
-            "Ask Zex...",
-            Style::default().fg(DIM),
-        )))
+        Text::default()
     } else {
         Text::from(Line::from(Span::styled(
             app.input.content.clone(),
@@ -2571,7 +2736,7 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ))
     } else if app.busy {
         let text = if area.width >= 72 {
-            "Ctrl+C stop · PgUp/PgDn scroll · Ctrl+O tool details"
+            "Ctrl+C stop · PgUp/PgDn scroll · Ctrl+O card details"
         } else {
             "Ctrl+C stop · PgUp/PgDn scroll"
         };
@@ -2805,8 +2970,9 @@ mod tests {
 
     use super::{
         ACCENT, App, AppContext, CommandOutput, InputAction, InputBuffer, KeyBurst, SCROLL_STEP,
-        SURFACE, SURFACE_RAISED, Status, ToolStatus, TranscriptEntry, UiRegions, command_specs,
-        handle_key_event, handle_terminal_event, input_metrics, render, truncate_chars, ui_regions,
+        SURFACE, SURFACE_RAISED, Status, ThinkingEntry, ToolStatus, TranscriptEntry, UiRegions,
+        command_specs, handle_key_event, handle_terminal_event, input_metrics, render,
+        truncate_chars, ui_regions,
     };
     use crate::agent::{AgentEvent, Message, MessageRole};
     use crate::provider::ThinkingLevel;
@@ -2823,6 +2989,7 @@ mod tests {
                 context_chars: 0,
                 max_context_chars: 120_000,
                 default_tool_timeout: Duration::from_secs(60),
+                show_thinking: true,
             },
         )
     }
@@ -2869,7 +3036,6 @@ mod tests {
         assert!(screen.contains("Zex"));
         assert!(screen.contains("Ask anything, or type / for commands"));
         assert!(screen.contains("ZEX"));
-        assert!(screen.contains("Ask Zex..."));
         assert!(screen.contains("Enter send"));
         assert!(screen.contains("think high"));
         assert!(screen.contains("main@a1b2c3d"));
@@ -2888,7 +3054,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_cursor_starts_on_the_placeholder_not_before_it() {
+    fn empty_input_keeps_the_cursor_cell_clear_for_ime_preedit() {
         let mut app = app();
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2899,13 +3065,13 @@ mod tests {
         terminal.backend_mut().assert_cursor_position((5, input.y));
         assert_eq!(
             terminal.backend().buffer()[(5, input.y)].symbol(),
-            "A",
-            "the cursor must overlay the first placeholder character"
+            " ",
+            "the IME preedit must not overlap application-rendered text"
         );
     }
 
     #[test]
-    fn typed_input_replaces_the_placeholder_at_the_same_cursor_origin() {
+    fn typed_input_starts_at_the_empty_editor_cursor_origin() {
         let mut app = app();
         app.input.insert_str("hello");
         let backend = TestBackend::new(80, 16);
@@ -2916,7 +3082,6 @@ mod tests {
         let input = ui_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app).input;
 
         assert!(screen.contains("› hello"));
-        assert!(!screen.contains("Ask Zex..."));
         terminal.backend_mut().assert_cursor_position((10, input.y));
     }
 
@@ -3017,7 +3182,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let ready = format!("{}", terminal.backend());
         assert!(ready.contains("ready"));
-        assert!(ready.contains("Ask Zex..."));
+        assert!(ready.contains("Enter send"));
 
         app.start_turn();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -3142,6 +3307,135 @@ mod tests {
         assert_eq!(tool.arguments, "{\n  \"path\": \"Cargo.toml\"\n}");
         assert_eq!(tool.output, "Cargo.toml");
         assert!(!tool.expanded);
+    }
+
+    #[test]
+    fn thinking_then_answer_remain_separate_timeline_entries() {
+        let mut app = app();
+        app.apply_agent_event(AgentEvent::ThinkingDelta {
+            delta: "Reason first.".to_owned(),
+        });
+        app.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::Assistant,
+            delta: "Final answer.".to_owned(),
+        });
+
+        assert!(matches!(
+            &app.transcript[..],
+            [
+                TranscriptEntry::Thinking(ThinkingEntry { content: thinking, .. }),
+                TranscriptEntry::Message {
+                    role: MessageRole::Assistant,
+                    content: answer,
+                },
+            ] if thinking == "Reason first." && answer == "Final answer."
+        ));
+    }
+
+    #[test]
+    fn thinking_is_a_folded_card_in_the_single_timeline() {
+        let mut app = app();
+        app.start_turn();
+        app.apply_agent_event(AgentEvent::ThinkingDelta {
+            delta: "Inspect constraints first.".to_owned(),
+        });
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-1".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+            timeout: Duration::from_secs(60),
+        });
+        app.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::Assistant,
+            delta: "Final answer.".to_owned(),
+        });
+
+        assert!(matches!(
+            &app.transcript[..],
+            [
+                TranscriptEntry::Thinking(ThinkingEntry {
+                    content,
+                    expanded: false,
+                }),
+                TranscriptEntry::Tool(_),
+                TranscriptEntry::Message {
+                    role: MessageRole::Assistant,
+                    content: answer,
+                },
+            ] if content == "Inspect constraints first." && answer == "Final answer."
+        ));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let folded = format!("{}", terminal.backend());
+        assert!(folded.contains("Thinking"));
+        assert!(folded.contains("Inspect constraints first."));
+
+        app.select_tool(false);
+        app.toggle_selected_tool();
+        let TranscriptEntry::Thinking(thinking) = &app.transcript[0] else {
+            panic!("expected thinking entry");
+        };
+        assert!(thinking.expanded);
+    }
+
+    #[test]
+    fn thinking_visibility_hides_live_and_restored_cards() {
+        let messages = vec![Message::Assistant {
+            content: "Answer".to_owned(),
+            thinking: Some("Saved thinking".to_owned()),
+            tool_calls: Vec::new(),
+            provider_state: None,
+        }];
+        let mut app = App::new(
+            &messages,
+            "test-model".to_owned(),
+            None,
+            AppContext {
+                working_dir: PathBuf::from("."),
+                thinking_level: Some(ThinkingLevel::Medium),
+                thinking_preference: ThinkingLevel::Medium,
+                context_chars: 0,
+                max_context_chars: 120_000,
+                default_tool_timeout: Duration::from_secs(60),
+                show_thinking: false,
+            },
+        );
+
+        assert!(matches!(
+            app.transcript.first(),
+            Some(TranscriptEntry::Thinking(ThinkingEntry { content, .. }))
+                if content == "Saved thinking"
+        ));
+        app.apply_agent_event(AgentEvent::ThinkingDelta {
+            delta: "Live thinking".to_owned(),
+        });
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptEntry::Thinking(ThinkingEntry { content, .. }))
+                if content == "Live thinking"
+        ));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let hidden = format!("{}", terminal.backend());
+        assert!(!hidden.contains("Saved thinking"));
+        assert!(!hidden.contains("Live thinking"));
+
+        app.set_show_thinking(true);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = format!("{}", terminal.backend());
+        assert!(shown.contains("Saved thinking"));
+        assert!(shown.contains("Live thinking"));
+
+        app.set_show_thinking(false);
+        assert!(matches!(
+            app.transcript.first(),
+            Some(TranscriptEntry::Thinking(ThinkingEntry { content, .. }))
+                if content == "Saved thinking"
+        ));
     }
 
     #[test]
@@ -3384,7 +3678,7 @@ mod tests {
         app.select_tool(false);
         app.toggle_selected_tool();
 
-        assert_eq!(app.selected_tool.as_deref(), Some("call-1"));
+        assert_eq!(app.selected_card, Some(0));
         let TranscriptEntry::Tool(tool) = &app.transcript[0] else {
             panic!("expected tool entry");
         };
@@ -3610,6 +3904,7 @@ mod tests {
             },
             Message::Assistant {
                 content: "saved answer".to_owned(),
+                thinking: None,
                 tool_calls: Vec::new(),
                 provider_state: None,
             },
@@ -4006,6 +4301,7 @@ mod tests {
                 context_chars: 0,
                 max_context_chars: 120_000,
                 default_tool_timeout: Duration::from_secs(60),
+                show_thinking: true,
             },
         );
         app.transcript.push(TranscriptEntry::Message {
@@ -4164,6 +4460,7 @@ mod tests {
                 context_chars: 0,
                 max_context_chars: 120_000,
                 default_tool_timeout: Duration::from_secs(60),
+                show_thinking: true,
             },
         );
         app.apply_agent_event(AgentEvent::MessageDelta {

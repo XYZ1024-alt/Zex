@@ -16,6 +16,9 @@ pub enum AgentEvent {
         role: MessageRole,
         delta: String,
     },
+    ThinkingDelta {
+        delta: String,
+    },
     ToolStart {
         call_id: String,
         name: String,

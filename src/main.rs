@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
         max_context_chars,
         compact_keep_turns,
         thinking_level,
+        show_thinking,
     } = config;
     let model = session_model.unwrap_or(model);
     let provider = OpenAiProvider::new(&base_url, api_key, openai_api, agent_timeout)?;
@@ -105,6 +106,7 @@ async fn main() -> Result<()> {
                 &session_store,
                 &mut session_id,
                 &working_dir,
+                show_thinking,
             )
             .await,
             None,

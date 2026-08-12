@@ -147,6 +147,12 @@ enum WireMessage<'a> {
     },
     Assistant {
         content: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_details: Option<&'a Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking_blocks: Option<&'a Value>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<WireToolCall<'a>>,
     },
@@ -163,10 +169,14 @@ impl<'a> From<&'a Message> for WireMessage<'a> {
             Message::User { content } => Self::User { content },
             Message::Assistant {
                 content,
+                thinking,
                 tool_calls,
-                ..
+                provider_state,
             } => Self::Assistant {
                 content: (!content.is_empty()).then_some(content),
+                reasoning_content: chat_reasoning_content(thinking, provider_state),
+                reasoning_details: provider_state_field(provider_state, "reasoning_details"),
+                thinking_blocks: provider_state_field(provider_state, "thinking_blocks"),
                 tool_calls: tool_calls.iter().map(WireToolCall::from).collect(),
             },
             Message::Tool {
@@ -178,6 +188,20 @@ impl<'a> From<&'a Message> for WireMessage<'a> {
             },
         }
     }
+}
+
+fn chat_reasoning_content<'a>(
+    thinking: &'a Option<String>,
+    provider_state: &'a Option<Value>,
+) -> Option<&'a str> {
+    provider_state_field(provider_state, "reasoning_content")
+        .and_then(Value::as_str)
+        .or_else(|| provider_state_field(provider_state, "reasoning").and_then(Value::as_str))
+        .or(thinking.as_deref())
+}
+
+fn provider_state_field<'a>(provider_state: &'a Option<Value>, field: &str) -> Option<&'a Value> {
+    provider_state.as_ref()?.as_object()?.get(field)
 }
 
 #[derive(Debug, Serialize)]
@@ -337,6 +361,7 @@ impl<'a> From<&'a Message> for Vec<ResponsesInputItem<'a>> {
                 content,
                 tool_calls,
                 provider_state,
+                ..
             } => {
                 if let Some(output) = provider_state.as_ref().and_then(Value::as_array) {
                     return output
@@ -394,6 +419,12 @@ fn model_supports_thinking(model: &str) -> bool {
         || model.starts_with("o1")
         || model.starts_with("o3")
         || model.starts_with("o4")
+        || model.contains("deepseek")
+        || model.contains("claude")
+        || model.contains("gemini")
+        || model.contains("qwen")
+        || model.contains("grok")
+        || model.contains("magistral")
         || model.contains("reasoning")
 }
 
@@ -418,6 +449,11 @@ struct StreamChoice {
 #[derive(Debug, Default, Deserialize)]
 struct StreamDelta {
     content: Option<String>,
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    reasoning_details: Option<Vec<Value>>,
+    thinking_blocks: Option<Vec<Value>>,
+    provider_specific_fields: Option<Value>,
     tool_calls: Option<Vec<StreamToolCall>>,
 }
 
@@ -486,18 +522,74 @@ fn parse_response_body(
 
 fn parse_chat_stream_body(body: &[u8], events: &EventSender) -> Result<AssistantMessage> {
     let mut content = String::new();
+    let mut thinking = String::new();
+    let mut provider_state = ChatProviderState::default();
     let mut tool_calls = BTreeMap::<usize, ToolCallAccumulator>::new();
+    let (parsed_events, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
 
     for line in body.split(|byte| *byte == b'\n') {
-        consume_sse_line(line, &mut content, &mut tool_calls, events)?;
+        consume_sse_line(
+            line,
+            &mut content,
+            &mut thinking,
+            &mut provider_state,
+            &mut tool_calls,
+            &parsed_events,
+        )?;
     }
 
-    Ok(finish_message(content, tool_calls))
+    let message = finish_message(content, thinking, provider_state.finish(), tool_calls);
+    drop(parsed_events);
+    let parsed_events = std::iter::from_fn(|| event_receiver.try_recv().ok()).collect();
+    emit_separated_message(events, &message, parsed_events);
+    Ok(message)
+}
+
+fn emit_separated_message(
+    events: &EventSender,
+    message: &AssistantMessage,
+    parsed_events: Vec<AgentEvent>,
+) {
+    let mut thinking_emitted = false;
+    let mut content_emitted = false;
+    for event in parsed_events {
+        match event {
+            AgentEvent::ThinkingDelta { delta } if message.thinking.is_some() => {
+                thinking_emitted = true;
+                let _ = events.send(AgentEvent::ThinkingDelta { delta });
+            }
+            AgentEvent::MessageDelta {
+                role: MessageRole::Assistant,
+                delta,
+            } if message.thinking.is_none() => {
+                content_emitted = true;
+                let _ = events.send(AgentEvent::MessageDelta {
+                    role: MessageRole::Assistant,
+                    delta,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if !thinking_emitted && let Some(thinking) = &message.thinking {
+        let _ = events.send(AgentEvent::ThinkingDelta {
+            delta: thinking.clone(),
+        });
+    }
+    if !content_emitted && !message.content.is_empty() {
+        let _ = events.send(AgentEvent::MessageDelta {
+            role: MessageRole::Assistant,
+            delta: message.content.clone(),
+        });
+    }
 }
 
 fn consume_sse_line(
     line: &[u8],
     content: &mut String,
+    thinking: &mut String,
+    provider_state: &mut ChatProviderState,
     tool_calls: &mut BTreeMap<usize, ToolCallAccumulator>,
     events: &EventSender,
 ) -> Result<()> {
@@ -514,7 +606,46 @@ fn consume_sse_line(
     let chunk: StreamChunk =
         serde_json::from_slice(data).context("provider returned an invalid streaming chunk")?;
     for choice in chunk.choices {
-        if let Some(delta) = choice.delta.content {
+        let StreamDelta {
+            content: content_delta,
+            reasoning_content,
+            reasoning,
+            reasoning_details,
+            thinking_blocks,
+            provider_specific_fields,
+            tool_calls: delta_tool_calls,
+        } = choice.delta;
+        let reasoning_delta = reasoning_content.as_deref().or(reasoning.as_deref());
+        let direct_thinking_blocks = thinking_blocks.as_deref();
+        let provider_thinking_blocks = provider_specific_fields
+            .as_ref()
+            .and_then(|fields| fields.get("thinking_blocks"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice);
+        if let Some(reasoning_details) = reasoning_details {
+            provider_state.reasoning_details.extend(reasoning_details);
+        }
+        if let Some(blocks) = direct_thinking_blocks {
+            provider_state
+                .thinking_blocks
+                .extend(blocks.iter().cloned());
+        } else if let Some(blocks) = provider_thinking_blocks {
+            provider_state
+                .thinking_blocks
+                .extend(blocks.iter().cloned());
+        }
+        let thinking_delta = reasoning_delta
+            .map(ToOwned::to_owned)
+            .or_else(|| thinking_text_from_blocks(direct_thinking_blocks))
+            .or_else(|| thinking_text_from_blocks(provider_thinking_blocks));
+        if let Some(delta) = thinking_delta.filter(|delta| !delta.is_empty()) {
+            if reasoning_delta.is_some() {
+                provider_state.reasoning_content.push_str(&delta);
+            }
+            thinking.push_str(&delta);
+            let _ = events.send(AgentEvent::ThinkingDelta { delta });
+        }
+        if let Some(delta) = content_delta {
             content.push_str(&delta);
             let _ = events.send(AgentEvent::MessageDelta {
                 role: MessageRole::Assistant,
@@ -522,7 +653,7 @@ fn consume_sse_line(
             });
         }
 
-        for tool_call in choice.delta.tool_calls.unwrap_or_default() {
+        for tool_call in delta_tool_calls.unwrap_or_default() {
             let entry = tool_calls.entry(tool_call.index).or_default();
             if let Some(id) = tool_call.id {
                 entry.id.push_str(&id);
@@ -543,10 +674,14 @@ fn consume_sse_line(
 
 fn finish_message(
     content: String,
+    thinking: String,
+    provider_state: Option<Value>,
     tool_calls: BTreeMap<usize, ToolCallAccumulator>,
 ) -> AssistantMessage {
+    let (thinking, content) = finalize_thinking(thinking, content);
     AssistantMessage {
         content,
+        thinking,
         tool_calls: tool_calls
             .into_values()
             .map(|call| ToolCall {
@@ -555,8 +690,83 @@ fn finish_message(
                 arguments: call.arguments,
             })
             .collect(),
-        provider_state: None,
+        provider_state,
     }
+}
+
+#[derive(Debug, Default)]
+struct ChatProviderState {
+    reasoning_content: String,
+    reasoning_details: Vec<Value>,
+    thinking_blocks: Vec<Value>,
+}
+
+impl ChatProviderState {
+    fn finish(self) -> Option<Value> {
+        let mut fields = serde_json::Map::new();
+        if !self.reasoning_content.is_empty() {
+            fields.insert(
+                "reasoning_content".to_owned(),
+                Value::String(self.reasoning_content),
+            );
+        }
+        if !self.reasoning_details.is_empty() {
+            fields.insert(
+                "reasoning_details".to_owned(),
+                Value::Array(self.reasoning_details),
+            );
+        }
+        if !self.thinking_blocks.is_empty() {
+            fields.insert(
+                "thinking_blocks".to_owned(),
+                Value::Array(self.thinking_blocks),
+            );
+        }
+        (!fields.is_empty()).then_some(Value::Object(fields))
+    }
+}
+
+fn thinking_text_from_blocks(blocks: Option<&[Value]>) -> Option<String> {
+    let mut text = String::new();
+    for block in blocks.unwrap_or_default() {
+        if let Some(value) = block
+            .get("thinking")
+            .or_else(|| block.get("text"))
+            .or_else(|| block.get("summary"))
+            .and_then(Value::as_str)
+        {
+            text.push_str(value);
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+fn finalize_thinking(explicit: String, content: String) -> (Option<String>, String) {
+    if !explicit.is_empty() {
+        let (_, content) = split_think_tags(&content);
+        return (Some(explicit), content);
+    }
+    split_think_tags(&content)
+}
+
+fn split_think_tags(content: &str) -> (Option<String>, String) {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+
+    let Some(open) = content.find(OPEN) else {
+        return (None, content.to_owned());
+    };
+    let after_open = open + OPEN.len();
+    let Some(close_offset) = content[after_open..].find(CLOSE) else {
+        return (None, content.to_owned());
+    };
+    let close = after_open + close_offset;
+    let after_close = close + CLOSE.len();
+    let thinking = content[after_open..close].trim().to_owned();
+    let answer = format!("{}{}", &content[..open], &content[after_close..])
+        .trim()
+        .to_owned();
+    ((!thinking.is_empty()).then_some(thinking), answer)
 }
 
 #[derive(Debug, Deserialize)]
@@ -572,6 +782,10 @@ struct NonStreamChoice {
 #[derive(Debug, Deserialize)]
 struct NonStreamMessage {
     content: Option<String>,
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    reasoning_details: Option<Value>,
+    thinking_blocks: Option<Value>,
     #[serde(default)]
     tool_calls: Vec<NonStreamToolCall>,
 }
@@ -601,8 +815,32 @@ fn parse_chat_non_stream_body(body: &[u8], events: &EventSender) -> Result<Assis
         .next()
         .context("provider response contained no choices")?
         .message;
-    let content = message.content.unwrap_or_default();
+    let NonStreamMessage {
+        content,
+        reasoning_content,
+        reasoning,
+        reasoning_details,
+        thinking_blocks,
+        tool_calls,
+    } = message;
+    let content = content.unwrap_or_default();
+    let raw_reasoning = reasoning_content.or(reasoning);
+    let explicit_thinking = raw_reasoning
+        .clone()
+        .or_else(|| {
+            thinking_blocks
+                .as_ref()
+                .and_then(Value::as_array)
+                .and_then(|blocks| thinking_text_from_blocks(Some(blocks)))
+        })
+        .unwrap_or_default();
+    let (thinking, content) = finalize_thinking(explicit_thinking, content);
 
+    if let Some(thinking) = &thinking {
+        let _ = events.send(AgentEvent::ThinkingDelta {
+            delta: thinking.clone(),
+        });
+    }
     if !content.is_empty() {
         let _ = events.send(AgentEvent::MessageDelta {
             role: MessageRole::Assistant,
@@ -610,10 +848,24 @@ fn parse_chat_non_stream_body(body: &[u8], events: &EventSender) -> Result<Assis
         });
     }
 
+    let mut provider_state = serde_json::Map::new();
+    if let Some(reasoning_content) = raw_reasoning {
+        provider_state.insert(
+            "reasoning_content".to_owned(),
+            Value::String(reasoning_content),
+        );
+    }
+    if let Some(reasoning_details) = reasoning_details {
+        provider_state.insert("reasoning_details".to_owned(), reasoning_details);
+    }
+    if let Some(thinking_blocks) = thinking_blocks {
+        provider_state.insert("thinking_blocks".to_owned(), thinking_blocks);
+    }
+
     Ok(AssistantMessage {
         content,
-        tool_calls: message
-            .tool_calls
+        thinking,
+        tool_calls: tool_calls
             .into_iter()
             .map(|call| ToolCall {
                 id: call.id,
@@ -621,7 +873,7 @@ fn parse_chat_non_stream_body(body: &[u8], events: &EventSender) -> Result<Assis
                 arguments: call.function.arguments,
             })
             .collect(),
-        provider_state: None,
+        provider_state: (!provider_state.is_empty()).then_some(Value::Object(provider_state)),
     })
 }
 
@@ -653,6 +905,7 @@ fn parse_responses_non_stream_body(body: &[u8], events: &EventSender) -> Result<
 
 fn parse_responses_stream_body(body: &[u8], events: &EventSender) -> Result<AssistantMessage> {
     let mut content = String::new();
+    let mut thinking = String::new();
     let mut output = Vec::<Value>::new();
     let mut completed_output = None;
     let mut response_error = None;
@@ -675,6 +928,14 @@ fn parse_responses_stream_body(body: &[u8], events: &EventSender) -> Result<Assi
                     content.push_str(delta);
                     let _ = events.send(AgentEvent::MessageDelta {
                         role: MessageRole::Assistant,
+                        delta: delta.to_owned(),
+                    });
+                }
+            }
+            Some("response.reasoning_summary_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    thinking.push_str(delta);
+                    let _ = events.send(AgentEvent::ThinkingDelta {
                         delta: delta.to_owned(),
                     });
                 }
@@ -705,9 +966,22 @@ fn parse_responses_stream_body(body: &[u8], events: &EventSender) -> Result<Assi
         output = completed_output;
     }
 
-    let mut message = finish_responses_message(output, events, !content.is_empty())?;
+    let (completion_events, mut completion_event_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut message = finish_responses_message(output, &completion_events, !content.is_empty())?;
+    drop(completion_events);
+    let completion_events =
+        std::iter::from_fn(|| completion_event_receiver.try_recv().ok()).collect::<Vec<_>>();
     if !content.is_empty() {
         message.content = content;
+    }
+    if !thinking.is_empty() {
+        message.thinking = Some(thinking);
+    }
+    for event in completion_events {
+        if matches!(event, AgentEvent::ThinkingDelta { .. }) && message.thinking.is_some() {
+            continue;
+        }
+        let _ = events.send(event);
     }
     Ok(message)
 }
@@ -718,10 +992,23 @@ fn finish_responses_message(
     text_already_emitted: bool,
 ) -> Result<AssistantMessage> {
     let mut content = String::new();
+    let mut thinking = String::new();
     let mut tool_calls = Vec::new();
 
     for item in &output {
         match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => {
+                for part in item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        thinking.push_str(text);
+                    }
+                }
+            }
             Some("message") => {
                 for part in item
                     .get("content")
@@ -750,6 +1037,11 @@ fn finish_responses_message(
         }
     }
 
+    if !thinking.is_empty() {
+        let _ = events.send(AgentEvent::ThinkingDelta {
+            delta: thinking.clone(),
+        });
+    }
     if !text_already_emitted && !content.is_empty() {
         let _ = events.send(AgentEvent::MessageDelta {
             role: MessageRole::Assistant,
@@ -759,6 +1051,7 @@ fn finish_responses_message(
 
     Ok(AssistantMessage {
         content,
+        thinking: (!thinking.is_empty()).then_some(thinking),
         tool_calls,
         provider_state: Some(Value::Array(output)),
     })
@@ -822,7 +1115,7 @@ mod tests {
     };
 
     use super::{
-        ResponsesRequest, ToolCallAccumulator, consume_sse_line, finish_message,
+        ChatProviderState, ResponsesRequest, ToolCallAccumulator, consume_sse_line, finish_message,
         parse_response_body,
     };
 
@@ -830,11 +1123,15 @@ mod tests {
     fn assembles_streamed_text_and_tool_calls() {
         let (events, mut receiver) = mpsc::unbounded_channel();
         let mut content = String::new();
+        let mut thinking = String::new();
+        let mut provider_state = ChatProviderState::default();
         let mut tool_calls = BTreeMap::<usize, ToolCallAccumulator>::new();
 
         consume_sse_line(
             br#"data: {"choices":[{"delta":{"content":"Zex "}}]}"#,
             &mut content,
+            &mut thinking,
+            &mut provider_state,
             &mut tool_calls,
             &events,
         )
@@ -842,6 +1139,8 @@ mod tests {
         consume_sse_line(
             br#"data: {"choices":[{"delta":{"content":"streams","tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"pa"}}]}}]}"#,
             &mut content,
+            &mut thinking,
+            &mut provider_state,
             &mut tool_calls,
             &events,
         )
@@ -849,13 +1148,16 @@ mod tests {
         consume_sse_line(
             br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"Cargo.toml\"}"}}]}}]}"#,
             &mut content,
+            &mut thinking,
+            &mut provider_state,
             &mut tool_calls,
             &events,
         )
         .unwrap();
 
-        let message = finish_message(content, tool_calls);
+        let message = finish_message(content, thinking, provider_state.finish(), tool_calls);
         assert_eq!(message.content, "Zex streams");
+        assert_eq!(message.thinking, None);
         assert_eq!(message.tool_calls.len(), 1);
         assert_eq!(message.tool_calls[0].id, "call_1");
         assert_eq!(message.tool_calls[0].name, "read");
@@ -919,6 +1221,195 @@ mod tests {
     }
 
     #[test]
+    fn prefers_explicit_reasoning_fields_over_think_tag_fallback() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let message = parse_response_body(
+            br#"{"choices":[{"message":{
+                "content":"<think>fallback</think>Final answer",
+                "reasoning_content":"Provider reasoning"
+            }}]}"#,
+            "application/json",
+            OpenAiApi::ChatCompletions,
+            &events,
+        )
+        .unwrap();
+
+        assert_eq!(message.thinking.as_deref(), Some("Provider reasoning"));
+        assert_eq!(message.content, "Final answer");
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::ThinkingDelta {
+                delta: "Provider reasoning".to_owned(),
+            }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::MessageDelta {
+                role: MessageRole::Assistant,
+                delta: "Final answer".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn separates_think_tags_when_provider_has_no_reasoning_field() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let message = parse_response_body(
+            br#"{"choices":[{"message":{"content":"<think>\nInspect first.\n</think>\nFinal answer"}}]}"#,
+            "application/json",
+            OpenAiApi::ChatCompletions,
+            &events,
+        )
+        .unwrap();
+
+        assert_eq!(message.thinking.as_deref(), Some("Inspect first."));
+        assert_eq!(message.content, "Final answer");
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::ThinkingDelta {
+                delta: "Inspect first.".to_owned(),
+            }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::MessageDelta {
+                role: MessageRole::Assistant,
+                delta: "Final answer".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn separates_streamed_think_tags_before_emitting_final_answer() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let body = br#"
+data: {"choices":[{"delta":{"content":"<thi"}}]}
+
+data: {"choices":[{"delta":{"content":"nk>Inspect first."}}]}
+
+data: {"choices":[{"delta":{"content":"</think>Final "}}]}
+
+data: {"choices":[{"delta":{"content":"answer"}}]}
+
+data: [DONE]
+
+"#;
+        let message = parse_response_body(
+            body,
+            "text/event-stream",
+            OpenAiApi::ChatCompletions,
+            &events,
+        )
+        .unwrap();
+
+        assert_eq!(message.thinking.as_deref(), Some("Inspect first."));
+        assert_eq!(message.content, "Final answer");
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::ThinkingDelta {
+                delta: "Inspect first.".to_owned(),
+            }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::MessageDelta {
+                role: MessageRole::Assistant,
+                delta: "Final answer".to_owned(),
+            }
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn parses_streamed_reasoning_and_thinking_blocks_without_mixing_answer() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let body = br#"
+data: {"choices":[{"delta":{"reasoning_content":"Plan "}}]}
+
+data: {"choices":[{"delta":{"thinking_blocks":[{"type":"thinking","thinking":"carefully."}]}}]}
+
+data: {"choices":[{"delta":{"content":"Answer"}}]}
+
+data: [DONE]
+
+"#;
+
+        let message = parse_response_body(
+            body,
+            "text/event-stream",
+            OpenAiApi::ChatCompletions,
+            &events,
+        )
+        .unwrap();
+
+        assert_eq!(message.thinking.as_deref(), Some("Plan carefully."));
+        assert_eq!(message.content, "Answer");
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::ThinkingDelta {
+                delta: "Plan ".to_owned(),
+            }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::ThinkingDelta {
+                delta: "carefully.".to_owned(),
+            }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::MessageDelta {
+                role: MessageRole::Assistant,
+                delta: "Answer".to_owned(),
+            }
+        );
+        assert_eq!(
+            message.provider_state.as_ref().unwrap()["thinking_blocks"][0]["thinking"],
+            "carefully."
+        );
+        assert_eq!(
+            message.provider_state.as_ref().unwrap()["reasoning_content"],
+            "Plan "
+        );
+    }
+
+    #[test]
+    fn serializes_reasoning_state_for_chat_tool_continuation() {
+        let messages = vec![Message::Assistant {
+            content: String::new(),
+            thinking: Some("Call the reader.".to_owned()),
+            tool_calls: vec![ToolCall {
+                id: "call_read".to_owned(),
+                name: "read".to_owned(),
+                arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+            }],
+            provider_state: Some(serde_json::json!({
+                "reasoning_content": "Call the reader.",
+                "reasoning_details": [{"type": "reasoning.summary", "summary": "Call reader"}],
+                "thinking_blocks": [{
+                    "type": "thinking",
+                    "thinking": "Call the reader.",
+                    "signature": "signed"
+                }]
+            })),
+        }];
+
+        let request = serde_json::to_value(super::ChatRequest::new(
+            "deepseek-reasoner",
+            None,
+            &messages,
+            &[],
+        ))
+        .unwrap();
+        let assistant = &request["messages"][0];
+
+        assert_eq!(assistant["reasoning_content"], "Call the reader.");
+        assert_eq!(assistant["reasoning_details"][0]["summary"], "Call reader");
+        assert_eq!(assistant["thinking_blocks"][0]["signature"], "signed");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call_read");
+    }
+
+    #[test]
     fn reports_empty_and_unsupported_bodies_with_context() {
         let (events, _) = mpsc::unbounded_channel();
 
@@ -947,6 +1438,7 @@ mod tests {
             },
             Message::Assistant {
                 content: String::new(),
+                thinking: None,
                 tool_calls: vec![ToolCall {
                     id: "call_read".to_owned(),
                     name: "read".to_owned(),
@@ -1005,6 +1497,8 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(chat["reasoning_effort"], "low");
+        assert!(super::model_supports_thinking("deepseek-reasoner"));
+        assert!(super::model_supports_thinking("anthropic/claude-sonnet-4"));
     }
 
     #[test]
@@ -1045,6 +1539,48 @@ mod tests {
             }
             event => panic!("unexpected event: {event:?}"),
         }
+    }
+
+    #[test]
+    fn parses_responses_reasoning_summary_separately() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let message = parse_response_body(
+            br#"{
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [{"type": "summary_text", "text": "Checked constraints."}]
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Done."}]
+                    }
+                ],
+                "error": null
+            }"#,
+            "application/json",
+            OpenAiApi::Responses,
+            &events,
+        )
+        .unwrap();
+
+        assert_eq!(message.thinking.as_deref(), Some("Checked constraints."));
+        assert_eq!(message.content, "Done.");
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::ThinkingDelta {
+                delta: "Checked constraints.".to_owned(),
+            }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::MessageDelta {
+                role: MessageRole::Assistant,
+                delta: "Done.".to_owned(),
+            }
+        );
     }
 
     #[test]

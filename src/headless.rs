@@ -3,7 +3,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -24,6 +24,9 @@ where
     P: Provider,
 {
     match parse(&prompt)? {
+        Some(crate::command::SlashCommand::Thinking(_)) => {
+            bail!("/thinking is available only in the TUI")
+        }
         Some(command) => {
             let result = execute(command, agent, session_store, session_id, working_dir).await?;
             if result.effect == CommandEffect::ReplaceView {
@@ -68,6 +71,9 @@ where
         }
 
         match parse(input) {
+            Ok(Some(crate::command::SlashCommand::Thinking(_))) => {
+                eprintln!("Zex command error: /thinking is available only in the TUI");
+            }
             Ok(Some(command)) => {
                 match execute(command, agent, session_store, session_id, working_dir).await {
                     Ok(result) => {
@@ -138,6 +144,7 @@ fn print_event(event: AgentEvent) -> Result<()> {
                     .context("failed to flush assistant output")?;
             }
         },
+        AgentEvent::ThinkingDelta { .. } => {}
         AgentEvent::ToolStart { name, .. } => println!("\n[tool] {name}"),
         AgentEvent::ToolEnd { name, is_error, .. } => {
             let status = if is_error { "failed" } else { "done" };

@@ -358,6 +358,7 @@ mod tests {
             },
             Message::Assistant {
                 content: "done".to_owned(),
+                thinking: Some("Completed the saved task.".to_owned()),
                 tool_calls: Vec::new(),
                 provider_state: None,
             },
@@ -376,6 +377,10 @@ mod tests {
         assert_eq!(sessions[0].message_count, 2);
         assert_eq!(sessions[0].preview, "first task");
         assert_eq!(store.load(None).await.unwrap().unwrap().messages, second);
+        let persisted = tokio::fs::read_to_string(directory.join(format!("{id}.jsonl")))
+            .await
+            .unwrap();
+        assert!(persisted.contains("\"thinking\":\"Completed the saved task.\""));
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
@@ -423,6 +428,34 @@ mod tests {
         assert!(matches!(
             &loaded.messages[0],
             Message::User { content } if content == "legacy"
+        ));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loads_legacy_assistant_messages_without_thinking() {
+        let directory = temp_directory("legacy-thinking");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let id = "20260812-120000-feedface";
+        let content = concat!(
+            "{\"type\":\"session\",\"session\":{\"format\":1,\"id\":\"20260812-120000-feedface\",\"created_at\":\"2026-08-12T12:00:00Z\",\"updated_at\":\"2026-08-12T12:00:00Z\"}}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"legacy answer\"}}\n"
+        );
+        tokio::fs::write(directory.join(format!("{id}.jsonl")), content)
+            .await
+            .unwrap();
+        let store = SessionStore::new(directory.clone());
+
+        let loaded = store.load(Some(id)).await.unwrap().unwrap();
+
+        assert!(matches!(
+            &loaded.messages[0],
+            Message::Assistant {
+                content,
+                thinking: None,
+                tool_calls,
+                provider_state: None,
+            } if content == "legacy answer" && tool_calls.is_empty()
         ));
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }

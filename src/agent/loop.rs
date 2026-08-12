@@ -258,6 +258,7 @@ where
 
             self.messages.push(Message::Assistant {
                 content: assistant.content.clone(),
+                thinking: assistant.thinking.clone(),
                 tool_calls: assistant.tool_calls.clone(),
                 provider_state: assistant.provider_state.clone(),
             });
@@ -415,9 +416,16 @@ fn compact_messages(messages: &mut Vec<Message>, keep_turns: usize) -> CompactSt
             }
             Message::Assistant {
                 content,
+                thinking,
                 tool_calls,
                 ..
             } => {
+                if let Some(thinking) = thinking
+                    .as_deref()
+                    .filter(|thinking| !thinking.trim().is_empty())
+                {
+                    summary_lines.push(format!("Assistant thinking: {}", summarize_text(thinking)));
+                }
                 if !content.trim().is_empty() {
                     summary_lines.push(format!("Assistant: {}", summarize_text(content)));
                 }
@@ -532,7 +540,11 @@ fn truncate_middle(content: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Mutex, time::Duration};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use anyhow::{Result, bail};
     use serde_json::{Value, json};
@@ -548,6 +560,7 @@ mod tests {
 
     struct SequenceProvider {
         messages: Mutex<VecDeque<AssistantMessage>>,
+        requests: Arc<Mutex<Vec<Vec<crate::agent::Message>>>>,
     }
 
     impl Provider for SequenceProvider {
@@ -555,16 +568,25 @@ mod tests {
             &self,
             _model: &str,
             _thinking_level: Option<crate::provider::ThinkingLevel>,
-            _messages: &[crate::agent::Message],
+            messages: &[crate::agent::Message],
             _tools: &[ToolDefinition],
             events: &crate::agent::EventSender,
         ) -> Result<AssistantMessage> {
+            self.requests
+                .lock()
+                .expect("sequence provider requests mutex poisoned")
+                .push(messages.to_vec());
             let message = self
                 .messages
                 .lock()
                 .expect("sequence provider mutex poisoned")
                 .pop_front()
                 .expect("sequence provider exhausted");
+            if let Some(thinking) = &message.thinking {
+                let _ = events.send(AgentEvent::ThinkingDelta {
+                    delta: thinking.clone(),
+                });
+            }
             if !message.content.is_empty() {
                 let _ = events.send(AgentEvent::MessageDelta {
                     role: MessageRole::Assistant,
@@ -609,6 +631,7 @@ mod tests {
     fn system_only_agent_has_no_conversation() {
         let provider = SequenceProvider {
             messages: Mutex::new(VecDeque::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
         };
         let (events, _) = mpsc::unbounded_channel();
         let agent = Agent::new(
@@ -659,10 +682,12 @@ mod tests {
 
     #[tokio::test]
     async fn emits_message_tool_and_turn_events_in_order() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let provider = SequenceProvider {
             messages: Mutex::new(VecDeque::from([
                 AssistantMessage {
                     content: String::new(),
+                    thinking: Some("Need the echo result.".to_owned()),
                     tool_calls: vec![ToolCall {
                         id: "call-1".to_owned(),
                         name: "echo".to_owned(),
@@ -672,10 +697,12 @@ mod tests {
                 },
                 AssistantMessage {
                     content: "done".to_owned(),
+                    thinking: Some("The tool returned the requested value.".to_owned()),
                     tool_calls: Vec::new(),
                     provider_state: None,
                 },
             ])),
+            requests: Arc::clone(&requests),
         };
         let mut tools = ToolRegistry::new(Duration::from_secs(1), 32_000);
         tools.register(EchoTool);
@@ -697,11 +724,43 @@ mod tests {
 
         agent.prompt("inspect").await.unwrap();
 
+        let captured_requests = requests
+            .lock()
+            .expect("sequence provider requests mutex poisoned");
+        assert_eq!(captured_requests.len(), 2);
+        assert!(matches!(
+            captured_requests[1].as_slice(),
+            [
+                crate::agent::Message::System { .. },
+                crate::agent::Message::User { content },
+                crate::agent::Message::Assistant {
+                    thinking: Some(thinking),
+                    tool_calls,
+                    ..
+                },
+                crate::agent::Message::Tool {
+                    tool_call_id,
+                    content: output,
+                },
+            ] if content == "inspect"
+                && thinking == "Need the echo result."
+                && tool_calls[0].id == "call-1"
+                && tool_call_id == "call-1"
+                && output == "observed"
+        ));
+        drop(captured_requests);
+
         assert_eq!(
             receiver.try_recv().unwrap(),
             AgentEvent::MessageDelta {
                 role: MessageRole::User,
                 delta: "inspect".to_owned(),
+            }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::ThinkingDelta {
+                delta: "Need the echo result.".to_owned(),
             }
         );
         assert_eq!(
@@ -726,6 +785,12 @@ mod tests {
                 && output == "observed"
                 && elapsed > Duration::ZERO
         ));
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::ThinkingDelta {
+                delta: "The tool returned the requested value.".to_owned(),
+            }
+        );
         assert_eq!(
             receiver.try_recv().unwrap(),
             AgentEvent::MessageDelta {
@@ -822,6 +887,7 @@ mod tests {
     fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
         let provider = SequenceProvider {
             messages: Mutex::new(VecDeque::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
         };
         let (events, _) = mpsc::unbounded_channel();
         let mut agent = Agent::new(
@@ -842,6 +908,7 @@ mod tests {
                 },
                 crate::agent::Message::Assistant {
                     content: String::new(),
+                    thinking: Some("Need to inspect the large file.".to_owned()),
                     tool_calls: vec![ToolCall {
                         id: "old-call".to_owned(),
                         name: "read".to_owned(),
@@ -858,6 +925,7 @@ mod tests {
                 },
                 crate::agent::Message::Assistant {
                     content: "answer one".to_owned(),
+                    thinking: None,
                     tool_calls: Vec::new(),
                     provider_state: None,
                 },
@@ -866,6 +934,7 @@ mod tests {
                 },
                 crate::agent::Message::Assistant {
                     content: "answer two".to_owned(),
+                    thinking: None,
                     tool_calls: Vec::new(),
                     provider_state: None,
                 },
@@ -893,6 +962,7 @@ mod tests {
             &agent.messages()[1],
             crate::agent::Message::System { content }
                 if content.contains("Compacted earlier conversation")
+                    && content.contains("Assistant thinking")
                     && content.contains("Tool result read")
         ));
         assert!(agent.messages().iter().any(
@@ -907,6 +977,7 @@ mod tests {
     fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
         let provider = SequenceProvider {
             messages: Mutex::new(VecDeque::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
         };
         let (events, mut receiver) = mpsc::unbounded_channel();
         let mut agent = Agent::new(
@@ -927,6 +998,7 @@ mod tests {
                 },
                 crate::agent::Message::Assistant {
                     content: "old answer".to_owned(),
+                    thinking: None,
                     tool_calls: Vec::new(),
                     provider_state: None,
                 },
