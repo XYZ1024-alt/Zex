@@ -148,9 +148,9 @@ TUI 是单列时间流，不使用左侧对话、右侧工具的仪表盘分栏�
 3. 固定状态栏：运行状态、model、think 强度、context 占用、短工作目录和可用时的 git branch@commit；窄终端自动隐藏次要字段。
 4. 最底输入框：始终是屏幕最后一个区域，支持多行编辑，最多显示 6 行；快捷键提示保持在输入框上方的一行内。
 
-界面使用统一的近黑背景、低对比 surface、暖灰正文、冷灰次要文本、单一青蓝 accent，以及柔和的 success/error 色。用户消息只用轻 surface 和 `›` 区分；assistant 使用弱 `zex` 提示，不显示醒目的 `YOU` / `ASSISTANT` 标签。基础 Markdown 标题、列表、引用和代码围栏会形成清楚但克制的层级。
+界面使用统一的近黑背景、暖灰正文、冷灰次要文本、单一青蓝 accent，以及柔和的 success/error 色。用户消息只用弱 `you ›` 前缀区分，不再铺深色标签背景；assistant 使用弱 `zex` 提示，不显示醒目的 `YOU` / `ASSISTANT` 标签。基础 Markdown 标题、列表、引用和代码围栏会形成清楚但克制的层级。
 
-tool 卡片标题突出工具名；`bash` 显示 `$ command`。Output 默认折叠为单行摘要，并标注 `Ctrl+O expand`；页脚只显示耗时与 timeout。running、done、failed、interrupted 使用克制状态色，连续卡片之间保留空行。展开后显示格式化参数与结果预览；参数和结果过长时明确截断。错误默认只显示首行摘要，`Ctrl+E` 展开或收起详情。Assistant 流式增量合并到当前消息，TUI 只在状态变化、输入、新事件或 toast 过期时按固定帧率差分重绘。
+tool 卡片标题突出工具名；`bash` 显示 `$ command`。默认态只显示标题、running/done/failed/interrupted、耗时和一行结果摘要；无输出的成功命令显示 `Completed`。`exit_code`、stdout/stderr 全文、timeout 和参数只在展开后出现，`Ctrl-O` 展开或折叠当前卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 只在状态变化、输入、新事件或 toast 过期时按固定帧率差分重绘。
 
 | 快捷键 | idle 模式 | turn 运行中 |
 | --- | --- | --- |
@@ -171,11 +171,11 @@ tool 卡片标题突出工具名；`bash` 显示 `$ command`。Output 默认折�
 
 ### 斜杠命令
 
-TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册表、解析与执行模块；`/help` 和补全列表因此不会漂移。输入 `/` 后按前缀过滤，例如 `/se` 只显示 `/sessions`。Up/Down 选择，Tab 补全，Enter 在前缀未完整时先补全、命令完整时执行，Esc 关闭。命中的斜杠命令不会作为普通用户消息发给模型；未知命令返回可读错误。`/model`、`/think`、`/compact`、新建与恢复会话等短暂状态反馈只更新底栏或显示约 4 秒 toast，不写入主 feed；`/help`、`/sessions` 等需要阅读的结果仍留在时间流。
+TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册表、解析与执行模块；`/help` 和补全列表因此不会漂移。输入 `/` 后按前缀过滤，例如 `/se` 只显示 `/sessions`。Up/Down 选择，Tab 补全，Enter 在前缀未完整时先补全、命令完整时执行，Esc 关闭。命中的斜杠命令不会作为普通用户消息发给模型；未知命令返回可读错误。`/model`、`/think`、`/compact`、新建与恢复会话等短暂状态反馈只更新底栏或显示约 4 秒 toast，不写入主 feed；`/help` 使用有限高度的临时命令面板，Esc 关闭且不污染对话时间流；`/sessions` 仍作为需要阅读的结果进入时间流。
 
 | 命令 | 行为 |
 | --- | --- |
-| `/help` | 在当前界面列出全部命令与简短说明 |
+| `/help` | 打开有限高度的命令面板；Esc 关闭，不写入对话时间流 |
 | `/model` | 显示当前会话正在使用的 model |
 | `/model <name>` | 立即切换后续 Provider 请求使用的 model；保存会话时一并记录 |
 | `/clear` | 清空当前 TUI/REPL 上下文；TUI 同时清空对话视图。不删除磁盘会话，下一条普通消息创建新会话 |

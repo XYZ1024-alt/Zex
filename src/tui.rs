@@ -22,7 +22,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -44,7 +44,8 @@ const MAX_TOOL_ARGUMENT_CHARS: usize = 2_000;
 const MAX_INPUT_HISTORY: usize = 100;
 const MAX_INPUT_ROWS: u16 = 6;
 const MIN_TRANSCRIPT_HEIGHT: u16 = 3;
-const MAX_FEED_WIDTH: u16 = 120;
+const MAX_FEED_WIDTH: u16 = 140;
+const FEED_HORIZONTAL_GUTTER: u16 = 2;
 const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 
@@ -652,7 +653,6 @@ enum TranscriptEntry {
         detail: String,
         expanded: bool,
     },
-    Help,
     Sessions(Vec<crate::session::SessionSummary>),
 }
 
@@ -801,6 +801,7 @@ struct App {
     history_cursor: Option<usize>,
     history_draft: String,
     toast: Option<Toast>,
+    help_open: bool,
 }
 
 impl App {
@@ -834,6 +835,7 @@ impl App {
             history_cursor: None,
             history_draft: String::new(),
             toast: None,
+            help_open: false,
         };
 
         for message in messages {
@@ -891,6 +893,7 @@ impl App {
     }
 
     fn start_turn(&mut self) {
+        self.help_open = false;
         self.busy = true;
         self.status = Status::Thinking;
         self.scroll_to_bottom();
@@ -1015,6 +1018,7 @@ impl App {
         self.selected_tool = None;
         self.status = Status::Idle;
         self.toast = None;
+        self.help_open = false;
         self.scroll_to_bottom();
     }
 
@@ -1072,7 +1076,10 @@ impl App {
 
     fn push_command_output(&mut self, output: CommandOutput) -> bool {
         match output {
-            CommandOutput::Help => self.transcript.push(TranscriptEntry::Help),
+            CommandOutput::Help => {
+                self.help_open = true;
+                return false;
+            }
             CommandOutput::Sessions(sessions) => {
                 self.transcript.push(TranscriptEntry::Sessions(sessions));
             }
@@ -1175,6 +1182,10 @@ impl App {
             self.dismiss_completion();
             return true;
         }
+        if self.help_open {
+            self.help_open = false;
+            return true;
+        }
         if let Some(selected) = self.selected_tool.clone() {
             if let Some(tool) = self.find_tool_mut(&selected)
                 && tool.expanded
@@ -1205,18 +1216,6 @@ impl App {
             return true;
         }
         false
-    }
-
-    fn active_tool_summary(&self) -> String {
-        if self.active_tools.is_empty() {
-            "—".to_owned()
-        } else {
-            self.active_tools
-                .values()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
     }
 
     fn sync_agent_status<P>(&mut self, agent: &Agent<P>)
@@ -1348,6 +1347,7 @@ impl App {
     }
 
     fn prepare_input_edit(&mut self) {
+        self.help_open = false;
         self.reset_history_navigation();
     }
 
@@ -1424,6 +1424,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_keymap(frame, areas[2], app);
     render_completion(frame, areas[3], app);
     render_input(frame, areas[4], app);
+    render_help_overlay(frame, app);
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1447,7 +1448,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         None => short_path(&app.working_dir, 36),
     };
-    let mut spans = vec![
+    let spans = vec![
         Span::styled(" ", Style::default()),
         Span::styled(app.status.symbol(), Style::default().fg(app.status.color())),
         Span::styled(
@@ -1468,14 +1469,6 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled("  ", Style::default()),
         Span::styled(location, Style::default().fg(DIM)),
     ];
-    if !app.active_tools.is_empty() {
-        spans.push(Span::styled("  ·  ", Style::default().fg(MUTED)));
-        spans.push(Span::styled(
-            single_line(&app.active_tool_summary(), 20),
-            Style::default().fg(ACCENT),
-        ));
-    }
-
     let compact_spans = vec![
         Span::styled(" ", Style::default()),
         Span::styled(app.status.symbol(), Style::default().fg(app.status.color())),
@@ -1636,10 +1629,10 @@ fn transcript_text(app: &App) -> Text<'static> {
             TranscriptEntry::Message { role, content } => {
                 match role {
                     MessageRole::User => {
-                        lines.push(Line::from(Span::styled(
-                            "  ›",
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        )));
+                        lines.push(Line::from(vec![
+                            Span::styled("  you", Style::default().fg(DIM)),
+                            Span::styled("  ›", Style::default().fg(ACCENT)),
+                        ]));
                     }
                     MessageRole::Assistant => {
                         lines.push(Line::from(Span::styled("  zex", Style::default().fg(DIM))));
@@ -1685,10 +1678,6 @@ fn transcript_text(app: &App) -> Text<'static> {
                 }
                 lines.push(Line::default());
             }
-            TranscriptEntry::Help => {
-                append_help_lines(&mut lines);
-                lines.push(Line::default());
-            }
             TranscriptEntry::Sessions(sessions) => {
                 append_session_lines(&mut lines, sessions);
                 lines.push(Line::default());
@@ -1699,29 +1688,71 @@ fn transcript_text(app: &App) -> Text<'static> {
     Text::from(lines)
 }
 
-fn append_help_lines(lines: &mut Vec<Line<'static>>) {
+fn render_help_overlay(frame: &mut Frame<'_>, app: &App) {
+    if !app.help_open {
+        return;
+    }
+
+    let viewport = centered_feed_area(frame.area());
+    let width = viewport.width.min(76).max(1);
+    let desired_height = command_specs().len() as u16 + 4;
+    let height = viewport.height.min(desired_height).max(1);
+    let area = Rect::new(
+        viewport.x + viewport.width.saturating_sub(width) / 2,
+        viewport.y + viewport.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let inner_width = area.width.saturating_sub(4) as usize;
+    let lines = help_lines(inner_width);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MUTED))
+                    .style(Style::default().bg(SURFACE_RAISED))
+                    .padding(ratatui::widgets::Padding::horizontal(1)),
+            )
+            .style(Style::default().bg(SURFACE_RAISED))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn help_lines(width: usize) -> Vec<Line<'static>> {
     let usage_width = command_specs()
         .iter()
         .map(|command| command.usage.len())
         .max()
         .unwrap_or(0);
-    lines.push(Line::from(Span::styled(
-        "  Commands",
-        Style::default()
-            .fg(TEXT_STRONG)
-            .add_modifier(Modifier::BOLD),
-    )));
-    for command in command_specs() {
-        lines.push(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                format!("{:<usage_width$}", command.usage),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(command.description, Style::default().fg(DIM)),
-        ]));
-    }
+    let wide = width >= usage_width + 2 + 24;
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "Commands",
+            Style::default()
+                .fg(TEXT_STRONG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  Esc close", Style::default().fg(DIM)),
+    ])];
+    lines.extend(command_specs().iter().map(|command| {
+        if wide {
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<usage_width$}", command.usage),
+                    Style::default().fg(ACCENT),
+                ),
+                Span::raw("  "),
+                Span::styled(command.description, Style::default().fg(DIM)),
+            ])
+        } else {
+            Line::from(Span::styled(command.usage, Style::default().fg(ACCENT)))
+        }
+    }));
+    lines
 }
 
 fn append_session_lines(
@@ -1764,6 +1795,10 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
         MessageRole::User => TEXT_STRONG,
         MessageRole::Assistant => TEXT,
     };
+    let content_prefix = match role {
+        MessageRole::User => "    ",
+        MessageRole::Assistant => "  ",
+    };
     let mut in_code_block = false;
 
     for source_line in content.split('\n') {
@@ -1773,7 +1808,7 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
             let language = trimmed.trim_start_matches('`').trim();
             if in_code_block {
                 lines.push(Line::from(vec![
-                    Span::styled("    ┌", Style::default().fg(MUTED)),
+                    Span::styled(format!("{content_prefix}┌"), Style::default().fg(MUTED)),
                     Span::styled(
                         if language.is_empty() {
                             String::new()
@@ -1785,7 +1820,7 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
                 ]));
             } else {
                 lines.push(Line::from(Span::styled(
-                    "    └",
+                    format!("{content_prefix}└"),
                     Style::default().fg(MUTED),
                 )));
             }
@@ -1793,17 +1828,14 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
         }
         if in_code_block {
             lines.push(Line::from(vec![
-                Span::styled("    │ ", Style::default().fg(MUTED)),
-                Span::styled(
-                    source_line.to_owned(),
-                    Style::default().fg(TEXT_STRONG).bg(SURFACE),
-                ),
+                Span::styled(format!("{content_prefix}│ "), Style::default().fg(MUTED)),
+                Span::styled(source_line.to_owned(), Style::default().fg(TEXT_STRONG)),
             ]));
             continue;
         }
         if let Some(heading) = trimmed.strip_prefix("### ") {
             lines.push(Line::from(Span::styled(
-                format!("  {heading}"),
+                format!("{content_prefix}{heading}"),
                 Style::default()
                     .fg(TEXT_STRONG)
                     .add_modifier(Modifier::BOLD),
@@ -1813,122 +1845,104 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
             .or_else(|| trimmed.strip_prefix("# "))
         {
             lines.push(Line::from(Span::styled(
-                format!("  {heading}"),
+                format!("{content_prefix}{heading}"),
                 Style::default()
                     .fg(TEXT_STRONG)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    .add_modifier(Modifier::BOLD),
             )));
         } else if let Some(item) = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
         {
             lines.push(Line::from(vec![
-                Span::styled("    • ", Style::default().fg(ACCENT)),
+                Span::styled(format!("{content_prefix}• "), Style::default().fg(ACCENT)),
                 Span::styled(item.to_owned(), Style::default().fg(base_color)),
             ]));
         } else if let Some((number, item)) = numbered_list_item(trimmed) {
             lines.push(Line::from(vec![
-                Span::styled(format!("    {number}. "), Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!("{content_prefix}{number}. "),
+                    Style::default().fg(ACCENT),
+                ),
                 Span::styled(item.to_owned(), Style::default().fg(base_color)),
             ]));
         } else if let Some(quote) = trimmed.strip_prefix("> ") {
             lines.push(Line::from(vec![
-                Span::styled("    │ ", Style::default().fg(MUTED)),
+                Span::styled(format!("{content_prefix}│ "), Style::default().fg(MUTED)),
                 Span::styled(quote.to_owned(), Style::default().fg(DIM)),
             ]));
         } else {
-            let prefix = if role == MessageRole::User {
-                "    "
-            } else {
-                "  "
-            };
             lines.push(Line::from(Span::styled(
-                format!("{prefix}{source_line}"),
-                Style::default()
-                    .fg(base_color)
-                    .bg(if role == MessageRole::User {
-                        SURFACE
-                    } else {
-                        BACKGROUND
-                    }),
+                format!("{content_prefix}{source_line}"),
+                Style::default().fg(base_color),
             )));
         }
     }
 }
 
 fn append_tool_lines(lines: &mut Vec<Line<'static>>, tool: &ToolEntry, selected: bool) {
-    let marker = if selected { "›" } else { " " };
-    let fold = if tool.expanded {
-        "hide"
-    } else {
-        "Ctrl+O expand"
-    };
+    let marker = if selected { "› " } else { "  " };
+    let fold = if tool.expanded { "▾" } else { "▸" };
     let title = tool_title(tool);
     let elapsed = tool_elapsed(tool);
-    let card_color = if selected { ACCENT } else { MUTED };
+    let rail_color = if selected { ACCENT } else { MUTED };
     lines.push(Line::from(vec![
-        Span::styled(format!("  {marker}╭─ "), Style::default().fg(card_color)),
         Span::styled(
-            title,
-            Style::default()
-                .fg(TEXT_STRONG)
-                .add_modifier(Modifier::BOLD),
+            format!("  {marker}{fold} "),
+            Style::default().fg(rail_color),
         ),
+        Span::styled(title, Style::default().fg(TEXT_STRONG)),
         Span::raw("  "),
         Span::styled(
             format!("{} {}", tool.status.symbol(), tool.status.label()),
             Style::default().fg(tool.status.color()),
         ),
+        Span::styled(
+            format!("  {}", format_duration(elapsed)),
+            Style::default().fg(DIM),
+        ),
     ]));
 
     if !tool.expanded {
-        lines.push(Line::from(vec![
-            Span::styled("    │ ", Style::default().fg(card_color)),
-            Span::styled(tool_summary(tool), Style::default().fg(TEXT)),
-            Span::styled(format!("  {fold}"), Style::default().fg(DIM)),
-        ]));
+        lines.push(Line::from(Span::styled(
+            format!("      {}", tool_summary(tool)),
+            Style::default().fg(DIM),
+        )));
     }
 
     if tool.expanded {
         lines.push(Line::from(Span::styled(
-            "    │ input",
+            "      input",
             Style::default().fg(DIM),
         )));
         for line in tool.arguments.split('\n') {
-            lines.push(Line::from(Span::styled(
-                format!("    │   {line}"),
-                Style::default().fg(TEXT),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled("      │ ", Style::default().fg(MUTED)),
+                Span::styled(line.to_owned(), Style::default().fg(TEXT)),
+            ]));
         }
         lines.push(Line::from(Span::styled(
-            "    │ output",
+            "      output",
             Style::default().fg(DIM),
         )));
         if tool.output.is_empty() {
             lines.push(Line::from(Span::styled(
-                "    │   waiting for result…",
+                "      │ waiting for result…",
                 Style::default().fg(DIM),
             )));
         } else {
             for line in tool.output.split('\n') {
-                lines.push(Line::from(Span::styled(
-                    format!("    │   {line}"),
-                    Style::default().fg(TEXT),
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled("      │ ", Style::default().fg(MUTED)),
+                    Span::styled(line.to_owned(), Style::default().fg(TEXT)),
+                ]));
             }
         }
-    }
-    lines.push(Line::from(vec![
-        Span::styled("    ╰─ ", Style::default().fg(card_color)),
-        Span::styled(
-            format!(
-                "{} · timeout {}",
-                format_duration(elapsed),
-                format_duration(tool.timeout)
-            ),
+        lines.push(Line::from(Span::styled(
+            format!("      timeout {}", format_duration(tool.timeout)),
             Style::default().fg(DIM),
-        ),
-    ]));
+        )));
+    }
     lines.push(Line::default());
 }
 
@@ -1957,18 +1971,29 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn tool_summary(tool: &ToolEntry) -> String {
-    let source = if tool.output.is_empty() {
+    match tool.status {
+        ToolStatus::Running => return "Working…".to_owned(),
+        ToolStatus::Cancelled => return "Interrupted".to_owned(),
+        ToolStatus::Failed => {}
+        ToolStatus::Done if tool.output.trim().is_empty() => return "Completed".to_owned(),
+        ToolStatus::Done => {}
+    }
+
+    if tool.name == "bash" {
+        if let Some(summary) = bash_output_summary(&tool.output) {
+            return summary;
+        }
+        return if tool.status == ToolStatus::Failed {
+            "Command failed".to_owned()
+        } else {
+            "Completed".to_owned()
+        };
+    }
+    let source = if tool.output.trim().is_empty() {
         &tool.arguments
     } else {
         &tool.output
     };
-    if source.trim().is_empty() {
-        return if tool.status == ToolStatus::Running {
-            "waiting for result…".to_owned()
-        } else {
-            "no output".to_owned()
-        };
-    }
     single_line(
         source
             .lines()
@@ -1976,6 +2001,18 @@ fn tool_summary(tool: &ToolEntry) -> String {
             .unwrap_or(source),
         120,
     )
+}
+
+fn bash_output_summary(output: &str) -> Option<String> {
+    let (_, body) = output
+        .strip_prefix("exit_code: ")?
+        .split_once("\nstdout:\n")?;
+    let (stdout, stderr) = body.split_once("\nstderr:\n")?;
+    let summary = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .or_else(|| stderr.lines().find(|line| !line.trim().is_empty()))?;
+    Some(single_line(summary, 120))
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2111,7 +2148,7 @@ fn wrapped_position(input: &str, width: usize) -> (usize, usize) {
 }
 
 fn input_height(input: &InputBuffer, terminal_width: u16) -> u16 {
-    let feed_width = terminal_width.min(MAX_FEED_WIDTH);
+    let feed_width = usable_feed_width(terminal_width);
     let inner_width = feed_width.saturating_sub(2).max(1) as usize;
     let rows = input_metrics(&input.content, input.cursor, inner_width)
         .total_rows
@@ -2158,16 +2195,20 @@ fn short_path(path: &Path, max_chars: usize) -> String {
 }
 
 fn centered_feed_area(area: Rect) -> Rect {
-    if area.width <= MAX_FEED_WIDTH {
-        return area;
-    }
-    let width = MAX_FEED_WIDTH;
+    let width = usable_feed_width(area.width);
     Rect::new(
         area.x + (area.width - width) / 2,
         area.y,
         width,
         area.height,
     )
+}
+
+fn usable_feed_width(terminal_width: u16) -> u16 {
+    terminal_width
+        .saturating_sub(FEED_HORIZONTAL_GUTTER.saturating_mul(2))
+        .min(MAX_FEED_WIDTH)
+        .max(1)
 }
 
 fn numbered_list_item(line: &str) -> Option<(&str, &str)> {
@@ -2943,7 +2984,9 @@ mod tests {
 
         assert!(screen.contains("$ git status"));
         assert!(screen.contains("$ git rev-parse --short HEAD"));
-        assert!(screen.contains("20ms · timeout 30.0s"));
+        assert!(screen.contains("done  20ms"));
+        assert!(!screen.contains("timeout 30.0s"));
+        assert!(!screen.contains("Ctrl+O"));
         assert!(screen.contains("/sessions"));
         assert!(screen.contains("List saved sessions"));
         assert!(screen.contains("think high"));
@@ -2990,6 +3033,11 @@ mod tests {
                 default_tool_timeout: Duration::from_secs(60),
             },
         );
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Keep this conversation visible.".to_owned(),
+        });
+        let transcript_before = app.transcript.clone();
         app.push_command_output(CommandOutput::Help);
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3016,14 +3064,22 @@ mod tests {
                 command.usage
             );
         }
-        assert!(!screen.contains("you"));
+        assert!(screen.contains("Esc close"));
+        assert_eq!(app.transcript, transcript_before);
+        assert!(app.help_open);
+
+        app.cancel_ui_layer();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let closed = format!("{}", terminal.backend());
+        assert!(closed.contains("Keep this conversation visible."));
+        assert!(!closed.contains("Esc close"));
     }
 
     #[test]
-    fn help_wraps_without_merging_adjacent_commands_on_narrow_terminals() {
+    fn help_stays_compact_on_narrow_terminals() {
         let mut app = app();
         app.push_command_output(CommandOutput::Help);
-        let backend = TestBackend::new(38, 32);
+        let backend = TestBackend::new(38, 18);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -3037,6 +3093,7 @@ mod tests {
                 command.usage
             );
         }
+        assert!(!screen.contains("List slash commands"));
         assert!(
             !rows.iter().any(|row| {
                 command_specs()
@@ -3120,7 +3177,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_status_conversation_folded_tool_input_and_help_regions() {
+    fn renders_status_conversation_and_folded_tool_regions() {
         let mut app = App::new(
             &[],
             "gpt-test".to_owned(),
@@ -3167,10 +3224,115 @@ mod tests {
         assert!(screen.contains("zex"));
         assert!(screen.contains("read"));
         assert!(screen.contains("done"));
-        assert!(screen.contains("Ctrl+O expand"));
-        assert!(screen.contains("14ms · timeout 60.0s"));
+        assert!(screen.contains("package zex"));
+        assert!(screen.contains("done  14ms"));
+        assert!(!screen.contains("Ctrl+O expand"));
+        assert!(!screen.contains("timeout 60.0s"));
         assert!(!screen.contains("\"path\": \"Cargo.toml\""));
         assert!(screen.contains("next prompt"));
         assert!(screen.contains("Enter send"));
+    }
+
+    #[test]
+    fn git_status_tool_is_short_by_default_and_expands_in_place() {
+        let mut app = app();
+        app.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::User,
+            delta: "Run git status".to_owned(),
+        });
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-git".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"git status --short --branch","timeout_seconds":30}"#
+                .to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        app.apply_agent_event(AgentEvent::ToolEnd {
+            call_id: "call-git".to_owned(),
+            name: "bash".to_owned(),
+            output:
+                "exit_code: 0\nstdout:\n## main...origin/main [ahead 1]\n M src/tui.rs\n\nstderr:\n"
+                    .to_owned(),
+            is_error: false,
+            elapsed: Duration::from_millis(18),
+        });
+        app.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::Assistant,
+            delta: "Branch `main` is ahead by one commit with one modified file.".to_owned(),
+        });
+        let backend = TestBackend::new(110, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let folded = format!("{}", terminal.backend());
+        assert!(folded.contains("$ git status --short --branch"));
+        assert!(folded.contains("done  18ms"));
+        assert_eq!(folded.matches("## main...origin/main [ahead 1]").count(), 1);
+        assert_eq!(
+            folded
+                .matches("Branch `main` is ahead by one commit with one modified file.")
+                .count(),
+            1
+        );
+        assert!(!folded.contains("exit_code: 0"));
+        assert!(!folded.contains("timeout 30.0s"));
+        assert!(!folded.contains("\"timeout_seconds\": 30"));
+
+        app.toggle_selected_tool();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let expanded = format!("{}", terminal.backend());
+        assert!(expanded.contains("input"));
+        assert!(expanded.contains("output"));
+        assert!(expanded.contains("exit_code: 0"));
+        assert!(expanded.contains("M src/tui.rs"));
+        assert!(expanded.contains("timeout 30.0s"));
+        assert!(expanded.contains("Branch `main` is ahead by one commit"));
+    }
+
+    #[test]
+    fn quiet_shell_command_uses_completed_summary_without_metadata() {
+        let mut app = app();
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-quiet".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"git status --porcelain"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        app.apply_agent_event(AgentEvent::ToolEnd {
+            call_id: "call-quiet".to_owned(),
+            name: "bash".to_owned(),
+            output: "exit_code: 0\nstdout:\n\nstderr:\n".to_owned(),
+            is_error: false,
+            elapsed: Duration::from_millis(9),
+        });
+        let backend = TestBackend::new(90, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        assert!(screen.contains("Completed"));
+        assert!(!screen.contains("exit_code: 0"));
+        assert!(!screen.contains("stdout:"));
+        assert!(!screen.contains("stderr:"));
+    }
+
+    #[test]
+    fn busy_state_lives_in_the_footer_without_feed_noise() {
+        let mut app = app();
+        app.start_turn();
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-running".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"git status"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        assert_eq!(screen.matches("Agent is working").count(), 1);
+        assert!(screen.contains("$ git status"));
+        assert!(screen.contains("running"));
     }
 }
