@@ -183,7 +183,12 @@ where
             let saved_id = if agent.has_conversation() {
                 Some(
                     session_store
-                        .save(session_id.as_deref(), agent.model(), agent.messages())
+                        .save(
+                            session_id.as_deref(),
+                            agent.model(),
+                            agent.thinking_preference(),
+                            agent.messages(),
+                        )
                         .await?,
                 )
             } else {
@@ -220,6 +225,9 @@ where
                     format!("Session {requested_id:?} not found. Use /resume to choose a session.")
                 })?;
             let resumed_id = loaded.id;
+            if let Some(thinking_level) = loaded.thinking_level {
+                agent.set_thinking_level(thinking_level);
+            }
             agent.replace_messages(loaded.messages);
             *session_id = Some(resumed_id.clone());
             Ok(CommandResult {
@@ -243,15 +251,40 @@ where
             })
         }
         SlashCommand::Think(requested) => {
-            let thinking_level = requested.unwrap_or_else(|| agent.cycle_thinking_level());
-            agent.set_thinking_level(thinking_level);
-            persist_thinking_level(working_dir, thinking_level).await?;
-            let message = match agent.thinking_level() {
-                Some(level) => format!("Thinking · {level}"),
-                None => format!(
-                    "Thinking · n/a for {} · preference {thinking_level}",
-                    agent.model()
-                ),
+            let thinking_level = match requested {
+                Some(thinking_level) => {
+                    agent.set_thinking_level(thinking_level);
+                    persist_thinking_level(working_dir, thinking_level).await?;
+                    if agent.has_conversation() {
+                        *session_id = Some(
+                            session_store
+                                .save(
+                                    session_id.as_deref(),
+                                    agent.model(),
+                                    thinking_level,
+                                    agent.messages(),
+                                )
+                                .await?,
+                        );
+                    }
+                    thinking_level
+                }
+                None => agent.thinking_preference(),
+            };
+            let effective = agent.thinking_level();
+            let available = agent
+                .thinking_capabilities()
+                .available_levels()
+                .into_iter()
+                .map(|level| level.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let message = if thinking_level == effective {
+                format!("Thinking · {thinking_level} · available {available}")
+            } else {
+                format!(
+                    "Thinking · requested {thinking_level} · effective {effective} · available {available}"
+                )
             };
             Ok(CommandResult {
                 output: CommandOutput::Status(message),
@@ -269,6 +302,7 @@ mod execution_tests {
     use std::{
         collections::VecDeque,
         sync::Mutex,
+        sync::atomic::{AtomicU64, Ordering},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -290,7 +324,7 @@ mod execution_tests {
         async fn complete(
             &self,
             _model: &str,
-            _thinking_level: Option<crate::provider::ThinkingLevel>,
+            _thinking_level: crate::provider::ThinkingLevel,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _events: &crate::agent::EventSender,
@@ -310,11 +344,16 @@ mod execution_tests {
     }
 
     fn temporary_directory() -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("zex-command-{}-{unique}", std::process::id()))
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "zex-command-{}-{unique}-{sequence}",
+            std::process::id()
+        ))
     }
 
     fn agent(messages: Vec<Message>) -> Agent<IdleProvider> {
@@ -382,6 +421,7 @@ mod execution_tests {
             .save(
                 None,
                 "saved-model",
+                crate::provider::ThinkingLevel::Medium,
                 &[Message::User {
                     content: "saved context".to_owned(),
                 }],
@@ -403,6 +443,7 @@ mod execution_tests {
         assert_eq!(result.effect, CommandEffect::ReplaceView);
         assert_eq!(session_id.as_deref(), Some(resumed_id.as_str()));
         assert_eq!(agent.model(), "model-a");
+        assert_eq!(agent.thinking_preference(), ThinkingLevel::Medium);
         assert!(agent.messages().iter().any(
             |message| matches!(message, Message::User { content } if content == "saved context")
         ));
@@ -417,6 +458,7 @@ mod execution_tests {
             .save(
                 None,
                 "older-model",
+                crate::provider::ThinkingLevel::Medium,
                 &[Message::User {
                     content: "older context".to_owned(),
                 }],
@@ -428,6 +470,7 @@ mod execution_tests {
             .save(
                 None,
                 "newer-model",
+                crate::provider::ThinkingLevel::Medium,
                 &[Message::User {
                     content: "newer context".to_owned(),
                 }],
@@ -482,6 +525,7 @@ mod execution_tests {
             .save(
                 None,
                 "saved-model",
+                crate::provider::ThinkingLevel::Medium,
                 &[Message::User {
                     content: "saved context".to_owned(),
                 }],
@@ -567,6 +611,7 @@ mod execution_tests {
             .save(
                 None,
                 "saved-model",
+                crate::provider::ThinkingLevel::Medium,
                 &[Message::User {
                     content: "saved context".to_owned(),
                 }],
@@ -587,7 +632,12 @@ mod execution_tests {
         .unwrap();
         agent.prompt("continued question").await.unwrap();
         let saved_id = store
-            .save(session_id.as_deref(), agent.model(), agent.messages())
+            .save(
+                session_id.as_deref(),
+                agent.model(),
+                agent.thinking_preference(),
+                agent.messages(),
+            )
             .await
             .unwrap();
         let reloaded = store.load(Some(&resumed_id)).await.unwrap().unwrap();
@@ -671,12 +721,38 @@ mod execution_tests {
         assert_eq!(agent.thinking_preference(), ThinkingLevel::High);
         assert!(matches!(
             result.output,
-            CommandOutput::Status(message) if message == "Thinking · n/a for model-a · preference high"
+            CommandOutput::Status(message)
+                if message == "Thinking · high · available off, low, medium, high"
         ));
         let config = tokio::fs::read_to_string(directory.join(".zex/config.toml"))
             .await
             .unwrap();
-        assert!(config.contains("thinking_level = \"high\""));
+        assert!(config.contains("default_thinking_level = \"high\""));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn think_command_updates_the_active_session_header() {
+        let directory = temporary_directory();
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let store = SessionStore::new(directory.join("sessions"));
+        let mut agent = agent(vec![Message::User {
+            content: "active conversation".to_owned(),
+        }]);
+        let mut session_id = None;
+
+        execute(
+            SlashCommand::Think(Some(ThinkingLevel::Max)),
+            &mut agent,
+            &store,
+            &mut session_id,
+            &directory,
+        )
+        .await
+        .unwrap();
+
+        let loaded = store.load(session_id.as_deref()).await.unwrap().unwrap();
+        assert_eq!(loaded.thinking_level, Some(ThinkingLevel::Max));
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }

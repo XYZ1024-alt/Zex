@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::agent::Message;
+use crate::provider::ThinkingLevel;
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -19,6 +20,7 @@ pub struct SessionStore {
 pub struct LoadedSession {
     pub id: String,
     pub messages: Vec<Message>,
+    pub thinking_level: Option<ThinkingLevel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +39,8 @@ struct SessionHeader {
     updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking_level: Option<ThinkingLevel>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,6 +59,7 @@ impl SessionStore {
         &self,
         session_id: Option<&str>,
         model: &str,
+        thinking_level: ThinkingLevel,
         messages: &[Message],
     ) -> Result<String> {
         tokio::fs::create_dir_all(&self.directory)
@@ -82,6 +87,7 @@ impl SessionStore {
             created_at,
             updated_at: format_timestamp(now)?,
             model: Some(model.to_owned()),
+            thinking_level: Some(thinking_level),
         };
         let content = serialize_session(header, messages)?;
         let temporary_path = self.directory.join(format!("{id}.jsonl.tmp"));
@@ -122,6 +128,7 @@ impl SessionStore {
             Ok((header, messages)) => Ok(Some(LoadedSession {
                 id: header.id,
                 messages,
+                thinking_level: header.thinking_level,
             })),
             Err(error)
                 if error
@@ -362,18 +369,43 @@ mod tests {
             },
         ];
 
-        let id = store.save(None, "model-a", &first).await.unwrap();
+        let id = store
+            .save(
+                None,
+                "model-a",
+                crate::provider::ThinkingLevel::Medium,
+                &first,
+            )
+            .await
+            .unwrap();
         let resumed = store.load(Some(&id)).await.unwrap().unwrap();
         assert_eq!(resumed.id, id);
         assert_eq!(resumed.messages, first);
+        assert_eq!(
+            resumed.thinking_level,
+            Some(crate::provider::ThinkingLevel::Medium)
+        );
 
-        store.save(Some(&id), "model-b", &second).await.unwrap();
+        store
+            .save(
+                Some(&id),
+                "model-b",
+                crate::provider::ThinkingLevel::High,
+                &second,
+            )
+            .await
+            .unwrap();
         let sessions = store.list().await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, id);
         assert_eq!(sessions[0].message_count, 2);
         assert_eq!(sessions[0].preview, "first task");
-        assert_eq!(store.load(None).await.unwrap().unwrap().messages, second);
+        let loaded = store.load(None).await.unwrap().unwrap();
+        assert_eq!(loaded.messages, second);
+        assert_eq!(
+            loaded.thinking_level,
+            Some(crate::provider::ThinkingLevel::High)
+        );
         let persisted = tokio::fs::read_to_string(directory.join(format!("{id}.jsonl")))
             .await
             .unwrap();
@@ -390,6 +422,7 @@ mod tests {
             .save(
                 None,
                 "model",
+                crate::provider::ThinkingLevel::Medium,
                 &[Message::User {
                     content: "hello".to_owned(),
                 }],
@@ -464,6 +497,7 @@ mod tests {
             .save(
                 None,
                 "model",
+                crate::provider::ThinkingLevel::Medium,
                 &[Message::User {
                     content: "older".to_owned(),
                 }],
@@ -475,6 +509,7 @@ mod tests {
             .save(
                 None,
                 "model",
+                crate::provider::ThinkingLevel::Medium,
                 &[Message::User {
                     content: "newer".to_owned(),
                 }],

@@ -30,7 +30,7 @@ Zex 按以下顺序合并配置，后者覆盖前者：
 
 可用 `ZEX_CONFIG_DIR` 覆盖整个全局目录，便于便携安装和隔离测试。
 
-会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建/更新时间和保存时的 model；后续每行是一条 Agent 消息。会话不保存 API Key、base URL 或其他敏感运行配置。恢复会话只恢复消息，不改变当前通过 `/model` 选择的模型。
+会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建/更新时间、保存时的 model 和当前 `thinking_level`；后续每行是一条 Agent 消息。会话不保存 API Key、base URL 或其他敏感运行配置。恢复会话会恢复消息与思考级别，但不改变当前通过 `/model` 选择的模型。
 
 项目配置示例：
 
@@ -43,8 +43,8 @@ agent_timeout_seconds = 600
 max_tool_output_chars = 32000
 max_context_chars = 120000
 compact_keep_turns = 6
-thinking_level = "medium"
-show_thinking = true
+default_thinking_level = "medium"
+hide_thinking_block = false
 
 [[providers]]
 id = "openai"
@@ -56,7 +56,22 @@ openai_api = "responses"
 [[providers.models]]
 id = "gpt-4.1-mini"
 display_name = "GPT-4.1 Mini"
-supports_thinking = false
+
+[providers.models.thinking]
+min_level = "low"
+max_level = "max"
+mode = "effort"
+
+[providers.models.compat]
+supports_reasoning_effort = true
+supports_interleaved_thinking = true
+
+[providers.models.compat.reasoning_effort_map]
+low = "low"
+medium = "medium"
+high = "high"
+xhigh = "xhigh"
+max = "max"
 ```
 
 支持的 TOML 字段：
@@ -71,8 +86,8 @@ supports_thinking = false
 | `max_tool_output_chars` | `32000` | 所有内置工具返回内容的统一字符上限 |
 | `max_context_chars` | `120000` | 上下文字符预算近似值；达到 85% 时自动 compact |
 | `compact_keep_turns` | `6` | compact 时完整保留的最近用户轮次数 |
-| `thinking_level` | `medium` | 思考强度偏好：`off`、`low`、`medium`、`high`；不支持的模型显示 `n/a` |
-| `show_thinking` | `true` | 是否在 TUI 时间流中显示默认折叠的思考卡片；隐藏不删除会话数据，也不影响模型实际思考 |
+| `default_thinking_level` | `medium` | 新会话默认思考强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
+| `hide_thinking_block` | `false` | 是否隐藏 TUI 中默认折叠的思考卡片；隐藏不删除会话数据，也不影响模型实际思考 |
 | `session_dir` | 全局 `sessions` 目录 | 自定义会话目录；相对路径基于项目工作目录 |
 
 旧的顶层 `api_key`、`model`、`base_url`、`openai_api` 仍会在没有 `providers` 时作为单个 `default` Provider 载入；首次从 `/provider` 保存后会写入新结构并移除这些顶层字段。对应环境变量仅参与这个旧配置迁移路径。
@@ -90,8 +105,8 @@ supports_thinking = false
 | `ZEX_MAX_TOOL_OUTPUT_CHARS` | 无 | `max_tool_output_chars` |
 | `ZEX_MAX_CONTEXT_CHARS` | 无 | `max_context_chars` |
 | `ZEX_COMPACT_KEEP_TURNS` | 无 | `compact_keep_turns` |
-| `ZEX_THINKING_LEVEL` | 无 | `thinking_level` |
-| `ZEX_SHOW_THINKING` | 无 | `show_thinking` |
+| `ZEX_DEFAULT_THINKING_LEVEL` | 无 | `default_thinking_level` |
+| `ZEX_HIDE_THINKING_BLOCK` | 无 | `hide_thinking_block` |
 | `ZEX_SESSION_DIR` | 无 | `session_dir` |
 
 PowerShell 示例：
@@ -163,6 +178,8 @@ TUI 占满 terminal 工作区，但不铺自定义整屏背景。它保持单列
 
 思考内容优先读取 Provider 的 `reasoning_content`、`reasoning`、`reasoning_details` / `thinking_blocks` 或 Responses API reasoning summary；缺少显式字段时再解析完整的 `<think>...</think>`。思考与 assistant 最终回答、tool call 分开保存，并在单一时间流中显示为默认折叠卡片。`/thinking show|hide` 控制卡片可见性并持久化，隐藏期间数据仍保留，因此再次显示或恢复会话时可重新渲染；该开关独立于 `/think` 的模型思考强度。
 
+Provider 与模型都可声明 `[thinking]`（`min_level`、`max_level`、`mode = "effort"`）和 `[compat]`（`supports_reasoning_effort`、`supports_interleaved_thinking`、`reasoning_effort_map`）。模型设置覆盖 Provider 默认值；缺失能力时使用安全范围 `off/low/medium/high`，因此 `xhigh` 和 `max` 会降级到 `high`，不会原样发送未知值。工具调用轮次仅在目标模型声明支持 interleaved thinking 时回传 reasoning；最终回答及不支持该能力的模型历史会在请求层剥离 reasoning，但会话中的可查看内容仍保留。
+
 思考和 tool 卡片都使用近黑 surface 和细 accent rail。tool 标题突出工具名；`bash` 显示 `$ command`。默认态只显示标题、running/done/failed/interrupted、耗时和一行结果摘要；无输出的成功命令显示 `Completed`。`exit_code`、stdout/stderr 全文、timeout 和参数只在展开后出现，`Ctrl-O` 展开或折叠当前卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 只在状态变化、输入、新事件或 toast 过期时按固定帧率差分重绘。
 
 | 快捷键 | idle 模式 | turn 运行中 |
@@ -178,7 +195,7 @@ TUI 占满 terminal 工作区，但不铺自定义整屏背景。它保持单列
 | Up / Down | 补全打开时选择上一项 / 下一项；否则浏览已发送输入并恢复草稿 | — |
 | Ctrl-O | 展开 / 折叠当前思考或 tool 卡片；未选择时作用于最近一条 | 同左 |
 | Ctrl-E | 展开 / 折叠最近一条错误详情 | 同左 |
-| Ctrl-T | 循环切换 `off → low → medium → high` 并持久化 | — |
+| Ctrl-T | 循环当前模型声明的可用级别并持久化 | — |
 
 粘贴使用终端 bracketed paste，允许直接粘贴多行内容。当前 turn 运行时输入区锁定，避免草稿与执行中状态混淆；Ctrl-C 中断后，已输入的用户消息保留，未完成的 assistant/tool 状态不会进入后续 Provider 上下文。
 
@@ -195,7 +212,7 @@ TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册�
 | `/sessions` | 查看保存的会话；复用 `SessionStore::list` 列出 ID、更新时间、消息数和预览 |
 | `/resume [id]` | 无参数时打开历史会话选择列表；有参数时直接恢复指定会话。只恢复消息，不改变当前模型 |
 | `/compact` | 立即压缩旧上下文，显示压缩前后字符数、约释放字符数、保留轮次和摘要数量 |
-| `/think [off\|low\|medium\|high]` | 无参数时循环切换；有参数时直接设置。写入项目 `.zex/config.toml`；模型不支持时显示 `n/a` 并保留偏好 |
+| `/think [off\|minimal\|low\|medium\|high\|xhigh\|max]` | 无参数时显示当前请求值、有效值与模型可用级别；有参数时设置并自动 clamp/map。写入项目默认值及活跃会话 |
 | `/thinking [show\|hide]` | 无参数时显示当前思考卡片可见性；有参数时独立设置并写入项目 `.zex/config.toml` |
 
 stdin 或 stdout 不是 TTY 时自动保留普通终端 REPL：
@@ -395,7 +412,7 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
     2. 要求模型连续执行 `git status` 和 `git rev-parse --short HEAD`。预期同一 feed 内出现两个 `$ git …` surface 卡片；默认折叠态只显示状态、耗时和短摘要，展开后才显示完整 output、参数和 timeout。
     3. 按 Tab 选中工具并按 Ctrl-O 展开/折叠。
     4. 输入 `/think high`，再连续按 Ctrl-T。预期状态栏 think 更新，项目 `.zex/config.toml` 写入最新偏好；每次只更新 toast，不向主 feed 追加消息。不支持推理强度的模型显示 `n/a`，不崩溃。
-    5. 输入 `/thinking hide` 后提交会返回思考内容的请求。预期不显示思考卡片，但最终回答和 tool 卡片不受影响；输入 `/thinking show` 后新返回的思考内容恢复为默认折叠卡片，配置写入 `show_thinking`。
+    5. 输入 `/thinking hide` 后提交会返回思考内容的请求。预期不显示思考卡片，但最终回答和 tool 卡片不受影响；输入 `/thinking show` 后新返回的思考内容恢复为默认折叠卡片，配置写入 `hide_thinking_block`。
 
 ## 模块
 

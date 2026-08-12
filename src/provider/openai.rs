@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::{
     agent::{AgentEvent, AssistantMessage, EventSender, Message, MessageRole, ToolCall},
-    provider::{OpenAiApi, Provider, ThinkingLevel, ToolDefinition},
+    provider::{NormalizedThinking, OpenAiApi, Provider, ThinkingLevel, ToolDefinition},
 };
 
 #[derive(Debug, Clone)]
@@ -42,21 +42,18 @@ impl OpenAiProvider {
     async fn send_request(
         &self,
         model: &str,
-        thinking_level: Option<ThinkingLevel>,
+        thinking: &NormalizedThinking,
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<reqwest::Response> {
         let request = self.client.post(&self.endpoint).bearer_auth(&self.api_key);
         let response = match self.api {
             OpenAiApi::ChatCompletions => {
-                request.json(&ChatRequest::new(model, thinking_level, messages, tools))
+                request.json(&ChatRequest::new(model, thinking, messages, tools))
             }
-            OpenAiApi::Responses => request.json(&ResponsesRequest::new(
-                model,
-                thinking_level,
-                messages,
-                tools,
-            )),
+            OpenAiApi::Responses => {
+                request.json(&ResponsesRequest::new(model, thinking, messages, tools))
+            }
         }
         .send()
         .await
@@ -73,24 +70,16 @@ impl OpenAiProvider {
             .unwrap_or_else(|error| format!("<failed to read response body: {error}>"));
         bail!("OpenAI-compatible provider returned {status}: {body}");
     }
-}
 
-impl Provider for OpenAiProvider {
-    fn supports_thinking(&self, model: &str) -> bool {
-        model_supports_thinking(model)
-    }
-
-    async fn complete(
+    pub(crate) async fn complete_normalized(
         &self,
         model: &str,
-        thinking_level: Option<ThinkingLevel>,
+        thinking: &NormalizedThinking,
         messages: &[Message],
         tools: &[ToolDefinition],
         events: &EventSender,
     ) -> Result<AssistantMessage> {
-        let response = self
-            .send_request(model, thinking_level, messages, tools)
-            .await?;
+        let response = self.send_request(model, thinking, messages, tools).await?;
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -105,13 +94,29 @@ impl Provider for OpenAiProvider {
     }
 }
 
+impl Provider for OpenAiProvider {
+    async fn complete(
+        &self,
+        model: &str,
+        thinking_level: ThinkingLevel,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        events: &EventSender,
+    ) -> Result<AssistantMessage> {
+        let capabilities = self.thinking_capabilities(model);
+        let thinking = crate::provider::normalize_thinking_level(&capabilities, thinking_level);
+        self.complete_normalized(model, &thinking, messages, tools, events)
+            .await
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<WireMessage<'a>>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,7 +126,7 @@ struct ChatRequest<'a> {
 impl<'a> ChatRequest<'a> {
     fn new(
         model: &'a str,
-        thinking_level: Option<ThinkingLevel>,
+        thinking: &'a NormalizedThinking,
         messages: &'a [Message],
         tools: &'a [ToolDefinition],
     ) -> Self {
@@ -129,7 +134,7 @@ impl<'a> ChatRequest<'a> {
             model,
             messages: messages.iter().map(WireMessage::from).collect(),
             stream: true,
-            reasoning_effort: thinking_level.and_then(ThinkingLevel::as_provider_value),
+            reasoning_effort: thinking.provider_value.as_deref(),
             tools: tools.iter().map(WireTool::from).collect(),
             tool_choice: (!tools.is_empty()).then_some("auto"),
         }
@@ -256,7 +261,7 @@ struct ResponsesRequest<'a> {
     stream: bool,
     store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ResponsesReasoning>,
+    reasoning: Option<ResponsesReasoning<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ResponsesTool<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -266,7 +271,7 @@ struct ResponsesRequest<'a> {
 impl<'a> ResponsesRequest<'a> {
     fn new(
         model: &'a str,
-        thinking_level: Option<ThinkingLevel>,
+        thinking: &'a NormalizedThinking,
         messages: &'a [Message],
         tools: &'a [ToolDefinition],
     ) -> Self {
@@ -278,8 +283,9 @@ impl<'a> ResponsesRequest<'a> {
                 .collect(),
             stream: true,
             store: false,
-            reasoning: thinking_level
-                .and_then(ThinkingLevel::as_provider_value)
+            reasoning: thinking
+                .provider_value
+                .as_deref()
                 .map(|effort| ResponsesReasoning { effort }),
             tools: tools.iter().map(ResponsesTool::from).collect(),
             tool_choice: (!tools.is_empty()).then_some("auto"),
@@ -288,8 +294,8 @@ impl<'a> ResponsesRequest<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct ResponsesReasoning {
-    effort: &'static str,
+struct ResponsesReasoning<'a> {
+    effort: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -413,21 +419,6 @@ impl<'a> From<&'a ToolDefinition> for ResponsesTool<'a> {
     }
 }
 
-fn model_supports_thinking(model: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase();
-    model.starts_with("gpt-5")
-        || model.starts_with("o1")
-        || model.starts_with("o3")
-        || model.starts_with("o4")
-        || model.contains("deepseek")
-        || model.contains("claude")
-        || model.contains("gemini")
-        || model.contains("qwen")
-        || model.contains("grok")
-        || model.contains("magistral")
-        || model.contains("reasoning")
-}
-
 #[derive(Debug, Serialize)]
 struct WireToolDefinition<'a> {
     name: &'a str,
@@ -451,6 +442,7 @@ struct StreamDelta {
     content: Option<String>,
     reasoning_content: Option<String>,
     reasoning: Option<String>,
+    thinking: Option<String>,
     reasoning_details: Option<Vec<Value>>,
     thinking_blocks: Option<Vec<Value>>,
     provider_specific_fields: Option<Value>,
@@ -610,12 +602,16 @@ fn consume_sse_line(
             content: content_delta,
             reasoning_content,
             reasoning,
+            thinking: direct_thinking,
             reasoning_details,
             thinking_blocks,
             provider_specific_fields,
             tool_calls: delta_tool_calls,
         } = choice.delta;
-        let reasoning_delta = reasoning_content.as_deref().or(reasoning.as_deref());
+        let reasoning_delta = reasoning_content
+            .as_deref()
+            .or(reasoning.as_deref())
+            .or(direct_thinking.as_deref());
         let direct_thinking_blocks = thinking_blocks.as_deref();
         let provider_thinking_blocks = provider_specific_fields
             .as_ref()
@@ -784,6 +780,7 @@ struct NonStreamMessage {
     content: Option<String>,
     reasoning_content: Option<String>,
     reasoning: Option<String>,
+    thinking: Option<String>,
     reasoning_details: Option<Value>,
     thinking_blocks: Option<Value>,
     #[serde(default)]
@@ -819,12 +816,13 @@ fn parse_chat_non_stream_body(body: &[u8], events: &EventSender) -> Result<Assis
         content,
         reasoning_content,
         reasoning,
+        thinking: direct_thinking,
         reasoning_details,
         thinking_blocks,
         tool_calls,
     } = message;
     let content = content.unwrap_or_default();
-    let raw_reasoning = reasoning_content.or(reasoning);
+    let raw_reasoning = reasoning_content.or(reasoning).or(direct_thinking);
     let explicit_thinking = raw_reasoning
         .clone()
         .or_else(|| {
@@ -972,7 +970,14 @@ fn parse_responses_stream_body(body: &[u8], events: &EventSender) -> Result<Assi
     let completion_events =
         std::iter::from_fn(|| completion_event_receiver.try_recv().ok()).collect::<Vec<_>>();
     if !content.is_empty() {
-        message.content = content;
+        let (fallback_thinking, stripped_content) = split_think_tags(&content);
+        message.content = stripped_content;
+        if thinking.is_empty()
+            && message.thinking.is_none()
+            && let Some(fallback_thinking) = fallback_thinking
+        {
+            thinking = fallback_thinking;
+        }
     }
     if !thinking.is_empty() {
         message.thinking = Some(thinking);
@@ -1035,6 +1040,12 @@ fn finish_responses_message(
             }
             _ => {}
         }
+    }
+    let (fallback_thinking, content) = split_think_tags(&content);
+    if thinking.is_empty()
+        && let Some(fallback_thinking) = fallback_thinking
+    {
+        thinking = fallback_thinking;
     }
 
     if !thinking.is_empty() {
@@ -1394,9 +1405,14 @@ data: [DONE]
             })),
         }];
 
+        let thinking = crate::provider::NormalizedThinking {
+            requested: ThinkingLevel::Off,
+            clamped: ThinkingLevel::Off,
+            provider_value: None,
+        };
         let request = serde_json::to_value(super::ChatRequest::new(
             "deepseek-reasoner",
-            None,
+            &thinking,
             &messages,
             &[],
         ))
@@ -1461,9 +1477,18 @@ data: [DONE]
             }),
         }];
 
-        let request =
-            serde_json::to_value(ResponsesRequest::new("test-model", None, &messages, &tools))
-                .unwrap();
+        let thinking = crate::provider::NormalizedThinking {
+            requested: ThinkingLevel::Off,
+            clamped: ThinkingLevel::Off,
+            provider_value: None,
+        };
+        let request = serde_json::to_value(ResponsesRequest::new(
+            "test-model",
+            &thinking,
+            &messages,
+            &tools,
+        ))
+        .unwrap();
         assert_eq!(request["stream"], true);
         assert_eq!(request["store"], false);
         assert_eq!(request["tools"][0]["type"], "function");
@@ -1480,25 +1505,23 @@ data: [DONE]
         let messages = vec![Message::User {
             content: "think".to_owned(),
         }];
-        let responses = serde_json::to_value(ResponsesRequest::new(
-            "gpt-5",
-            Some(ThinkingLevel::High),
-            &messages,
-            &[],
-        ))
-        .unwrap();
+        let high = crate::provider::NormalizedThinking {
+            requested: ThinkingLevel::Max,
+            clamped: ThinkingLevel::High,
+            provider_value: Some("high".to_owned()),
+        };
+        let responses =
+            serde_json::to_value(ResponsesRequest::new("gpt-5", &high, &messages, &[])).unwrap();
         assert_eq!(responses["reasoning"]["effort"], "high");
 
-        let chat = serde_json::to_value(super::ChatRequest::new(
-            "gpt-5",
-            Some(ThinkingLevel::Low),
-            &messages,
-            &[],
-        ))
-        .unwrap();
+        let low = crate::provider::NormalizedThinking {
+            requested: ThinkingLevel::Low,
+            clamped: ThinkingLevel::Low,
+            provider_value: Some("low".to_owned()),
+        };
+        let chat =
+            serde_json::to_value(super::ChatRequest::new("gpt-5", &low, &messages, &[])).unwrap();
         assert_eq!(chat["reasoning_effort"], "low");
-        assert!(super::model_supports_thinking("deepseek-reasoner"));
-        assert!(super::model_supports_thinking("anthropic/claude-sonnet-4"));
     }
 
     #[test]

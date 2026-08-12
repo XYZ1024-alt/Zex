@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::agent::CompactStats;
+use crate::provider::ThinkingLevel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRole {
@@ -18,6 +19,11 @@ pub enum AgentEvent {
     },
     ThinkingDelta {
         delta: String,
+    },
+    ThinkingNormalized {
+        requested: ThinkingLevel,
+        clamped: ThinkingLevel,
+        provider_value: Option<String>,
     },
     ToolStart {
         call_id: String,

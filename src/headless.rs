@@ -153,6 +153,14 @@ fn print_event(event: AgentEvent) -> Result<()> {
             }
         },
         AgentEvent::ThinkingDelta { .. } => {}
+        AgentEvent::ThinkingNormalized {
+            requested,
+            clamped,
+            provider_value,
+        } => eprintln!(
+            "[thinking] requested={requested} clamped={clamped} upstream={}",
+            provider_value.as_deref().unwrap_or("<omitted>")
+        ),
         AgentEvent::ToolStart { name, .. } => println!("\n[tool] {name}"),
         AgentEvent::ToolEnd { name, is_error, .. } => {
             let status = if is_error { "failed" } else { "done" };

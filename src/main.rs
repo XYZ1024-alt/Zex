@@ -41,7 +41,6 @@ async fn main() -> Result<()> {
     };
     let config = Config::load().await?;
     let mut session_id = loaded_session.as_ref().map(|session| session.id.clone());
-    let resumed_messages = loaded_session.map(|session| session.messages);
     let Config {
         providers,
         active_model,
@@ -53,9 +52,14 @@ async fn main() -> Result<()> {
         max_tool_output_chars,
         max_context_chars,
         compact_keep_turns,
-        thinking_level,
-        show_thinking,
+        default_thinking_level,
+        hide_thinking_block,
     } = config;
+    let thinking_level = loaded_session
+        .as_ref()
+        .and_then(|session| session.thinking_level)
+        .unwrap_or(default_thinking_level);
+    let resumed_messages = loaded_session.map(|session| session.messages);
     if !configured && !tui::is_available() {
         anyhow::bail!("no Provider configured; start Zex in a TTY and use /provider");
     }
@@ -107,7 +111,7 @@ async fn main() -> Result<()> {
                 &mut session_id,
                 tui::TuiContext {
                     working_dir: &working_dir,
-                    show_thinking,
+                    hide_thinking_block,
                     providers,
                     provider_registry,
                 },
@@ -125,14 +129,24 @@ async fn main() -> Result<()> {
 
     let save_result = match &result {
         Err(error) => session_store
-            .save(session_id.as_deref(), agent.model(), agent.messages())
+            .save(
+                session_id.as_deref(),
+                agent.model(),
+                agent.thinking_preference(),
+                agent.messages(),
+            )
             .await
             .map_err(|save_error| {
                 anyhow::anyhow!("failed to save the session after {error:#}: {save_error:#}")
             })
             .map(Some),
         Ok(()) if agent.has_conversation() => session_store
-            .save(session_id.as_deref(), agent.model(), agent.messages())
+            .save(
+                session_id.as_deref(),
+                agent.model(),
+                agent.thinking_preference(),
+                agent.messages(),
+            )
             .await
             .map(Some),
         Ok(()) => Ok(None),

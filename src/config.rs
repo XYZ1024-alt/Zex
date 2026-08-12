@@ -8,7 +8,9 @@ use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{OpenAiApi, ThinkingLevel};
+use crate::provider::{
+    OpenAiApi, ThinkingCapabilities, ThinkingCompat, ThinkingConfig, ThinkingLevel,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_TOOL_TIMEOUT_SECONDS: u64 = 60;
@@ -67,10 +69,10 @@ impl std::fmt::Debug for SecretValue {
 pub struct ModelConfig {
     pub id: String,
     pub display_name: String,
-    #[serde(default)]
-    pub supports_thinking: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_thinking_level: Option<ThinkingLevel>,
+    pub thinking: Option<ThinkingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<ThinkingCompat>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +83,10 @@ pub struct ProviderConfig {
     pub api_key: SecretValue,
     #[serde(default)]
     pub openai_api: OpenAiApi,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<ThinkingCompat>,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
 }
@@ -98,8 +104,7 @@ pub struct ModelChoice {
     pub target: ModelRef,
     pub provider_name: String,
     pub model_name: String,
-    pub supports_thinking: bool,
-    pub default_thinking_level: Option<ThinkingLevel>,
+    pub thinking: ThinkingCapabilities,
 }
 
 impl ProviderCatalog {
@@ -114,8 +119,7 @@ impl ProviderCatalog {
                     },
                     provider_name: provider.display_name.clone(),
                     model_name: model.display_name.clone(),
-                    supports_thinking: model.supports_thinking,
-                    default_thinking_level: model.default_thinking_level,
+                    thinking: Self::resolved_thinking(provider, model),
                 })
             })
             .collect()
@@ -138,6 +142,19 @@ impl ProviderCatalog {
 
     pub fn contains(&self, target: &ModelRef) -> bool {
         self.model(target).is_some()
+    }
+
+    pub fn thinking_capabilities(&self, target: &ModelRef) -> ThinkingCapabilities {
+        self.model(target)
+            .map(|(provider, model)| Self::resolved_thinking(provider, model))
+            .unwrap_or_default()
+    }
+
+    fn resolved_thinking(provider: &ProviderConfig, model: &ModelConfig) -> ThinkingCapabilities {
+        let mut capabilities = ThinkingCapabilities::default();
+        capabilities.apply(provider.thinking.as_ref(), provider.compat.as_ref());
+        capabilities.apply(model.thinking.as_ref(), model.compat.as_ref());
+        capabilities
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -181,14 +198,17 @@ impl ProviderCatalog {
                         provider.id
                     );
                 }
-                if !model.supports_thinking && model.default_thinking_level.is_some() {
-                    bail!(
-                        "model {}/{} cannot define a thinking level when thinking is disabled",
-                        provider.id,
-                        model.id
-                    );
-                }
+                validate_thinking(
+                    &format!("model {}/{}", provider.id, model.id),
+                    model.thinking.as_ref(),
+                    model.compat.as_ref(),
+                )?;
             }
+            validate_thinking(
+                &format!("provider {}", provider.id),
+                provider.thinking.as_ref(),
+                provider.compat.as_ref(),
+            )?;
         }
 
         if let Some(active_model) = &self.active_model
@@ -206,6 +226,36 @@ impl ProviderCatalog {
     }
 }
 
+fn validate_thinking(
+    owner: &str,
+    thinking: Option<&ThinkingConfig>,
+    compat: Option<&ThinkingCompat>,
+) -> Result<()> {
+    if let Some(thinking) = thinking {
+        if thinking.min_level == ThinkingLevel::Off {
+            bail!("{owner} thinking.min_level must not be off");
+        }
+        if thinking.min_level > thinking.max_level {
+            bail!(
+                "{owner} thinking.min_level {} exceeds max_level {}",
+                thinking.min_level,
+                thinking.max_level
+            );
+        }
+    }
+    if let Some(compat) = compat {
+        for (level, value) in &compat.reasoning_effort_map {
+            if *level == ThinkingLevel::Off {
+                bail!("{owner} reasoning_effort_map must not map off");
+            }
+            if value.trim().is_empty() {
+                bail!("{owner} reasoning_effort_map value for {level} must not be empty");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub providers: ProviderCatalog,
@@ -218,8 +268,8 @@ pub struct Config {
     pub max_tool_output_chars: usize,
     pub max_context_chars: usize,
     pub compact_keep_turns: usize,
-    pub thinking_level: ThinkingLevel,
-    pub show_thinking: bool,
+    pub default_thinking_level: ThinkingLevel,
+    pub hide_thinking_block: bool,
 }
 
 impl Config {
@@ -263,18 +313,19 @@ impl Config {
         if providers.providers.is_empty()
             && let (Some(api_key), Some(model)) = (legacy_api_key, legacy_model)
         {
-            let supports_thinking = legacy_model_supports_thinking(&model);
             providers.providers.push(ProviderConfig {
                 id: "default".to_owned(),
                 display_name: "Default".to_owned(),
                 base_url: legacy_base_url,
                 api_key: SecretValue::new(api_key),
                 openai_api: legacy_openai_api,
+                thinking: None,
+                compat: None,
                 models: vec![ModelConfig {
                     display_name: model.clone(),
                     id: model.clone(),
-                    supports_thinking,
-                    default_thinking_level: supports_thinking.then_some(ThinkingLevel::default()),
+                    thinking: None,
+                    compat: None,
                 }],
             });
             providers.active_model = Some(ModelRef {
@@ -335,12 +386,16 @@ impl Config {
                     DEFAULT_COMPACT_KEEP_TURNS,
                 )?,
             )?,
-            thinking_level: env_or_file(
-                "ZEX_THINKING_LEVEL",
-                file.thinking_level,
+            default_thinking_level: env_or_file(
+                "ZEX_DEFAULT_THINKING_LEVEL",
+                file.default_thinking_level,
                 ThinkingLevel::default(),
             )?,
-            show_thinking: env_or_file("ZEX_SHOW_THINKING", file.show_thinking, true)?,
+            hide_thinking_block: env_or_file(
+                "ZEX_HIDE_THINKING_BLOCK",
+                file.hide_thinking_block,
+                false,
+            )?,
         })
     }
 
@@ -371,8 +426,8 @@ struct FileConfig {
     max_tool_output_chars: Option<usize>,
     max_context_chars: Option<usize>,
     compact_keep_turns: Option<usize>,
-    thinking_level: Option<ThinkingLevel>,
-    show_thinking: Option<bool>,
+    default_thinking_level: Option<ThinkingLevel>,
+    hide_thinking_block: Option<bool>,
     session_dir: Option<String>,
 }
 
@@ -395,8 +450,10 @@ impl FileConfig {
             max_tool_output_chars: project.max_tool_output_chars.or(self.max_tool_output_chars),
             max_context_chars: project.max_context_chars.or(self.max_context_chars),
             compact_keep_turns: project.compact_keep_turns.or(self.compact_keep_turns),
-            thinking_level: project.thinking_level.or(self.thinking_level),
-            show_thinking: project.show_thinking.or(self.show_thinking),
+            default_thinking_level: project
+                .default_thinking_level
+                .or(self.default_thinking_level),
+            hide_thinking_block: project.hide_thinking_block.or(self.hide_thinking_block),
             session_dir: project.session_dir.or(self.session_dir),
         }
     }
@@ -444,7 +501,7 @@ pub async fn persist_thinking_level(
 ) -> Result<()> {
     update_project_config(working_dir, |table| {
         table.insert(
-            "thinking_level".to_owned(),
+            "default_thinking_level".to_owned(),
             toml::Value::String(thinking_level.to_string()),
         );
     })
@@ -454,8 +511,8 @@ pub async fn persist_thinking_level(
 pub async fn persist_show_thinking(working_dir: &Path, show_thinking: bool) -> Result<()> {
     update_project_config(working_dir, |table| {
         table.insert(
-            "show_thinking".to_owned(),
-            toml::Value::Boolean(show_thinking),
+            "hide_thinking_block".to_owned(),
+            toml::Value::Boolean(!show_thinking),
         );
     })
     .await
@@ -506,17 +563,6 @@ async fn update_project_config(
             Err(error).with_context(|| format!("failed to replace config file {}", path.display()))
         }
     }
-}
-
-fn legacy_model_supports_thinking(model: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase();
-    model.starts_with("gpt-5")
-        || model.starts_with("o1")
-        || model.starts_with("o3")
-        || model.starts_with("o4")
-        || model.contains("reasoner")
-        || model.contains("thinking")
-        || model.contains("claude")
 }
 
 fn global_config_dir() -> Result<PathBuf> {
@@ -660,8 +706,8 @@ mod tests {
         "ZEX_MAX_TOOL_OUTPUT_CHARS",
         "ZEX_MAX_CONTEXT_CHARS",
         "ZEX_COMPACT_KEEP_TURNS",
-        "ZEX_THINKING_LEVEL",
-        "ZEX_SHOW_THINKING",
+        "ZEX_DEFAULT_THINKING_LEVEL",
+        "ZEX_HIDE_THINKING_BLOCK",
         "ZEX_SESSION_DIR",
     ];
 
@@ -741,7 +787,6 @@ openai_api = "responses"
 [[providers.models]]
 id = "project-model"
 display_name = "Project Model"
-supports_thinking = true
 
 max_turns = 8
 "#,
@@ -777,7 +822,7 @@ max_turns = 8
         let content = tokio::fs::read_to_string(project.join(".zex/config.toml"))
             .await
             .unwrap();
-        assert!(content.contains("thinking_level = \"high\""));
+        assert!(content.contains("default_thinking_level = \"high\""));
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
@@ -792,19 +837,19 @@ max_turns = 8
             r#"
 api_key = "secret"
 model = "model"
-show_thinking = false
+hide_thinking_block = true
 "#,
         )
         .await;
 
         let config = Config::load_from(&project, &global).await.unwrap();
-        assert!(!config.show_thinking);
+        assert!(config.hide_thinking_block);
 
         super::persist_show_thinking(&project, true).await.unwrap();
         let content = tokio::fs::read_to_string(project.join(".zex/config.toml"))
             .await
             .unwrap();
-        assert!(content.contains("show_thinking = true"));
+        assert!(content.contains("hide_thinking_block = false"));
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
@@ -831,11 +876,17 @@ show_thinking = false
                 base_url: "https://api.openai.com/v1".to_owned(),
                 api_key: super::SecretValue::new("secret".to_owned()),
                 openai_api: crate::provider::OpenAiApi::Responses,
+                thinking: None,
+                compat: None,
                 models: vec![super::ModelConfig {
                     id: "gpt-5".to_owned(),
                     display_name: "GPT-5".to_owned(),
-                    supports_thinking: true,
-                    default_thinking_level: Some(crate::provider::ThinkingLevel::High),
+                    thinking: Some(crate::provider::ThinkingConfig {
+                        min_level: crate::provider::ThinkingLevel::Low,
+                        max_level: crate::provider::ThinkingLevel::Max,
+                        mode: crate::provider::ThinkingMode::Effort,
+                    }),
+                    compat: None,
                 }],
             }],
         };
@@ -851,6 +902,79 @@ show_thinking = false
         assert!(content.contains("provider_id = \"openai\""));
         assert!(!content.contains("model = \"legacy\""));
         assert!(!content.contains("api_key = \"legacy-secret\""));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loads_provider_and_model_thinking_capabilities() {
+        let _environment = EnvGuard::clear();
+        let root = temp_directory("thinking-capabilities");
+        let project = root.join("project");
+        let global = root.join("global");
+        write_config(
+            &project.join(".zex/config.toml"),
+            r#"
+active_model = { provider_id = "openai", model_id = "codex-ultra" }
+default_thinking_level = "max"
+hide_thinking_block = true
+
+[[providers]]
+id = "openai"
+display_name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+api_key = "secret"
+openai_api = "responses"
+
+[providers.thinking]
+min_level = "low"
+max_level = "xhigh"
+mode = "effort"
+
+[providers.compat]
+supports_reasoning_effort = true
+supports_interleaved_thinking = true
+
+[providers.compat.reasoning_effort_map]
+xhigh = "xhigh"
+
+[[providers.models]]
+id = "codex-ultra"
+display_name = "Codex Ultra"
+
+[providers.models.thinking]
+min_level = "minimal"
+max_level = "max"
+mode = "effort"
+
+[providers.models.compat.reasoning_effort_map]
+max = "max"
+"#,
+        )
+        .await;
+
+        let config = Config::load_from(&project, &global).await.unwrap();
+        let capabilities = config
+            .providers
+            .thinking_capabilities(config.active_model.as_ref().unwrap());
+
+        assert_eq!(
+            config.default_thinking_level,
+            crate::provider::ThinkingLevel::Max
+        );
+        assert!(config.hide_thinking_block);
+        assert_eq!(
+            capabilities.min_level,
+            crate::provider::ThinkingLevel::Minimal
+        );
+        assert_eq!(capabilities.max_level, crate::provider::ThinkingLevel::Max);
+        assert!(capabilities.supports_interleaved_thinking);
+        assert_eq!(
+            capabilities
+                .reasoning_effort_map
+                .get(&crate::provider::ThinkingLevel::Max)
+                .map(String::as_str),
+            Some("max")
+        );
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 

@@ -86,23 +86,24 @@ where
         self.model = model;
     }
 
-    pub fn thinking_level(&self) -> Option<ThinkingLevel> {
-        self.provider
-            .supports_thinking(&self.model)
-            .then_some(self.thinking_level)
+    pub fn thinking_level(&self) -> ThinkingLevel {
+        crate::provider::normalize_thinking_level(
+            &self.provider.thinking_capabilities(&self.model),
+            self.thinking_level,
+        )
+        .clamped
     }
 
     pub fn thinking_preference(&self) -> ThinkingLevel {
         self.thinking_level
     }
 
-    pub fn set_thinking_level(&mut self, thinking_level: ThinkingLevel) {
-        self.thinking_level = thinking_level;
+    pub fn thinking_capabilities(&self) -> crate::provider::ThinkingCapabilities {
+        self.provider.thinking_capabilities(&self.model)
     }
 
-    pub fn cycle_thinking_level(&mut self) -> ThinkingLevel {
-        self.thinking_level = self.thinking_level.next();
-        self.thinking_level
+    pub fn set_thinking_level(&mut self, thinking_level: ThinkingLevel) {
+        self.thinking_level = thinking_level;
     }
 
     pub fn max_context_chars(&self) -> usize {
@@ -240,7 +241,7 @@ where
                 .provider
                 .complete(
                     &self.model,
-                    self.thinking_level(),
+                    self.thinking_level,
                     &self.messages,
                     &definitions,
                     &self.events,
@@ -567,7 +568,7 @@ mod tests {
         async fn complete(
             &self,
             _model: &str,
-            _thinking_level: Option<crate::provider::ThinkingLevel>,
+            _thinking_level: crate::provider::ThinkingLevel,
             messages: &[crate::agent::Message],
             _tools: &[ToolDefinition],
             events: &crate::agent::EventSender,
@@ -603,7 +604,7 @@ mod tests {
         async fn complete(
             &self,
             _model: &str,
-            _thinking_level: Option<crate::provider::ThinkingLevel>,
+            _thinking_level: crate::provider::ThinkingLevel,
             _messages: &[crate::agent::Message],
             _tools: &[ToolDefinition],
             _events: &crate::agent::EventSender,
@@ -618,7 +619,7 @@ mod tests {
         async fn complete(
             &self,
             _model: &str,
-            _thinking_level: Option<crate::provider::ThinkingLevel>,
+            _thinking_level: crate::provider::ThinkingLevel,
             _messages: &[crate::agent::Message],
             _tools: &[ToolDefinition],
             _events: &crate::agent::EventSender,

@@ -87,7 +87,7 @@ pub async fn run(
         session_id,
         RunContext {
             working_dir: context.working_dir,
-            show_thinking: context.show_thinking,
+            hide_thinking_block: context.hide_thinking_block,
             providers: context.providers,
             provider_registry: context.provider_registry,
         },
@@ -104,7 +104,7 @@ pub async fn run(
 
 pub struct TuiContext<'a> {
     pub working_dir: &'a Path,
-    pub show_thinking: bool,
+    pub hide_thinking_block: bool,
     pub providers: ProviderCatalog,
     pub provider_registry: ProviderRegistry,
 }
@@ -112,7 +112,7 @@ pub struct TuiContext<'a> {
 #[derive(Clone)]
 struct RunContext<'a> {
     working_dir: &'a Path,
-    show_thinking: bool,
+    hide_thinking_block: bool,
     providers: ProviderCatalog,
     provider_registry: ProviderRegistry,
 }
@@ -132,12 +132,12 @@ async fn run_loop(
         session_id.clone(),
         AppContext {
             working_dir: context.working_dir.to_path_buf(),
-            thinking_level: agent.thinking_level(),
+            thinking_level: Some(agent.thinking_level()),
             thinking_preference: agent.thinking_preference(),
             context_chars: agent.context_chars(),
             max_context_chars: agent.max_context_chars(),
             default_tool_timeout: agent.default_tool_timeout(),
-            show_thinking: context.show_thinking,
+            show_thinking: !context.hide_thinking_block,
             providers: context.providers.clone(),
         },
     );
@@ -667,6 +667,8 @@ fn handle_key_event(
             KeyCode::Enter | KeyCode::Char('e') => app.edit_provider_item(),
             KeyCode::Char('i') => app.edit_selected_model_id(),
             KeyCode::Char('t') => app.cycle_selected_model_thinking_level(),
+            KeyCode::Char('m') => app.cycle_selected_model_thinking_min_level(),
+            KeyCode::Char('r') => app.cycle_selected_model_reasoning_map(),
             KeyCode::Char('n') => app.new_provider_item(),
             KeyCode::Char('d') => app.request_provider_delete(),
             KeyCode::Esc | KeyCode::Char('q') => app.request_provider_exit(),
@@ -690,7 +692,23 @@ fn handle_key_event(
         return if turn_active {
             InputAction::None
         } else {
-            InputAction::Submit("/think".to_owned())
+            let levels = app
+                .providers
+                .active_model
+                .as_ref()
+                .map(|model| {
+                    app.providers
+                        .thinking_capabilities(model)
+                        .available_levels()
+                })
+                .unwrap_or_else(|| {
+                    crate::provider::ThinkingCapabilities::default().available_levels()
+                });
+            let current = levels
+                .iter()
+                .position(|level| *level == app.thinking_preference)
+                .unwrap_or(0);
+            InputAction::Submit(format!("/think {}", levels[(current + 1) % levels.len()]))
         };
     }
 
@@ -1368,6 +1386,12 @@ impl App {
                     self.status = Status::Thinking;
                 }
             }
+            AgentEvent::ThinkingNormalized {
+                requested, clamped, ..
+            } => {
+                self.thinking_preference = requested;
+                self.thinking_level = (clamped != ThinkingLevel::Off).then_some(clamped);
+            }
             AgentEvent::ToolStart {
                 call_id,
                 name,
@@ -1743,7 +1767,7 @@ impl App {
     {
         self.model = agent.model().to_owned();
         self.session_id = session_id.map(str::to_owned);
-        self.thinking_level = agent.thinking_level();
+        self.thinking_level = Some(agent.thinking_level());
         self.thinking_preference = agent.thinking_preference();
         self.context_chars = agent.context_chars();
         self.max_context_chars = agent.max_context_chars();
@@ -2161,10 +2185,72 @@ impl App {
         if let Some(model) = editor
             .selected_provider_mut()
             .and_then(|provider| provider.models.get_mut(model_selected))
-            && model.supports_thinking
         {
-            model.default_thinking_level =
-                Some(model.default_thinking_level.unwrap_or_default().next());
+            let thinking = model
+                .thinking
+                .get_or_insert_with(crate::provider::ThinkingConfig::default);
+            thinking.max_level = thinking.max_level.next();
+            if thinking.max_level == ThinkingLevel::Off {
+                thinking.max_level = thinking.min_level;
+            }
+            if thinking.max_level < thinking.min_level {
+                thinking.max_level = thinking.min_level;
+            }
+        }
+    }
+
+    fn cycle_selected_model_thinking_min_level(&mut self) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        if editor.pane != ProviderPane::Models {
+            return;
+        }
+        let model_selected = editor.model_selected;
+        if let Some(model) = editor
+            .selected_provider_mut()
+            .and_then(|provider| provider.models.get_mut(model_selected))
+        {
+            let thinking = model
+                .thinking
+                .get_or_insert_with(crate::provider::ThinkingConfig::default);
+            let mut next = thinking.min_level.next();
+            if next == ThinkingLevel::Off || next > thinking.max_level {
+                next = ThinkingLevel::Minimal;
+            }
+            thinking.min_level = next;
+        }
+    }
+
+    fn cycle_selected_model_reasoning_map(&mut self) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        if editor.pane != ProviderPane::Models {
+            return;
+        }
+        let model_selected = editor.model_selected;
+        let Some(model) = editor
+            .selected_provider_mut()
+            .and_then(|provider| provider.models.get_mut(model_selected))
+        else {
+            return;
+        };
+        let thinking = model
+            .thinking
+            .get_or_insert_with(crate::provider::ThinkingConfig::default)
+            .clone();
+        let compat = model.compat.get_or_insert_default();
+        compat.supports_reasoning_effort = Some(true);
+        compat.reasoning_effort_map.clear();
+        for level in ThinkingLevel::ALL
+            .into_iter()
+            .filter(|level| *level >= thinking.min_level && *level <= thinking.max_level)
+        {
+            compat
+                .reasoning_effort_map
+                .entry(level)
+                .or_insert_with(|| level.to_string());
         }
     }
 
@@ -2181,6 +2267,8 @@ impl App {
                     base_url: "https://api.openai.com/v1".to_owned(),
                     api_key: SecretValue::new(String::new()),
                     openai_api: OpenAiApi::Responses,
+                    thinking: None,
+                    compat: None,
                     models: Vec::new(),
                 });
                 editor.provider_selected = editor.draft.providers.len() - 1;
@@ -2198,8 +2286,8 @@ impl App {
                 provider.models.push(ModelConfig {
                     id: format!("model-{number}"),
                     display_name: format!("Model {number}"),
-                    supports_thinking: false,
-                    default_thinking_level: None,
+                    thinking: None,
+                    compat: None,
                 });
                 let model_selected = provider.models.len() - 1;
                 let model_id = provider.models[model_selected].id.clone();
@@ -2319,9 +2407,11 @@ impl App {
                     .selected_provider_mut()
                     .and_then(|provider| provider.models.get_mut(model_selected))
                 {
-                    model.supports_thinking = !model.supports_thinking;
-                    model.default_thinking_level =
-                        model.supports_thinking.then_some(ThinkingLevel::default());
+                    model.thinking = if model.thinking.is_some() {
+                        None
+                    } else {
+                        Some(crate::provider::ThinkingConfig::default())
+                    };
                 }
             }
             _ => {}
@@ -2572,7 +2662,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .unwrap_or(0)
         .min(999);
     let thinking = app.thinking_level.map_or_else(
-        || format!("n/a ({})", app.thinking_preference),
+        || app.thinking_preference.to_string(),
         |level| level.to_string(),
     );
     let thinking = format!(
@@ -2872,14 +2962,10 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
             };
             let marker = if selected { "›" } else { " " };
             let current_marker = if current { "●" } else { " " };
-            let thinking = if choice.supports_thinking {
-                choice
-                    .default_thinking_level
-                    .map(|level| level.to_string())
-                    .unwrap_or_else(|| "yes".to_owned())
-            } else {
-                "n/a".to_owned()
-            };
+            let thinking = format!(
+                "{}–{}",
+                choice.thinking.min_level, choice.thinking.max_level
+            );
             lines.push(
                 Line::from(vec![
                     Span::styled(
@@ -3063,14 +3149,20 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         for (index, model) in provider.models.iter().enumerate() {
             let selected = model_active && editor.model_selected == index;
-            let thinking = if model.supports_thinking {
-                model
-                    .default_thinking_level
-                    .map(|level| level.to_string())
-                    .unwrap_or_else(|| "yes".to_owned())
-            } else {
-                "n/a".to_owned()
-            };
+            let capabilities = editor.draft.thinking_capabilities(&ModelRef {
+                provider_id: provider.id.clone(),
+                model_id: model.id.clone(),
+            });
+            let thinking = format!("{}–{}", capabilities.min_level, capabilities.max_level);
+            let map = capabilities
+                .reasoning_effort_map
+                .iter()
+                .filter(|(level, _)| {
+                    **level >= capabilities.min_level && **level <= capabilities.max_level
+                })
+                .map(|(level, value)| format!("{level}:{value}"))
+                .collect::<Vec<_>>()
+                .join(",");
             lines.push(
                 Line::from(vec![
                     Span::styled(
@@ -3085,7 +3177,10 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         pad_display(&single_line(&model.id, 24), 26),
                         Style::default().fg(DIM),
                     ),
-                    Span::styled(format!("think {thinking}"), Style::default().fg(DIM)),
+                    Span::styled(
+                        format!("think {thinking}  map {map}"),
+                        Style::default().fg(DIM),
+                    ),
                 ])
                 .style(Style::default().bg(if selected {
                     SURFACE_RAISED
@@ -3987,7 +4082,7 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else if app.provider_editor_is_editing() {
             "Enter apply field · Esc cancel · Ctrl+S save"
         } else {
-            "Tab pane · ↑↓/jk select · Enter name · i ID · Space thinking · t level · n new · d delete · Ctrl+S save · Esc exit"
+            "Tab pane · ↑↓/jk select · Enter name · i ID · Space thinking · m/t min/max · r fill map · n new · d delete · Ctrl+S save · Esc exit"
         };
         Line::from(Span::styled(text, Style::default().fg(DIM)))
     } else if app.session_picker_open() {
@@ -4280,18 +4375,28 @@ mod tests {
                 base_url: "https://api.openai.com/v1".to_owned(),
                 api_key: SecretValue::new("secret".to_owned()),
                 openai_api: OpenAiApi::Responses,
+                thinking: None,
+                compat: None,
                 models: vec![
                     ModelConfig {
                         id: "gpt-5".to_owned(),
                         display_name: "GPT-5".to_owned(),
-                        supports_thinking: true,
-                        default_thinking_level: Some(ThinkingLevel::High),
+                        thinking: Some(crate::provider::ThinkingConfig {
+                            min_level: ThinkingLevel::Low,
+                            max_level: ThinkingLevel::Max,
+                            mode: crate::provider::ThinkingMode::Effort,
+                        }),
+                        compat: None,
                     },
                     ModelConfig {
                         id: "gpt-4.1-mini".to_owned(),
                         display_name: "GPT-4.1 Mini".to_owned(),
-                        supports_thinking: false,
-                        default_thinking_level: None,
+                        thinking: None,
+                        compat: Some(crate::provider::ThinkingCompat {
+                            supports_reasoning_effort: Some(false),
+                            reasoning_effort_map: Default::default(),
+                            supports_interleaved_thinking: Some(false),
+                        }),
                     },
                 ],
             }],
@@ -4531,8 +4636,12 @@ mod tests {
         draft.providers[0].models.push(ModelConfig {
             id: "new-model".to_owned(),
             display_name: "New Model".to_owned(),
-            supports_thinking: true,
-            default_thinking_level: Some(ThinkingLevel::Medium),
+            thinking: Some(crate::provider::ThinkingConfig {
+                min_level: ThinkingLevel::Minimal,
+                max_level: ThinkingLevel::Medium,
+                mode: crate::provider::ThinkingMode::Effort,
+            }),
+            compat: None,
         });
 
         super::save_provider_changes(&mut agent, &mut app, &root, &registry, draft)
@@ -4546,7 +4655,10 @@ mod tests {
                 .unwrap()
                 .choices
                 .iter()
-                .any(|choice| choice.target.model_id == "new-model" && choice.supports_thinking)
+                .any(|choice| {
+                    choice.target.model_id == "new-model"
+                        && choice.thinking.max_level == ThinkingLevel::Medium
+                })
         );
         let config = tokio::fs::read_to_string(root.join(".zex/config.toml"))
             .await
@@ -5783,7 +5895,7 @@ mod tests {
                 false,
                 false,
             ),
-            InputAction::Submit("/think".to_owned())
+            InputAction::Submit("/think high".to_owned())
         );
     }
 
