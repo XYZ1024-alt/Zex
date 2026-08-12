@@ -1,8 +1,8 @@
 # Zex
 
-Zex 是一个极简、可单二进制运行的 AI Agent Harness 核心。它提供科研与工程工作流能够依赖的最小 Agent 循环，而不是大而全的 coding 产品。
+Zex 是一个极简、可单二进制运行的通用 coding harness。它提供最小 Agent 循环与可观测终端界面，而不是大而全的 IDE 或实验管理平台。
 
-Zex 的第一版刻意只包含 OpenAI 兼容模型接入、普通终端 REPL、一次性任务、四个本地工具、事件流和简单会话落盘。它不包含 MCP、子 Agent、Plan Mode、插件系统、Web UI、复杂 TUI、向量库、RAG 或长期记忆。
+Zex 当前只包含 OpenAI 兼容模型接入、ReAct 循环、四个本地工具、核心事件流、ratatui TUI、headless 模式、TOML 配置和 JSONL 会话管理。它不包含 MCP、子 Agent、Plan Mode、插件市场、IDE、科研指标、实验记录、向量库、RAG 或长期记忆。
 
 ## 构建
 
@@ -14,21 +14,65 @@ cargo build --release
 
 生成的二进制为 `target/release/zex`；Windows 上为 `target/release/zex.exe`。
 
-## 配置
+## 目录与文件格式
 
-至少配置 API Key 和模型名。`ZEX_*` 变量优先，未设置时读取对应的 `OPENAI_*` 变量。
+Zex 按以下顺序合并配置，后者覆盖前者：
 
-| 变量 | 备用变量 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `ZEX_API_KEY` | `OPENAI_API_KEY` | 无 | 必填 API Key |
-| `ZEX_BASE_URL` | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容 API 根地址 |
-| `ZEX_MODEL` | `OPENAI_MODEL` | 无 | 必填模型名 |
-| `ZEX_OPENAI_API` | 无 | `chat-completions` | API 协议：`chat-completions` 或 `responses` |
-| `ZEX_BASH_TIMEOUT_SECONDS` | 无 | `60` | 单次 `bash` 工具超时 |
-| `ZEX_AGENT_TIMEOUT_SECONDS` | 无 | `600` | 单轮 Agent 总超时 |
-| `ZEX_MAX_STEPS` | 无 | `12` | 单轮最大模型调用步数 |
-| `ZEX_MAX_TOOL_OUTPUT_CHARS` | 无 | `32000` | `read`/`bash` 返回内容上限 |
-| `ZEX_SESSION_DIR` | 无 | `.zex/sessions` | 会话 JSON 保存目录 |
+1. 全局 `config.toml`
+2. 当前工作目录的 `.zex/config.toml`
+3. 环境变量
+
+全局目录遵循操作系统标准：
+
+- Windows：`%APPDATA%\zex\config.toml`
+- macOS：`~/Library/Application Support/zex/config.toml`
+- Linux：`$XDG_CONFIG_HOME/zex/config.toml`，未设置时为 `~/.config/zex/config.toml`
+
+可用 `ZEX_CONFIG_DIR` 覆盖整个全局目录，便于便携安装和隔离测试。
+
+会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建与更新时间；后续每行是一条 Agent 消息。会话只保存消息，不保存 API Key 或其他运行配置。
+
+项目配置示例：
+
+```toml
+# .zex/config.toml
+model = "gpt-4.1-mini"
+base_url = "https://api.openai.com/v1"
+openai_api = "responses"
+max_turns = 12
+bash_timeout_seconds = 60
+agent_timeout_seconds = 600
+max_tool_output_chars = 32000
+```
+
+支持的 TOML 字段：
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `api_key` | 无 | API Key；允许配置，但推荐只用环境变量 |
+| `model` | 无 | 必填模型名 |
+| `base_url` | `https://api.openai.com/v1` | OpenAI 兼容 API 根地址 |
+| `openai_api` | `chat-completions` | `chat-completions` 或 `responses` |
+| `max_turns` | `12` | 单轮最大 Provider 调用次数 |
+| `bash_timeout_seconds` | `60` | 单次 `bash` 工具超时 |
+| `agent_timeout_seconds` | `600` | 单轮 Agent 总超时 |
+| `max_tool_output_chars` | `32000` | `read`/`bash` 返回内容上限 |
+| `session_dir` | 全局 `sessions` 目录 | 自定义会话目录；相对路径基于项目工作目录 |
+
+环境变量优先级高于两个 TOML 文件。API Key 使用 `ZEX_API_KEY`，未设置或为空时再读 `OPENAI_API_KEY`；因此可把非敏感配置提交到项目配置，同时保证密钥不进入仓库。
+
+| 变量 | 备用变量 | 对应字段 |
+| --- | --- | --- |
+| `ZEX_CONFIG_DIR` | 无 | 全局配置与默认会话目录根路径 |
+| `ZEX_API_KEY` | `OPENAI_API_KEY` | `api_key` |
+| `ZEX_MODEL` | `OPENAI_MODEL` | `model` |
+| `ZEX_BASE_URL` | `OPENAI_BASE_URL` | `base_url` |
+| `ZEX_OPENAI_API` | 无 | `openai_api` |
+| `ZEX_MAX_TURNS` | 无 | `max_turns` |
+| `ZEX_BASH_TIMEOUT_SECONDS` | 无 | `bash_timeout_seconds` |
+| `ZEX_AGENT_TIMEOUT_SECONDS` | 无 | `agent_timeout_seconds` |
+| `ZEX_MAX_TOOL_OUTPUT_CHARS` | 无 | `max_tool_output_chars` |
+| `ZEX_SESSION_DIR` | 无 | `session_dir` |
 
 PowerShell 示例：
 
@@ -78,27 +122,63 @@ zex -p "读取 README 并总结成三句话"
 cargo run -- -p "读取 README 并总结成三句话"
 ```
 
-### 交互式 REPL
+`--prompt` / `-p` 始终使用 headless 输出，不进入 TUI。
+
+### 交互式 TUI
+
+在 stdin 和 stdout 都连接终端时，不带 `--prompt` 启动 TUI：
 
 ```bash
 zex
 ```
 
-终端出现 `zex>` 后可连续输入消息。Unix 上按 Ctrl-D，Windows 上按 Ctrl-Z 后回车退出。
+主区显示用户/助手对话与工具执行过程；宽终端使用右侧状态栏，窄终端使用底部状态栏，展示当前状态、当前 tool 与最近错误摘要。
 
-### 继续最近会话
+- 输入文本后按 Enter 提交。
+- 空输入时按 Esc 或 `q` 退出。
+- 当前轮执行期间按 `q` 或 Ctrl-C 退出。
 
-```bash
-zex --continue-session
-```
-
-也可继续最近会话后立即提交新任务：
+stdin 或 stdout 不是 TTY 时自动保留普通终端 REPL：
 
 ```bash
-zex --continue-session -p "继续上一轮工作并给出结论"
+echo "解释当前目录" | zex
 ```
 
-每次运行结束后，Zex 会把完整消息列表保存为 `.zex/sessions/<timestamp>.json`。`--continue-session` 加载文件名时间戳最大的会话；目录为空时从新会话开始。
+非 TTY REPL 沿用 `zex>` 提示；Unix 上 Ctrl-D，Windows 上 Ctrl-Z 后回车退出。
+
+### 会话列表与恢复
+
+列出会话；输出包含 ID、最后更新时间、消息数和首条用户消息摘要：
+
+```bash
+zex sessions
+```
+
+恢复最近更新的会话并进入交互模式：
+
+```bash
+zex resume
+```
+
+恢复指定会话：
+
+```bash
+zex resume 20260812-143012-1a2b3c4d
+```
+
+恢复后立即运行一次性任务：
+
+```bash
+zex resume 20260812-143012-1a2b3c4d -p "继续上一轮工作并给出结论"
+```
+
+也可省略 ID，直接恢复最近会话：
+
+```bash
+zex resume -p "继续上一轮工作并给出结论"
+```
+
+新运行在退出时创建一个 JSONL 文件；恢复已有会话时原位更新同一文件，不复制分叉会话。若命令、Provider 或工具报错，Zex 仍会保存当前消息历史，再返回错误。
 
 ## 内置工具
 
@@ -115,15 +195,25 @@ zex --continue-session -p "继续上一轮工作并给出结论"
 
 OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两种协议都优先请求流式响应，并兼容网关忽略 `stream` 后返回普通 JSON。Responses 模式使用扁平 function tool 定义、`function_call`/`function_call_output` 输入项，并保留 Provider 输出项以支持推理模型的连续工具调用。
 
-内部事件 channel 发出：
+## 事件设计与模块划分
 
-- 文本增量
-- 工具开始
-- 工具结束及成功状态
-- 错误
-- 单轮结束
+核心通过 `tokio::sync::mpsc::UnboundedSender<AgentEvent>` 单向推送状态，不依赖 ratatui 或终端类型：
 
-当前 CLI 只负责打印事件；后续可在不改动 Agent loop 的情况下替换为 TUI 或其他消费者。
+- `MessageDelta { role, delta }`：用户消息或助手文本增量。
+- `ToolStart { call_id, name }`：工具开始；`call_id` 用于关联完成事件。
+- `ToolEnd { call_id, name, output, is_error }`：工具完成、输出与失败状态。
+- `Error { message }`：Provider、超时、步数上限等轮次错误。
+- `TurnEnd`：一轮正常结束。
+
+模块边界：
+
+- `src/agent/event.rs`：与 UI 无关的事件契约。
+- `src/agent/loop.rs`、`src/provider`：生产事件，完全不引用 TUI。
+- `src/tui.rs`：消费事件并维护只用于渲染的视图状态；使用 ratatui + crossterm，与 tokio `select!` 配合处理 Agent 事件、键盘输入和重绘。
+- `src/headless.rs`：同一事件流的纯文本消费者，供 `-p` 和无 TTY 场景使用。
+- `src/main.rs`：仅负责检测模式并装配 core、TUI 或 headless 消费者。
+
+TUI 不调用工具、不解析 Provider 响应，也不持有 Agent 业务状态；core 不知道事件由 TUI、headless 或其他消费者渲染。
 
 ## 安全边界
 
@@ -133,17 +223,25 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 
 ## 最小自测
 
-以下验证需要一个支持 OpenAI Chat Completions 或 Responses function calls 的可用模型或兼容网关。
+第 1 项可离线运行；第 2–8 项需要一个支持 OpenAI Chat Completions 或 Responses function calls 的可用模型或兼容网关。
 
-1. 验证普通对话：
+1. 运行自动化检查：
+
+   ```bash
+   cargo fmt --check
+   cargo test
+   cargo clippy --all-targets --all-features -- -D warnings
+   ```
+
+2. 验证 `-p` 保持 headless：
 
    ```bash
    cargo run -- -p "只回答：Zex 已连接"
    ```
 
-   预期：终端输出模型回复并正常退出。
+   预期：即使在交互终端中也不进入 alternate screen，直接输出模型回复并正常退出。
 
-2. 验证 `read` 与工具结果回灌：
+3. 验证 `read` 与 headless 工具事件：
 
    ```bash
    cargo run -- -p "必须使用 read 工具读取 Cargo.toml，然后告诉我 package name"
@@ -151,7 +249,7 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 
    预期：终端显示 `[tool] read`、`[tool] read: done`，随后模型基于工具结果回答 `zex`。
 
-3. 验证 `bash` 与工具结果回灌：
+4. 验证 `bash` 与工具结果回灌：
 
    Windows：
 
@@ -167,29 +265,50 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 
    预期：终端显示 `bash` 工具开始和完成，模型读取命令输出后继续回答。
 
-4. 验证 REPL 连续对话：
+5. 验证 TUI 连续对话与状态：
 
    ```bash
    cargo run --
    ```
 
-   先输入 `记住数字 37`，再输入 `刚才的数字是什么？`。预期第二轮回答保留同一会话上下文。
+   预期进入 TUI。先输入 `记住数字 37`，再输入 `必须使用 read 读取 Cargo.toml，然后告诉我刚才的数字`。主区应显示两轮对话与 `read` 的 running/done 过程；状态区应在 idle、thinking、running tool 间切换，第二轮回答保留上下文。
 
-5. 验证会话恢复：退出 REPL 后运行：
+6. 验证错误摘要：使用错误 API Key 启动 TUI 并提交一句话。预期主区出现错误，状态区显示最近错误摘要，终端仍可退出并恢复。
 
-   ```bash
-   cargo run -- --continue-session -p "复述上一轮记住的数字"
+7. 验证无 TTY 回退：
+
+   Windows PowerShell：
+
+   ```powershell
+   "只回答：headless" | cargo run --
    ```
 
-   预期：Zex 加载 `.zex/sessions` 中最近的 JSON 会话并回答 `37`。
+   Linux/macOS：
+
+   ```bash
+   printf '只回答：headless\n' | cargo run --
+   ```
+
+   预期不进入 TUI，使用普通 REPL/事件输出。
+
+8. 验证会话列表与恢复：退出 TUI 后运行：
+
+   ```bash
+   cargo run -- sessions
+   cargo run -- resume -p "复述上一轮记住的数字"
+   ```
+
+   预期：第一条命令显示刚保存的会话 ID；第二条命令加载最近的 JSONL 会话并回答 `37`。
 
 ## 模块
 
 - `src/provider`：Provider 抽象、OpenAI 兼容 Chat Completions/Responses 与流式解析
-- `src/agent`：消息类型、事件、带最大步数和超时的 Agent loop
+- `src/agent`：消息类型、事件、带最大 Provider 轮次和超时的 Agent loop
 - `src/tools`：统一 Tool trait、注册表和四个内置工具
-- `src/session.rs`：简单 JSON 会话保存与最近恢复
+- `src/tui.rs`：ratatui/crossterm 可观测界面
+- `src/headless.rs`：一次性任务与无 TTY 的文本界面
+- `src/session.rs`：版本化 JSONL 会话保存、列表与恢复
 - `src/cli.rs`：clap 命令行参数
-- `src/config.rs`：环境变量配置
+- `src/config.rs`：全局/项目 TOML 合并与环境变量覆盖
 
 Zex 保持 minimal core：能力通过清晰边界继续扩展，而不是提前把扩展系统耦合进核心。

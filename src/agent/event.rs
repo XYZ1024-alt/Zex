@@ -1,23 +1,31 @@
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
-    TextDelta(String),
-    TurnFinished {
-        acknowledged: oneshot::Sender<()>,
+    MessageDelta {
+        role: MessageRole,
+        delta: String,
     },
-    ToolStarted {
+    ToolStart {
         call_id: String,
         name: String,
     },
-    ToolFinished {
+    ToolEnd {
         call_id: String,
         name: String,
         output: String,
         is_error: bool,
     },
-    Error(String),
+    Error {
+        message: String,
+    },
+    TurnEnd,
 }
 
 pub type EventSender = mpsc::UnboundedSender<AgentEvent>;

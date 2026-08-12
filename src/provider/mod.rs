@@ -9,7 +9,8 @@ use crate::agent::{AssistantMessage, EventSender, Message};
 
 pub use openai::OpenAiProvider;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 pub enum OpenAiApi {
     ChatCompletions,
     Responses,

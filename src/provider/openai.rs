@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    agent::{AgentEvent, AssistantMessage, EventSender, Message, ToolCall},
+    agent::{AgentEvent, AssistantMessage, EventSender, Message, MessageRole, ToolCall},
     provider::{OpenAiApi, Provider, ToolDefinition},
 };
 
@@ -474,7 +474,10 @@ fn consume_sse_line(
     for choice in chunk.choices {
         if let Some(delta) = choice.delta.content {
             content.push_str(&delta);
-            let _ = events.send(AgentEvent::TextDelta(delta));
+            let _ = events.send(AgentEvent::MessageDelta {
+                role: MessageRole::Assistant,
+                delta,
+            });
         }
 
         for tool_call in choice.delta.tool_calls.unwrap_or_default() {
@@ -559,7 +562,10 @@ fn parse_chat_non_stream_body(body: &[u8], events: &EventSender) -> Result<Assis
     let content = message.content.unwrap_or_default();
 
     if !content.is_empty() {
-        let _ = events.send(AgentEvent::TextDelta(content.clone()));
+        let _ = events.send(AgentEvent::MessageDelta {
+            role: MessageRole::Assistant,
+            delta: content.clone(),
+        });
     }
 
     Ok(AssistantMessage {
@@ -625,7 +631,10 @@ fn parse_responses_stream_body(body: &[u8], events: &EventSender) -> Result<Assi
             Some("response.output_text.delta") => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     content.push_str(delta);
-                    let _ = events.send(AgentEvent::TextDelta(delta.to_owned()));
+                    let _ = events.send(AgentEvent::MessageDelta {
+                        role: MessageRole::Assistant,
+                        delta: delta.to_owned(),
+                    });
                 }
             }
             Some("response.output_item.done") => {
@@ -700,7 +709,10 @@ fn finish_responses_message(
     }
 
     if !text_already_emitted && !content.is_empty() {
-        let _ = events.send(AgentEvent::TextDelta(content.clone()));
+        let _ = events.send(AgentEvent::MessageDelta {
+            role: MessageRole::Assistant,
+            delta: content.clone(),
+        });
     }
 
     Ok(AssistantMessage {
@@ -763,7 +775,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::{
-        agent::{AgentEvent, Message, ToolCall},
+        agent::{AgentEvent, Message, MessageRole, ToolCall},
         provider::{OpenAiApi, ToolDefinition},
     };
 
@@ -807,11 +819,17 @@ mod tests {
         assert_eq!(message.tool_calls[0].name, "read");
         assert_eq!(message.tool_calls[0].arguments, r#"{"path":"Cargo.toml"}"#);
         match receiver.try_recv().unwrap() {
-            AgentEvent::TextDelta(delta) => assert_eq!(delta, "Zex "),
+            AgentEvent::MessageDelta { role, delta } => {
+                assert_eq!(role, MessageRole::Assistant);
+                assert_eq!(delta, "Zex ");
+            }
             event => panic!("unexpected event: {event:?}"),
         }
         match receiver.try_recv().unwrap() {
-            AgentEvent::TextDelta(delta) => assert_eq!(delta, "streams"),
+            AgentEvent::MessageDelta { role, delta } => {
+                assert_eq!(role, MessageRole::Assistant);
+                assert_eq!(delta, "streams");
+            }
             event => panic!("unexpected event: {event:?}"),
         }
     }
@@ -829,7 +847,10 @@ mod tests {
 
         assert_eq!(message.content, "Zex");
         match receiver.try_recv().unwrap() {
-            AgentEvent::TextDelta(delta) => assert_eq!(delta, "Zex"),
+            AgentEvent::MessageDelta { role, delta } => {
+                assert_eq!(role, MessageRole::Assistant);
+                assert_eq!(delta, "Zex");
+            }
             event => panic!("unexpected event: {event:?}"),
         }
     }
@@ -847,7 +868,10 @@ mod tests {
 
         assert_eq!(message.content, "Zex JSON");
         match receiver.try_recv().unwrap() {
-            AgentEvent::TextDelta(delta) => assert_eq!(delta, "Zex JSON"),
+            AgentEvent::MessageDelta { role, delta } => {
+                assert_eq!(role, MessageRole::Assistant);
+                assert_eq!(delta, "Zex JSON");
+            }
             event => panic!("unexpected event: {event:?}"),
         }
     }
@@ -948,7 +972,10 @@ mod tests {
         assert_eq!(message.tool_calls[0].name, "read");
         assert!(message.provider_state.is_some());
         match receiver.try_recv().unwrap() {
-            AgentEvent::TextDelta(delta) => assert_eq!(delta, "Checking."),
+            AgentEvent::MessageDelta { role, delta } => {
+                assert_eq!(role, MessageRole::Assistant);
+                assert_eq!(delta, "Checking.");
+            }
             event => panic!("unexpected event: {event:?}"),
         }
     }
@@ -970,7 +997,10 @@ data: {"type":"response.completed","response":{"output":[{"type":"message","role
         assert_eq!(message.content, "Done");
         assert!(message.tool_calls.is_empty());
         match receiver.try_recv().unwrap() {
-            AgentEvent::TextDelta(delta) => assert_eq!(delta, "Done"),
+            AgentEvent::MessageDelta { role, delta } => {
+                assert_eq!(role, MessageRole::Assistant);
+                assert_eq!(delta, "Done");
+            }
             event => panic!("unexpected event: {event:?}"),
         }
     }
