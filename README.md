@@ -132,11 +132,27 @@ cargo run -- -p "读取 README 并总结成三句话"
 zex
 ```
 
-主区显示用户/助手对话与工具执行过程；宽终端使用右侧状态栏，窄终端使用底部状态栏，展示当前状态、当前 tool 与最近错误摘要。
+TUI 使用固定四层布局：
 
-- 输入文本后按 Enter 提交。
-- 空输入时按 Esc 或 `q` 退出。
-- 当前轮执行期间按 `q` 或 Ctrl-C 退出。
+1. 顶部状态栏：当前 model、turn 状态、正在执行的 tool；错误只显示最近摘要。
+2. 对话区：以 `YOU`、`ASSISTANT`、`TOOL`、`ERROR` 分组显示事件流，保持可滚动历史。
+3. 底部输入区：支持多行编辑，最多显示 6 行，内容更长时输入区内部滚动。
+4. 快捷键提示行：按当前 idle / running 模式显示可用操作。
+
+tool 调用默认只显示名称、状态和单行摘要。选中后可展开格式化参数和结果预览；参数与结果过长时会明确截断。Assistant 的流式增量合并到当前消息，TUI 只在状态变化、输入或新事件到达时按固定帧率差分重绘，不清空整屏。
+
+| 快捷键 | idle 模式 | turn 运行中 |
+| --- | --- | --- |
+| Enter | 发送非空输入 | — |
+| Shift-Enter / Alt-Enter | 插入换行 | — |
+| Ctrl-C | 退出 TUI | 中断当前 turn，返回 idle |
+| Esc | 依次关闭 tool 详情、取消选择、清空草稿或回到底部；无可取消状态时退出 | 关闭当前 UI 选择，不中断 turn |
+| PageUp / PageDown | 对话历史翻页 | 对话历史翻页 |
+| Home / End | 跳到历史顶部 / 底部 | 跳到历史顶部 / 底部 |
+| Tab / Shift-Tab | 选择下一个 / 上一个 tool | 选择下一个 / 上一个 tool |
+| `e` | 输入框为空时展开 / 折叠当前 tool | 展开 / 折叠当前 tool |
+
+粘贴使用终端 bracketed paste，允许直接粘贴多行内容。当前 turn 运行时输入区锁定，避免草稿与执行中状态混淆；Ctrl-C 中断后，已输入的用户消息保留，未完成的 assistant/tool 状态不会进入后续 Provider 上下文。
 
 stdin 或 stdout 不是 TTY 时自动保留普通终端 REPL：
 
@@ -200,9 +216,10 @@ OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两�
 核心通过 `tokio::sync::mpsc::UnboundedSender<AgentEvent>` 单向推送状态，不依赖 ratatui 或终端类型：
 
 - `MessageDelta { role, delta }`：用户消息或助手文本增量。
-- `ToolStart { call_id, name }`：工具开始；`call_id` 用于关联完成事件。
+- `ToolStart { call_id, name, arguments }`：工具开始；`call_id` 用于关联完成事件，参数仅由消费者决定是否展示。
 - `ToolEnd { call_id, name, output, is_error }`：工具完成、输出与失败状态。
 - `Error { message }`：Provider、超时、步数上限等轮次错误。
+- `TurnCancelled`：调用方中断当前轮；核心丢弃未完成的 assistant/tool 上下文并恢复可继续输入状态。
 - `TurnEnd`：一轮正常结束。
 
 模块边界：
@@ -223,7 +240,7 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 
 ## 最小自测
 
-第 1 项可离线运行；第 2–8 项需要一个支持 OpenAI Chat Completions 或 Responses function calls 的可用模型或兼容网关。
+第 1 项可离线运行；第 2–9 项需要一个支持 OpenAI Chat Completions 或 Responses function calls 的可用模型或兼容网关。
 
 1. 运行自动化检查：
 
@@ -271,11 +288,13 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
    cargo run --
    ```
 
-   预期进入 TUI。先输入 `记住数字 37`，再输入 `必须使用 read 读取 Cargo.toml，然后告诉我刚才的数字`。主区应显示两轮对话与 `read` 的 running/done 过程；状态区应在 idle、thinking、running tool 间切换，第二轮回答保留上下文。
+   预期进入 TUI。先输入 `记住数字 37`，再输入 `必须使用 read 读取 Cargo.toml，然后告诉我刚才的数字`。主区应显示两轮对话与默认折叠的 `read` running/done 摘要；状态栏应在 `IDLE`、`THINKING`、`TOOL` 间切换并显示 model。按 Tab 选择 tool、按 `e` 展开参数和结果，再用 PageUp/PageDown 滚动历史。第二轮回答应保留上下文。
 
-6. 验证错误摘要：使用错误 API Key 启动 TUI 并提交一句话。预期主区出现错误，状态区显示最近错误摘要，终端仍可退出并恢复。
+6. 验证多行输入与中断：用 Shift-Enter 或 Alt-Enter 输入两行后按 Enter 发送。再提交一个会运行较久的请求，并在 `THINKING` 或 `TOOL` 状态按 Ctrl-C。预期出现单条 interrupted 提示，运行中的 tool 标记为 interrupted，状态恢复 `IDLE`，可立即发送下一条消息。
 
-7. 验证无 TTY 回退：
+7. 验证错误摘要：使用错误 API Key 启动 TUI 并提交一句话。预期主区只出现一条可读错误，顶部状态栏显示最近错误摘要，不重复刷屏；Esc 或 Ctrl-C 可正常退出并恢复终端。
+
+8. 验证无 TTY 回退：
 
    Windows PowerShell：
 
@@ -291,7 +310,7 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 
    预期不进入 TUI，使用普通 REPL/事件输出。
 
-8. 验证会话列表与恢复：退出 TUI 后运行：
+9. 验证会话列表与恢复：退出 TUI 后运行：
 
    ```bash
    cargo run -- sessions

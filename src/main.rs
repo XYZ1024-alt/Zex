@@ -52,7 +52,8 @@ async fn main() -> Result<()> {
         max_turns,
         max_tool_output_chars,
     } = config;
-    let provider = OpenAiProvider::new(&base_url, api_key, model, openai_api, agent_timeout)?;
+    let provider =
+        OpenAiProvider::new(&base_url, api_key, model.clone(), openai_api, agent_timeout)?;
     let (events, event_receiver) = mpsc::unbounded_channel();
     let mut tools = ToolRegistry::new();
     tools.register(ReadTool::new(working_dir.clone(), max_tool_output_chars));
@@ -79,7 +80,7 @@ async fn main() -> Result<()> {
             Some(printer),
         )
     } else if tui::is_available() {
-        (tui::run(&mut agent, event_receiver).await, None)
+        (tui::run(&mut agent, event_receiver, model).await, None)
     } else {
         let printer = headless::spawn_event_printer(event_receiver);
         (headless::run_repl(&mut agent).await, Some(printer))

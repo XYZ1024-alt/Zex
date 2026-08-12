@@ -36,3 +36,9 @@ pub struct AssistantMessage {
     pub tool_calls: Vec<ToolCall>,
     pub provider_state: Option<Value>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptOutcome {
+    Completed(AssistantMessage),
+    Cancelled,
+}

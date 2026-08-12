@@ -15,6 +15,7 @@ pub enum AgentEvent {
     ToolStart {
         call_id: String,
         name: String,
+        arguments: String,
     },
     ToolEnd {
         call_id: String,
@@ -25,6 +26,7 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
+    TurnCancelled,
     TurnEnd,
 }
 

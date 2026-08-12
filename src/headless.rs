@@ -81,6 +81,7 @@ fn print_event(event: AgentEvent) -> Result<()> {
             println!("\n[tool] {name}: {status}");
         }
         AgentEvent::Error { message } => eprintln!("\nZex error: {message}"),
+        AgentEvent::TurnCancelled => eprintln!("\nZex turn interrupted."),
         AgentEvent::TurnEnd => println!(),
     }
     Ok(())

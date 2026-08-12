@@ -1,10 +1,10 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use anyhow::{Result, bail};
 use serde_json::Value;
 
 use crate::{
-    agent::{AgentEvent, AssistantMessage, EventSender, Message, MessageRole},
+    agent::{AgentEvent, AssistantMessage, EventSender, Message, MessageRole, PromptOutcome},
     provider::Provider,
     tools::ToolRegistry,
 };
@@ -59,6 +59,41 @@ where
     }
 
     pub async fn prompt(&mut self, prompt: impl Into<String>) -> Result<AssistantMessage> {
+        match self
+            .prompt_with_cancellation(prompt, std::future::pending())
+            .await?
+        {
+            PromptOutcome::Completed(message) => Ok(message),
+            PromptOutcome::Cancelled => {
+                unreachable!("a pending cancellation future cannot resolve")
+            }
+        }
+    }
+
+    pub async fn prompt_cancellable(
+        &mut self,
+        prompt: impl Into<String>,
+        mut cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<PromptOutcome> {
+        self.prompt_with_cancellation(prompt, async move {
+            while !*cancellation.borrow() {
+                if cancellation.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        })
+        .await
+    }
+
+    async fn prompt_with_cancellation<F>(
+        &mut self,
+        prompt: impl Into<String>,
+        cancellation: F,
+    ) -> Result<PromptOutcome>
+    where
+        F: Future<Output = ()>,
+    {
+        let checkpoint = self.messages.len();
         let prompt = prompt.into();
         self.messages.push(Message::User {
             content: prompt.clone(),
@@ -68,18 +103,42 @@ where
             delta: prompt,
         });
 
-        match tokio::time::timeout(self.turn_timeout, self.run_loop()).await {
-            Ok(result) => result,
-            Err(_) => {
-                let message = format!(
-                    "agent turn exceeded its {} second timeout",
-                    self.turn_timeout.as_secs()
-                );
-                let _ = self.events.send(AgentEvent::Error {
-                    message: message.clone(),
-                });
-                bail!(message);
+        let resolution = {
+            let turn = tokio::time::timeout(self.turn_timeout, self.run_loop());
+            tokio::pin!(turn);
+            tokio::pin!(cancellation);
+
+            tokio::select! {
+                biased;
+                _ = &mut cancellation => None,
+                result = &mut turn => Some(result),
             }
+        };
+
+        match resolution {
+            None => {
+                self.messages.truncate(checkpoint + 1);
+                let _ = self.events.send(AgentEvent::TurnCancelled);
+                Ok(PromptOutcome::Cancelled)
+            }
+            Some(result) => match result {
+                Ok(Ok(message)) => Ok(PromptOutcome::Completed(message)),
+                Ok(Err(error)) => {
+                    self.messages.truncate(checkpoint + 1);
+                    Err(error)
+                }
+                Err(_) => {
+                    self.messages.truncate(checkpoint + 1);
+                    let message = format!(
+                        "agent turn exceeded its {} second timeout",
+                        self.turn_timeout.as_secs()
+                    );
+                    let _ = self.events.send(AgentEvent::Error {
+                        message: message.clone(),
+                    });
+                    bail!(message);
+                }
+            },
         }
     }
 
@@ -116,12 +175,14 @@ where
             for tool_call in assistant.tool_calls {
                 let name = tool_call.name;
                 let call_id = tool_call.id;
+                let arguments = tool_call.arguments;
                 let _ = self.events.send(AgentEvent::ToolStart {
                     call_id: call_id.clone(),
                     name: name.clone(),
+                    arguments: arguments.clone(),
                 });
 
-                let result = match serde_json::from_str::<Value>(&tool_call.arguments) {
+                let result = match serde_json::from_str::<Value>(&arguments) {
                     Ok(arguments) => self.tools.execute(&name, arguments).await,
                     Err(error) => Err(anyhow::Error::from(error)),
                 };
@@ -210,6 +271,19 @@ mod tests {
         }
     }
 
+    struct PendingProvider;
+
+    impl Provider for PendingProvider {
+        async fn complete(
+            &self,
+            _messages: &[crate::agent::Message],
+            _tools: &[ToolDefinition],
+            _events: &crate::agent::EventSender,
+        ) -> Result<AssistantMessage> {
+            std::future::pending().await
+        }
+    }
+
     #[test]
     fn system_only_agent_has_no_conversation() {
         let provider = SequenceProvider {
@@ -295,6 +369,7 @@ mod tests {
             AgentEvent::ToolStart {
                 call_id: "call-1".to_owned(),
                 name: "echo".to_owned(),
+                arguments: r#"{"value":"observed"}"#.to_owned(),
             }
         );
         assert_eq!(
@@ -344,5 +419,45 @@ mod tests {
                 message: "provider unavailable".to_owned(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_user_prompt_and_discards_partial_turn_state() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            PendingProvider,
+            ToolRegistry::new(),
+            events,
+            Duration::from_secs(60),
+            1,
+            None,
+        );
+        let (cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), async {
+            let prompt = agent.prompt_cancellable("stop this", cancel_receiver);
+            tokio::pin!(prompt);
+            tokio::task::yield_now().await;
+            cancel_sender.send(true).unwrap();
+            prompt.await
+        })
+        .await
+        .expect("cancellation timed out")
+        .unwrap();
+
+        assert_eq!(outcome, crate::agent::PromptOutcome::Cancelled);
+        assert_eq!(agent.messages().len(), 2);
+        assert!(matches!(
+            &agent.messages()[1],
+            crate::agent::Message::User { content } if content == "stop this"
+        ));
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::MessageDelta {
+                role: MessageRole::User,
+                delta: "stop this".to_owned(),
+            }
+        );
+        assert_eq!(receiver.try_recv().unwrap(), AgentEvent::TurnCancelled);
     }
 }
