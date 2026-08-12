@@ -9,6 +9,63 @@ use crate::agent::{AssistantMessage, EventSender, Message};
 
 pub use openai::OpenAiProvider;
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingLevel {
+    Off,
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl ThinkingLevel {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Low,
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Off,
+        }
+    }
+
+    pub fn as_provider_value(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+        }
+    }
+}
+
+impl FromStr for ThinkingLevel {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            _ => anyhow::bail!(
+                "thinking level must be one of off, low, medium, or high; got {value:?}"
+            ),
+        }
+    }
+}
+
+impl fmt::Display for ThinkingLevel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum OpenAiApi {
@@ -56,9 +113,14 @@ pub struct ToolDefinition {
 }
 
 pub trait Provider: Send + Sync {
+    fn supports_thinking(&self, _model: &str) -> bool {
+        false
+    }
+
     async fn complete(
         &self,
         model: &str,
+        thinking_level: Option<ThinkingLevel>,
         messages: &[Message],
         tools: &[ToolDefinition],
         events: &EventSender,

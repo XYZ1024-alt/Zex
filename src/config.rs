@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use serde::Deserialize;
 
-use crate::provider::OpenAiApi;
+use crate::provider::{OpenAiApi, ThinkingLevel};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_TOOL_TIMEOUT_SECONDS: u64 = 60;
@@ -32,6 +32,7 @@ pub struct Config {
     pub max_tool_output_chars: usize,
     pub max_context_chars: usize,
     pub compact_keep_turns: usize,
+    pub thinking_level: ThinkingLevel,
 }
 
 impl Config {
@@ -121,6 +122,11 @@ impl Config {
                     DEFAULT_COMPACT_KEEP_TURNS,
                 )?,
             )?,
+            thinking_level: env_or_file(
+                "ZEX_THINKING_LEVEL",
+                file.thinking_level,
+                ThinkingLevel::default(),
+            )?,
         })
     }
 
@@ -148,6 +154,7 @@ struct FileConfig {
     max_tool_output_chars: Option<usize>,
     max_context_chars: Option<usize>,
     compact_keep_turns: Option<usize>,
+    thinking_level: Option<ThinkingLevel>,
     session_dir: Option<String>,
 }
 
@@ -164,9 +171,45 @@ impl FileConfig {
             max_tool_output_chars: project.max_tool_output_chars.or(self.max_tool_output_chars),
             max_context_chars: project.max_context_chars.or(self.max_context_chars),
             compact_keep_turns: project.compact_keep_turns.or(self.compact_keep_turns),
+            thinking_level: project.thinking_level.or(self.thinking_level),
             session_dir: project.session_dir.or(self.session_dir),
         }
     }
+}
+
+pub async fn persist_thinking_level(
+    working_dir: &Path,
+    thinking_level: ThinkingLevel,
+) -> Result<()> {
+    let path = working_dir.join(PROJECT_CONFIG_PATH);
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read config file {}", path.display()));
+        }
+    };
+    let mut table = if content.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        toml::from_str::<toml::Table>(&content)
+            .with_context(|| format!("failed to parse config file {}", path.display()))?
+    };
+    table.insert(
+        "thinking_level".to_owned(),
+        toml::Value::String(thinking_level.to_string()),
+    );
+    let serialized =
+        toml::to_string_pretty(&table).context("failed to serialize project config")?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    tokio::fs::write(&path, serialized)
+        .await
+        .with_context(|| format!("failed to write config file {}", path.display()))
 }
 
 fn global_config_dir() -> Result<PathBuf> {
@@ -310,6 +353,7 @@ mod tests {
         "ZEX_MAX_TOOL_OUTPUT_CHARS",
         "ZEX_MAX_CONTEXT_CHARS",
         "ZEX_COMPACT_KEEP_TURNS",
+        "ZEX_THINKING_LEVEL",
         "ZEX_SESSION_DIR",
     ];
 
@@ -393,6 +437,24 @@ max_turns = 8
         assert_eq!(config.model, "project-model");
         assert_eq!(config.base_url, "https://global.example/v1");
         assert_eq!(config.max_turns, 10);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persists_thinking_level_in_project_config() {
+        let _environment = EnvGuard::clear();
+        let root = temp_directory("thinking");
+        let project = root.join("project");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+
+        super::persist_thinking_level(&project, crate::provider::ThinkingLevel::High)
+            .await
+            .unwrap();
+
+        let content = tokio::fs::read_to_string(project.join(".zex/config.toml"))
+            .await
+            .unwrap();
+        assert!(content.contains("thinking_level = \"high\""));
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 

@@ -45,6 +45,7 @@ agent_timeout_seconds = 600
 max_tool_output_chars = 32000
 max_context_chars = 120000
 compact_keep_turns = 6
+thinking_level = "medium"
 ```
 
 支持的 TOML 字段：
@@ -61,6 +62,7 @@ compact_keep_turns = 6
 | `max_tool_output_chars` | `32000` | 所有内置工具返回内容的统一字符上限 |
 | `max_context_chars` | `120000` | 上下文字符预算近似值；达到 85% 时自动 compact |
 | `compact_keep_turns` | `6` | compact 时完整保留的最近用户轮次数 |
+| `thinking_level` | `medium` | 思考强度偏好：`off`、`low`、`medium`、`high`；不支持的模型显示 `n/a` |
 | `session_dir` | 全局 `sessions` 目录 | 自定义会话目录；相对路径基于项目工作目录 |
 
 环境变量优先级高于两个 TOML 文件。API Key 使用 `ZEX_API_KEY`，未设置或为空时再读 `OPENAI_API_KEY`；因此可把非敏感配置提交到项目配置，同时保证密钥不进入仓库。
@@ -78,6 +80,7 @@ compact_keep_turns = 6
 | `ZEX_MAX_TOOL_OUTPUT_CHARS` | 无 | `max_tool_output_chars` |
 | `ZEX_MAX_CONTEXT_CHARS` | 无 | `max_context_chars` |
 | `ZEX_COMPACT_KEEP_TURNS` | 无 | `compact_keep_turns` |
+| `ZEX_THINKING_LEVEL` | 无 | `thinking_level` |
 | `ZEX_SESSION_DIR` | 无 | `session_dir` |
 
 PowerShell 示例：
@@ -138,31 +141,34 @@ cargo run -- -p "读取 README 并总结成三句话"
 zex
 ```
 
-TUI 使用固定四层布局：
+TUI 是单列时间流，不使用左侧对话、右侧工具的仪表盘分栏：
 
-1. 顶部状态栏：当前 model、turn 状态、正在执行的 tool；错误只显示最近摘要。
-2. 对话区：以 `YOU`、`ASSISTANT`、`TOOL`、`ERROR` 分组显示事件流，保持可滚动历史。
-3. 底部输入区：支持多行编辑，最多显示 6 行，内容更长时输入区内部滚动。
-4. 快捷键提示行：按当前 idle / running 模式显示可用操作。
+1. 主区：可滚动 feed，按发生顺序显示 user/assistant 文本和 tool 卡片。当前 core 未生产 planning/todo 事件，因此不会为不存在的数据预留面板；以后新增对应事件时仍进入同一 feed。
+2. 斜杠补全：输入 `/` 时浮在输入框上方，不占永久分区。
+3. 固定状态栏：model、turn 状态、短工作目录、可用时的 git branch@commit、think 强度和 context 占用。
+4. 最底输入框：始终固定，支持多行编辑，最多显示 6 行；下方仅保留一行当前快捷键提示。
 
-tool 调用默认只显示名称、状态和单行摘要。选中后可展开格式化参数和结果预览；参数与结果过长时会明确截断。Assistant 的流式增量合并到当前消息，TUI 只在状态变化、输入或新事件到达时按固定帧率差分重绘，不清空整屏。
+tool 卡片标题突出工具名；`bash` 显示 `$ command`。Output 默认折叠为单行摘要，并标注 `Ctrl+O expand`；页脚显示 Wall 与 Timeout。running、done、failed、interrupted 使用独立状态颜色，连续卡片之间保留空行。展开后显示格式化参数与结果预览；参数和结果过长时明确截断。Assistant 流式增量合并到当前消息，TUI 只在状态变化、输入或新事件到达时按固定帧率差分重绘。
 
 | 快捷键 | idle 模式 | turn 运行中 |
 | --- | --- | --- |
 | Enter | 发送非空输入 | — |
 | Shift-Enter / Alt-Enter | 插入换行 | — |
 | Ctrl-C | 退出 TUI | 中断当前 turn，返回 idle |
-| Esc | 依次关闭 tool 详情、取消选择、清空草稿或回到底部；无可取消状态时退出 | 关闭当前 UI 选择，不中断 turn |
+| Esc | 关闭补全、tool 详情、取消选择、清空草稿或回到底部；无可取消状态时退出 | 关闭当前 UI 选择，不中断 turn |
 | PageUp / PageDown | 对话历史翻页 | 对话历史翻页 |
 | Home / End | 跳到历史顶部 / 底部 | 跳到历史顶部 / 底部 |
-| Tab / Shift-Tab | 选择下一个 / 上一个 tool | 选择下一个 / 上一个 tool |
-| `e` | 输入框为空时展开 / 折叠当前 tool | 展开 / 折叠当前 tool |
+| Tab / Shift-Tab | 补全打开时接受当前命令；否则选择下一个 / 上一个 tool | 选择下一个 / 上一个 tool |
+| Up / Down | 补全打开时选择上一项 / 下一项 | — |
+| Ctrl-O | 展开 / 折叠当前 tool；未选择时作用于最近一条 | 同左 |
+| `e` | 输入框为空时展开 / 折叠当前 tool | 同左 |
+| Ctrl-T | 循环切换 `off → low → medium → high` 并持久化 | — |
 
 粘贴使用终端 bracketed paste，允许直接粘贴多行内容。当前 turn 运行时输入区锁定，避免草稿与执行中状态混淆；Ctrl-C 中断后，已输入的用户消息保留，未完成的 assistant/tool 状态不会进入后续 Provider 上下文。
 
 ### 斜杠命令
 
-TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令解析与执行模块。命中的斜杠命令不会作为普通用户消息发给模型；未知命令返回可读错误。
+TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册表、解析与执行模块；`/help` 和补全列表因此不会漂移。输入 `/` 后按前缀过滤，例如 `/se` 只显示 `/sessions`。Up/Down 选择，Tab 补全，Enter 在前缀未完整时先补全、命令完整时执行，Esc 关闭。命中的斜杠命令不会作为普通用户消息发给模型；未知命令返回可读错误。
 
 | 命令 | 行为 |
 | --- | --- |
@@ -173,6 +179,7 @@ TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令解析�
 | `/sessions` | 复用 `SessionStore::list` 列出 ID、更新时间、消息数和预览 |
 | `/resume [id]` | 恢复指定会话；省略 ID 时恢复最近的非当前会话。恢复消息及该会话保存的 model |
 | `/compact` | 立即压缩旧上下文，显示压缩前后字符数、约释放字符数、保留轮次和摘要数量 |
+| `/think [off\|low\|medium\|high]` | 无参数时循环切换；有参数时直接设置。写入项目 `.zex/config.toml`；模型不支持时显示 `n/a` 并保留偏好 |
 
 stdin 或 stdout 不是 TTY 时自动保留普通终端 REPL：
 
@@ -323,11 +330,11 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
    cargo run --
    ```
 
-   预期进入 TUI。先输入 `记住数字 37`，再输入 `必须使用 read 读取 Cargo.toml，然后告诉我刚才的数字`。主区应显示两轮对话与默认折叠的 `read` running/done 摘要；状态栏应在 `IDLE`、`THINKING`、`TOOL` 间切换并显示 model。按 Tab 选择 tool、按 `e` 展开参数和结果，再用 PageUp/PageDown 滚动历史。第二轮回答应保留上下文。
+   预期进入 TUI。先输入 `记住数字 37`，再输入 `必须使用 read 读取 Cargo.toml，然后告诉我刚才的数字`。主区应显示两轮对话与默认折叠的 `read` running/done 卡片；状态栏应在 `IDLE`、`THINKING`、`TOOL` 间切换并显示 model、cwd、git、think 和 context。按 Tab 选择 tool、按 Ctrl-O 展开参数和结果，再用 PageUp/PageDown 滚动历史。第二轮回答应保留上下文。
 
 6. 验证多行输入与中断：用 Shift-Enter 或 Alt-Enter 输入两行后按 Enter 发送。再提交一个会运行较久的请求，并在 `THINKING` 或 `TOOL` 状态按 Ctrl-C。预期出现单条 interrupted 提示，运行中的 tool 标记为 interrupted，状态恢复 `IDLE`，可立即发送下一条消息。
 
-7. 验证错误摘要：使用错误 API Key 启动 TUI 并提交一句话。预期主区只出现一条可读错误，顶部状态栏显示最近错误摘要，不重复刷屏；Esc 或 Ctrl-C 可正常退出并恢复终端。
+7. 验证错误摘要：使用错误 API Key 启动 TUI 并提交一句话。预期主区只出现一条可读错误，不重复刷屏；Esc 或 Ctrl-C 可正常退出并恢复终端。
 
 8. 验证无 TTY 回退：
 
@@ -364,6 +371,13 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
     2. 输入 `/compact`。预期 INFO 行显示类似 `freed approximately N chars (before → after); kept 2 recent turn(s)`，其中有足够旧内容时 `N > 0`。
     3. 再询问最近两轮的信息，预期能完整回答；询问早期任务时应基于 compact 摘要回答。退出后检查会话 JSONL，可看到一条以 `[Compacted earlier conversation:` 开头的 system 消息，旧的大段 tool 输出不再完整保存。
     4. 临时把 `max_context_chars` 调低后重复长输出，预期无需输入 `/compact` 即出现自动 compact 反馈；TUI 与非 TTY REPL 行为一致。
+
+13. 验证本次 TUI 交互：
+
+    1. 输入 `/se`，预期输入框上方只出现 `/sessions` 与说明；Up/Down 选择，Tab 补全，Esc 关闭。
+    2. 要求模型连续执行 `git status` 和 `git rev-parse --short HEAD`。预期同一 feed 内出现两个 `$ git …` 卡片，默认折叠 Output，卡片页脚分别显示 Wall 和 Timeout，卡片之间有空行。
+    3. 按 Tab 选中工具并按 Ctrl-O 展开/折叠。
+    4. 输入 `/think high`，再按 Ctrl-T。预期状态栏 think 更新，项目 `.zex/config.toml` 写入最新偏好；不支持推理强度的模型显示 `n/a`，不崩溃。
 
 ## 模块
 

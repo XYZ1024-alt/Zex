@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
         max_tool_output_chars,
         max_context_chars,
         compact_keep_turns,
+        thinking_level,
     } = config;
     let model = session_model.unwrap_or(model);
     let provider = OpenAiProvider::new(&base_url, api_key, openai_api, agent_timeout)?;
@@ -67,7 +68,7 @@ async fn main() -> Result<()> {
     tools.register(WriteTool::new(working_dir.clone()));
     tools.register(EditTool::new(working_dir.clone()));
     tools.register(GrepTool::new(working_dir.clone()));
-    tools.register(GlobTool::new(working_dir));
+    tools.register(GlobTool::new(working_dir.clone()));
     let mut agent = Agent::new(
         provider,
         tools,
@@ -78,6 +79,7 @@ async fn main() -> Result<()> {
             max_turns,
             max_context_chars,
             compact_keep_turns,
+            thinking_level,
         },
         resumed_messages,
     );
@@ -90,19 +92,27 @@ async fn main() -> Result<()> {
                 prompt.to_owned(),
                 &session_store,
                 &mut session_id,
+                &working_dir,
             )
             .await,
             Some(printer),
         )
     } else if tui::is_available() {
         (
-            tui::run(&mut agent, event_receiver, &session_store, &mut session_id).await,
+            tui::run(
+                &mut agent,
+                event_receiver,
+                &session_store,
+                &mut session_id,
+                &working_dir,
+            )
+            .await,
             None,
         )
     } else {
         let printer = headless::spawn_event_printer(event_receiver);
         (
-            headless::run_repl(&mut agent, &session_store, &mut session_id).await,
+            headless::run_repl(&mut agent, &session_store, &mut session_id, &working_dir).await,
             Some(printer),
         )
     };

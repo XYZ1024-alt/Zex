@@ -1,19 +1,79 @@
+use std::path::Path;
+
 use anyhow::{Context, Result, bail};
 
 use crate::{
     agent::{Agent, CompactStats},
+    config::persist_thinking_level,
     provider::Provider,
+    provider::ThinkingLevel,
     session::{SessionStore, format_session_summaries},
 };
 
-const HELP: &str = "\
-/help                 List slash commands
-/model                Show the active model
-/model <name>         Switch the active model for this session
-/clear                Clear this view and start a fresh context
-/sessions             List saved sessions
-/resume [id]          Resume the named session, or latest non-current session
-/compact              Compact older context and report reclaimed characters";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub usage: &'static str,
+    pub description: &'static str,
+    pub accepts_arguments: bool,
+}
+
+pub const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "/help",
+        usage: "/help",
+        description: "List slash commands",
+        accepts_arguments: false,
+    },
+    CommandSpec {
+        name: "/model",
+        usage: "/model [name]",
+        description: "Show or switch the active model",
+        accepts_arguments: true,
+    },
+    CommandSpec {
+        name: "/clear",
+        usage: "/clear",
+        description: "Clear the view and model context",
+        accepts_arguments: false,
+    },
+    CommandSpec {
+        name: "/sessions",
+        usage: "/sessions",
+        description: "List saved sessions",
+        accepts_arguments: false,
+    },
+    CommandSpec {
+        name: "/resume",
+        usage: "/resume [id]",
+        description: "Resume a saved session",
+        accepts_arguments: true,
+    },
+    CommandSpec {
+        name: "/compact",
+        usage: "/compact",
+        description: "Compact older context",
+        accepts_arguments: false,
+    },
+    CommandSpec {
+        name: "/think",
+        usage: "/think [off|low|medium|high]",
+        description: "Show, set, or cycle thinking",
+        accepts_arguments: true,
+    },
+];
+
+pub fn command_specs() -> &'static [CommandSpec] {
+    COMMANDS
+}
+
+fn help_text() -> String {
+    COMMANDS
+        .iter()
+        .map(|command| format!("{:<36} {}", command.usage, command.description))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
@@ -23,6 +83,7 @@ pub enum SlashCommand {
     Sessions,
     Resume(Option<String>),
     Compact,
+    Think(Option<ThinkingLevel>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,10 +116,14 @@ pub fn parse(input: &str) -> Result<Option<SlashCommand>> {
             SlashCommand::Resume(arguments.first().map(|value| (*value).to_owned()))
         }
         "/compact" if arguments.is_empty() => SlashCommand::Compact,
+        "/think" if arguments.len() <= 1 => {
+            SlashCommand::Think(arguments.first().map(|value| value.parse()).transpose()?)
+        }
         "/help" | "/clear" | "/sessions" | "/compact" => {
             bail!("{name} does not accept arguments")
         }
         "/resume" => bail!("/resume accepts at most one session ID"),
+        "/think" => bail!("/think accepts at most one level"),
         _ => bail!("unknown slash command {name:?}; use /help"),
     };
     Ok(Some(command))
@@ -69,13 +134,14 @@ pub async fn execute<P>(
     agent: &mut Agent<P>,
     session_store: &SessionStore,
     session_id: &mut Option<String>,
+    working_dir: &Path,
 ) -> Result<CommandResult>
 where
     P: Provider,
 {
     match command {
         SlashCommand::Help => Ok(CommandResult {
-            message: HELP.to_owned(),
+            message: help_text(),
             effect: CommandEffect::None,
         }),
         SlashCommand::Model(None) => Ok(CommandResult {
@@ -142,6 +208,22 @@ where
                 effect: CommandEffect::ReplaceView,
             })
         }
+        SlashCommand::Think(requested) => {
+            let thinking_level = requested.unwrap_or_else(|| agent.cycle_thinking_level());
+            agent.set_thinking_level(thinking_level);
+            persist_thinking_level(working_dir, thinking_level).await?;
+            let message = match agent.thinking_level() {
+                Some(level) => format!("Thinking level: {level}. Saved to .zex/config.toml."),
+                None => format!(
+                    "Thinking: n/a for model {}. Saved preference: {thinking_level}.",
+                    agent.model()
+                ),
+            };
+            Ok(CommandResult {
+                message,
+                effect: CommandEffect::None,
+            })
+        }
     }
 }
 
@@ -158,7 +240,7 @@ mod execution_tests {
     use super::{CommandEffect, SlashCommand, execute};
     use crate::{
         agent::{Agent, AgentOptions, AssistantMessage, Message},
-        provider::{Provider, ToolDefinition},
+        provider::{Provider, ThinkingLevel, ToolDefinition},
         session::SessionStore,
         tools::ToolRegistry,
     };
@@ -171,6 +253,7 @@ mod execution_tests {
         async fn complete(
             &self,
             _model: &str,
+            _thinking_level: Option<crate::provider::ThinkingLevel>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _events: &crate::agent::EventSender,
@@ -210,6 +293,7 @@ mod execution_tests {
                 max_turns: 1,
                 max_context_chars: 120_000,
                 compact_keep_turns: 1,
+                thinking_level: crate::provider::ThinkingLevel::Medium,
             },
             Some(messages),
         )
@@ -234,9 +318,15 @@ mod execution_tests {
         }]);
         let mut session_id = Some(saved_id.clone());
 
-        let result = execute(SlashCommand::Clear, &mut agent, &store, &mut session_id)
-            .await
-            .unwrap();
+        let result = execute(
+            SlashCommand::Clear,
+            &mut agent,
+            &store,
+            &mut session_id,
+            &directory,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.effect, CommandEffect::ClearView);
         assert!(session_id.is_none());
@@ -267,6 +357,7 @@ mod execution_tests {
             &mut agent,
             &store,
             &mut session_id,
+            &directory,
         )
         .await
         .unwrap();
@@ -277,6 +368,7 @@ mod execution_tests {
             &mut agent,
             &store,
             &mut session_id,
+            &directory,
         )
         .await
         .unwrap();
@@ -317,9 +409,15 @@ mod execution_tests {
         let before = agent.context_chars();
         let mut session_id = None;
 
-        let result = execute(SlashCommand::Compact, &mut agent, &store, &mut session_id)
-            .await
-            .unwrap();
+        let result = execute(
+            SlashCommand::Compact,
+            &mut agent,
+            &store,
+            &mut session_id,
+            &directory,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.effect, CommandEffect::ReplaceView);
         assert!(result.message.contains("freed approximately"));
@@ -327,6 +425,33 @@ mod execution_tests {
         assert!(result.message.contains(&agent.context_chars().to_string()));
         assert!(agent.context_chars() < before);
         let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
+    async fn think_command_cycles_and_persists_preference() {
+        let directory = temporary_directory();
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let store = SessionStore::new(directory.join("sessions"));
+        let mut agent = agent(Vec::new());
+        let mut session_id = None;
+
+        let result = execute(
+            SlashCommand::Think(Some(ThinkingLevel::High)),
+            &mut agent,
+            &store,
+            &mut session_id,
+            &directory,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(agent.thinking_preference(), ThinkingLevel::High);
+        assert!(result.message.contains("n/a"));
+        let config = tokio::fs::read_to_string(directory.join(".zex/config.toml"))
+            .await
+            .unwrap();
+        assert!(config.contains("thinking_level = \"high\""));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }
 
@@ -350,7 +475,8 @@ fn compact_feedback(stats: &CompactStats) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SlashCommand, parse};
+    use super::{SlashCommand, command_specs, parse};
+    use crate::provider::ThinkingLevel;
 
     #[test]
     fn parses_commands_without_treating_messages_as_commands() {
@@ -361,5 +487,14 @@ mod tests {
             Some(SlashCommand::Model(Some("gpt-5".to_owned())))
         );
         assert!(parse("/unknown").is_err());
+        assert_eq!(
+            parse("/think high").unwrap(),
+            Some(SlashCommand::Think(Some(ThinkingLevel::High)))
+        );
+        assert!(
+            command_specs()
+                .iter()
+                .any(|command| command.name == "/think")
+        );
     }
 }

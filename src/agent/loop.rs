@@ -1,11 +1,14 @@
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Result, bail};
 use serde_json::Value;
 
 use crate::{
     agent::{AgentEvent, AssistantMessage, EventSender, Message, MessageRole, PromptOutcome},
-    provider::Provider,
+    provider::{Provider, ThinkingLevel},
     tools::ToolRegistry,
 };
 
@@ -24,6 +27,7 @@ pub struct Agent<P> {
     max_turns: usize,
     max_context_chars: usize,
     compact_keep_turns: usize,
+    thinking_level: ThinkingLevel,
 }
 
 pub struct AgentOptions {
@@ -32,6 +36,7 @@ pub struct AgentOptions {
     pub max_turns: usize,
     pub max_context_chars: usize,
     pub compact_keep_turns: usize,
+    pub thinking_level: ThinkingLevel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +70,7 @@ where
             max_turns: options.max_turns,
             max_context_chars: options.max_context_chars,
             compact_keep_turns: options.compact_keep_turns,
+            thinking_level: options.thinking_level,
         }
     }
 
@@ -78,6 +84,33 @@ where
 
     pub fn set_model(&mut self, model: String) {
         self.model = model;
+    }
+
+    pub fn thinking_level(&self) -> Option<ThinkingLevel> {
+        self.provider
+            .supports_thinking(&self.model)
+            .then_some(self.thinking_level)
+    }
+
+    pub fn thinking_preference(&self) -> ThinkingLevel {
+        self.thinking_level
+    }
+
+    pub fn set_thinking_level(&mut self, thinking_level: ThinkingLevel) {
+        self.thinking_level = thinking_level;
+    }
+
+    pub fn cycle_thinking_level(&mut self) -> ThinkingLevel {
+        self.thinking_level = self.thinking_level.next();
+        self.thinking_level
+    }
+
+    pub fn max_context_chars(&self) -> usize {
+        self.max_context_chars
+    }
+
+    pub fn default_tool_timeout(&self) -> Duration {
+        self.tools.default_timeout()
     }
 
     pub fn clear(&mut self) {
@@ -205,7 +238,13 @@ where
             self.compact_if_needed();
             let assistant = match self
                 .provider
-                .complete(&self.model, &self.messages, &definitions, &self.events)
+                .complete(
+                    &self.model,
+                    self.thinking_level(),
+                    &self.messages,
+                    &definitions,
+                    &self.events,
+                )
                 .await
             {
                 Ok(assistant) => assistant,
@@ -232,16 +271,25 @@ where
                 let name = tool_call.name;
                 let call_id = tool_call.id;
                 let arguments = tool_call.arguments;
+                let parsed_arguments = serde_json::from_str::<Value>(&arguments);
+                let timeout = parsed_arguments
+                    .as_ref()
+                    .ok()
+                    .and_then(|arguments| self.tools.execution_timeout(arguments).ok())
+                    .unwrap_or_else(|| self.tools.default_timeout());
                 let _ = self.events.send(AgentEvent::ToolStart {
                     call_id: call_id.clone(),
                     name: name.clone(),
                     arguments: arguments.clone(),
+                    timeout,
                 });
 
-                let result = match serde_json::from_str::<Value>(&arguments) {
+                let started = Instant::now();
+                let result = match parsed_arguments {
                     Ok(arguments) => self.tools.execute(&name, arguments).await,
                     Err(error) => Err(anyhow::Error::from(error)),
                 };
+                let elapsed = started.elapsed();
                 let (content, is_error) = match result {
                     Ok(output) => (output, false),
                     Err(error) => (format!("tool error: {error:#}"), true),
@@ -252,6 +300,7 @@ where
                     name,
                     output: content.clone(),
                     is_error,
+                    elapsed,
                 });
                 self.messages.push(Message::Tool {
                     tool_call_id: call_id,
@@ -505,6 +554,7 @@ mod tests {
         async fn complete(
             &self,
             _model: &str,
+            _thinking_level: Option<crate::provider::ThinkingLevel>,
             _messages: &[crate::agent::Message],
             _tools: &[ToolDefinition],
             events: &crate::agent::EventSender,
@@ -531,6 +581,7 @@ mod tests {
         async fn complete(
             &self,
             _model: &str,
+            _thinking_level: Option<crate::provider::ThinkingLevel>,
             _messages: &[crate::agent::Message],
             _tools: &[ToolDefinition],
             _events: &crate::agent::EventSender,
@@ -545,6 +596,7 @@ mod tests {
         async fn complete(
             &self,
             _model: &str,
+            _thinking_level: Option<crate::provider::ThinkingLevel>,
             _messages: &[crate::agent::Message],
             _tools: &[ToolDefinition],
             _events: &crate::agent::EventSender,
@@ -569,6 +621,7 @@ mod tests {
                 max_turns: 1,
                 max_context_chars: 120_000,
                 compact_keep_turns: 6,
+                thinking_level: crate::provider::ThinkingLevel::Medium,
             },
             None,
         );
@@ -637,6 +690,7 @@ mod tests {
                 max_turns: 3,
                 max_context_chars: 120_000,
                 compact_keep_turns: 6,
+                thinking_level: crate::provider::ThinkingLevel::Medium,
             },
             None,
         );
@@ -656,17 +710,22 @@ mod tests {
                 call_id: "call-1".to_owned(),
                 name: "echo".to_owned(),
                 arguments: r#"{"value":"observed"}"#.to_owned(),
+                timeout: Duration::from_secs(1),
             }
         );
-        assert_eq!(
+        assert!(matches!(
             receiver.try_recv().unwrap(),
             AgentEvent::ToolEnd {
-                call_id: "call-1".to_owned(),
-                name: "echo".to_owned(),
-                output: "observed".to_owned(),
+                call_id,
+                name,
+                output,
                 is_error: false,
-            }
-        );
+                elapsed,
+            } if call_id == "call-1"
+                && name == "echo"
+                && output == "observed"
+                && elapsed > Duration::ZERO
+        ));
         assert_eq!(
             receiver.try_recv().unwrap(),
             AgentEvent::MessageDelta {
@@ -690,6 +749,7 @@ mod tests {
                 max_turns: 1,
                 max_context_chars: 120_000,
                 compact_keep_turns: 6,
+                thinking_level: crate::provider::ThinkingLevel::Medium,
             },
             None,
         );
@@ -725,6 +785,7 @@ mod tests {
                 max_turns: 1,
                 max_context_chars: 120_000,
                 compact_keep_turns: 6,
+                thinking_level: crate::provider::ThinkingLevel::Medium,
             },
             None,
         );
@@ -773,6 +834,7 @@ mod tests {
                 max_turns: 1,
                 max_context_chars: 120_000,
                 compact_keep_turns: 2,
+                thinking_level: crate::provider::ThinkingLevel::Medium,
             },
             Some(vec![
                 crate::agent::Message::User {
@@ -857,6 +919,7 @@ mod tests {
                 max_turns: 1,
                 max_context_chars: 1_000,
                 compact_keep_turns: 1,
+                thinking_level: crate::provider::ThinkingLevel::Medium,
             },
             Some(vec![
                 crate::agent::Message::User {

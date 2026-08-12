@@ -105,6 +105,14 @@ impl ToolRegistry {
             .with_context(|| format!("tool '{name}' failed"))?;
         Ok(truncate_output(result, self.max_output_chars))
     }
+
+    pub fn default_timeout(&self) -> Duration {
+        self.default_timeout
+    }
+
+    pub fn execution_timeout(&self, arguments: &Value) -> Result<Duration> {
+        timeout_from_arguments(arguments, self.default_timeout)
+    }
 }
 
 fn timeout_from_arguments(arguments: &Value, default: Duration) -> Result<Duration> {

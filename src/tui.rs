@@ -1,7 +1,9 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{self, IsTerminal},
-    time::Duration,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -28,8 +30,8 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     agent::{Agent, AgentEvent, Message, MessageRole, PromptOutcome},
-    command::{CommandEffect, execute, parse},
-    provider::Provider,
+    command::{CommandEffect, CommandSpec, command_specs, execute, parse},
+    provider::{Provider, ThinkingLevel},
     session::SessionStore,
 };
 
@@ -39,6 +41,8 @@ const MAX_TOOL_DETAIL_CHARS: usize = 4_000;
 const MAX_TOOL_ARGUMENT_CHARS: usize = 2_000;
 const MAX_INPUT_ROWS: u16 = 6;
 const MIN_TRANSCRIPT_HEIGHT: u16 = 3;
+const MAX_COMPLETION_ROWS: u16 = 7;
+const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 
 pub fn is_available() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
@@ -49,6 +53,7 @@ pub async fn run<P>(
     event_receiver: mpsc::UnboundedReceiver<AgentEvent>,
     session_store: &SessionStore,
     session_id: &mut Option<String>,
+    working_dir: &Path,
 ) -> Result<()>
 where
     P: Provider,
@@ -61,6 +66,7 @@ where
         EventStream::new(),
         session_store,
         session_id,
+        working_dir,
     )
     .await;
     let restore_result = terminal.restore();
@@ -79,14 +85,27 @@ async fn run_loop<P>(
     mut terminal_events: EventStream,
     session_store: &SessionStore,
     session_id: &mut Option<String>,
+    working_dir: &Path,
 ) -> Result<()>
 where
     P: Provider,
 {
-    let mut app = App::new(agent.messages(), agent.model().to_owned());
+    let mut app = App::new(
+        agent.messages(),
+        agent.model().to_owned(),
+        AppContext {
+            working_dir: working_dir.to_path_buf(),
+            thinking_level: agent.thinking_level(),
+            thinking_preference: agent.thinking_preference(),
+            context_chars: agent.context_chars(),
+            max_context_chars: agent.max_context_chars(),
+            default_tool_timeout: agent.default_tool_timeout(),
+        },
+    );
     let mut redraw = tokio::time::interval(FRAME_INTERVAL);
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
+    let mut burst = KeyBurst::default();
 
     loop {
         tokio::select! {
@@ -108,16 +127,30 @@ where
             }
             event = terminal_events.next() => {
                 match event {
-                    Some(Ok(event)) => match handle_terminal_event(event, &mut app, false) {
+                    Some(Ok(event)) => match handle_terminal_event(
+                        event,
+                        &mut app,
+                        false,
+                        &mut burst,
+                        Instant::now(),
+                    ) {
                         InputAction::None => {}
                         InputAction::Quit => return Ok(()),
                         InputAction::Interrupt => {}
                         InputAction::Submit(prompt) => {
                             match parse(&prompt) {
                                 Ok(Some(command)) => {
-                                    match execute(command, agent, session_store, session_id).await {
+                                    match execute(
+                                        command,
+                                        agent,
+                                        session_store,
+                                        session_id,
+                                        working_dir,
+                                    )
+                                    .await
+                                    {
                                         Ok(result) => {
-                                            app.model = agent.model().to_owned();
+                                            app.sync_agent_status(agent);
                                             match result.effect {
                                                 CommandEffect::None => {}
                                                 CommandEffect::ClearView => app.reset_transcript(),
@@ -141,6 +174,7 @@ where
                                         prompt,
                                     )
                                     .await?;
+                                    app.sync_agent_status(agent);
                                 }
                                 Err(error) => app.record_error(format!("{error:#}")),
                             }
@@ -175,6 +209,7 @@ where
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     let mut cancellation_requested = false;
+    let mut burst = KeyBurst::default();
 
     loop {
         tokio::select! {
@@ -219,7 +254,13 @@ where
             }
             event = terminal_events.next() => {
                 match event {
-                    Some(Ok(event)) => match handle_terminal_event(event, app, true) {
+                    Some(Ok(event)) => match handle_terminal_event(
+                        event,
+                        app,
+                        true,
+                        &mut burst,
+                        Instant::now(),
+                    ) {
                         InputAction::Interrupt if !cancellation_requested => {
                             cancellation_requested = true;
                             app.status = Status::Cancelling;
@@ -253,26 +294,113 @@ enum InputAction {
     Submit(String),
 }
 
-fn handle_terminal_event(event: Event, app: &mut App, turn_active: bool) -> InputAction {
+#[derive(Debug, Default)]
+struct KeyBurst {
+    last_plain_key: Option<Instant>,
+}
+
+impl KeyBurst {
+    fn observe(&mut self, key: KeyEvent, now: Instant) -> bool {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.last_plain_key = None;
+            return false;
+        }
+        let in_burst = self
+            .last_plain_key
+            .is_some_and(|previous| now.duration_since(previous) <= PASTE_BURST_WINDOW);
+        if matches!(
+            key.code,
+            KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab
+        ) {
+            self.last_plain_key = Some(now);
+        } else {
+            self.last_plain_key = None;
+        }
+        in_burst
+    }
+
+    fn reset(&mut self) {
+        self.last_plain_key = None;
+    }
+}
+
+fn handle_terminal_event(
+    event: Event,
+    app: &mut App,
+    turn_active: bool,
+    burst: &mut KeyBurst,
+    now: Instant,
+) -> InputAction {
     match event {
         Event::Paste(content) if !turn_active => {
+            burst.reset();
             app.input.insert_str(&content);
+            app.refresh_completion();
             InputAction::None
         }
         Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
-            handle_key_event(key, app, turn_active)
+            let in_paste_burst = burst.observe(key, now);
+            handle_key_event(key, app, turn_active, in_paste_burst)
         }
         _ => InputAction::None,
     }
 }
 
-fn handle_key_event(key: KeyEvent, app: &mut App, turn_active: bool) -> InputAction {
+fn handle_key_event(
+    key: KeyEvent,
+    app: &mut App,
+    turn_active: bool,
+    in_paste_burst: bool,
+) -> InputAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return if turn_active {
             InputAction::Interrupt
         } else {
             InputAction::Quit
         };
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+        app.toggle_selected_tool();
+        return InputAction::None;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+        return if turn_active {
+            InputAction::None
+        } else {
+            InputAction::Submit("/think".to_owned())
+        };
+    }
+
+    if app.completion_open() && !turn_active {
+        match key.code {
+            KeyCode::Up => {
+                app.select_completion(true);
+                return InputAction::None;
+            }
+            KeyCode::Down => {
+                app.select_completion(false);
+                return InputAction::None;
+            }
+            KeyCode::Tab => {
+                app.accept_completion();
+                return InputAction::None;
+            }
+            KeyCode::Enter => {
+                if app.complete_or_execute_selected() {
+                    return InputAction::None;
+                }
+            }
+            KeyCode::Esc => {
+                app.dismiss_completion();
+                return InputAction::None;
+            }
+            _ => {}
+        }
     }
 
     match key.code {
@@ -328,8 +456,9 @@ fn handle_key_event(key: KeyEvent, app: &mut App, turn_active: bool) -> InputAct
             code: KeyCode::Enter,
             modifiers,
             ..
-        } if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+        } if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) || in_paste_burst => {
             app.input.insert_char('\n');
+            app.refresh_completion();
         }
         KeyEvent {
             code: KeyCode::Enter,
@@ -343,11 +472,17 @@ fn handle_key_event(key: KeyEvent, app: &mut App, turn_active: bool) -> InputAct
         KeyEvent {
             code: KeyCode::Backspace,
             ..
-        } => app.input.backspace(),
+        } => {
+            app.input.backspace();
+            app.refresh_completion();
+        }
         KeyEvent {
             code: KeyCode::Delete,
             ..
-        } => app.input.delete(),
+        } => {
+            app.input.delete();
+            app.refresh_completion();
+        }
         KeyEvent {
             code: KeyCode::Left,
             ..
@@ -362,6 +497,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App, turn_active: bool) -> InputAct
             ..
         } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
             app.input.insert_char(character);
+            app.refresh_completion();
         }
         _ => {}
     }
@@ -436,6 +572,9 @@ struct ToolEntry {
     output: String,
     status: ToolStatus,
     expanded: bool,
+    started_at: Option<Instant>,
+    elapsed: Option<Duration>,
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -505,6 +644,34 @@ impl InputBuffer {
         self.clear();
         prompt
     }
+
+    fn replace(&mut self, value: &str) {
+        self.content.clear();
+        self.content.push_str(value);
+        self.cursor = self.content.len();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitStatus {
+    branch: String,
+    commit: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompletionState {
+    selected: usize,
+    dismissed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AppContext {
+    working_dir: PathBuf,
+    thinking_level: Option<ThinkingLevel>,
+    thinking_preference: ThinkingLevel,
+    context_chars: usize,
+    max_context_chars: usize,
+    default_tool_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -521,10 +688,19 @@ struct App {
     max_scroll: usize,
     transcript_page_height: usize,
     follow_output: bool,
+    working_dir: PathBuf,
+    git_status: Option<GitStatus>,
+    thinking_level: Option<ThinkingLevel>,
+    thinking_preference: ThinkingLevel,
+    context_chars: usize,
+    max_context_chars: usize,
+    default_tool_timeout: Duration,
+    completion: CompletionState,
 }
 
 impl App {
-    fn new(messages: &[Message], model: String) -> Self {
+    fn new(messages: &[Message], model: String, context: AppContext) -> Self {
+        let git_status = load_git_status(&context.working_dir);
         let mut app = Self {
             model,
             transcript: Vec::new(),
@@ -538,6 +714,17 @@ impl App {
             max_scroll: 0,
             transcript_page_height: 1,
             follow_output: true,
+            working_dir: context.working_dir,
+            git_status,
+            thinking_level: context.thinking_level,
+            thinking_preference: context.thinking_preference,
+            context_chars: context.context_chars,
+            max_context_chars: context.max_context_chars,
+            default_tool_timeout: context.default_tool_timeout,
+            completion: CompletionState {
+                selected: 0,
+                dismissed: false,
+            },
         };
 
         for message in messages {
@@ -569,6 +756,9 @@ impl App {
                             output: String::new(),
                             status: ToolStatus::Done,
                             expanded: false,
+                            started_at: None,
+                            elapsed: None,
+                            timeout: app.default_tool_timeout,
                         })
                     }));
                 }
@@ -615,6 +805,7 @@ impl App {
                 call_id,
                 name,
                 arguments,
+                timeout,
             } => {
                 self.active_tools.insert(call_id.clone(), name.clone());
                 self.status = Status::RunningTool;
@@ -625,6 +816,9 @@ impl App {
                     output: String::new(),
                     status: ToolStatus::Running,
                     expanded: false,
+                    started_at: Some(Instant::now()),
+                    elapsed: None,
+                    timeout,
                 }));
             }
             AgentEvent::ToolEnd {
@@ -632,6 +826,7 @@ impl App {
                 name,
                 output,
                 is_error,
+                elapsed,
             } => {
                 let status = if is_error {
                     ToolStatus::Failed
@@ -642,6 +837,8 @@ impl App {
                     tool.name = name;
                     tool.output = truncate_chars(&output, MAX_TOOL_DETAIL_CHARS);
                     tool.status = status;
+                    tool.started_at = None;
+                    tool.elapsed = Some(elapsed);
                 }
                 self.active_tools.remove(&call_id);
                 self.status = if !self.active_tools.is_empty() {
@@ -671,6 +868,8 @@ impl App {
                         && tool.status == ToolStatus::Running
                     {
                         tool.status = ToolStatus::Cancelled;
+                        tool.elapsed = tool.started_at.map(|started| started.elapsed());
+                        tool.started_at = None;
                     }
                 }
                 self.transcript.push(TranscriptEntry::Notice(
@@ -710,7 +909,18 @@ impl App {
 
     fn replace_transcript(&mut self, messages: &[Message]) {
         let model = self.model.clone();
-        *self = Self::new(messages, model);
+        *self = Self::new(
+            messages,
+            model,
+            AppContext {
+                working_dir: self.working_dir.clone(),
+                thinking_level: self.thinking_level,
+                thinking_preference: self.thinking_preference,
+                context_chars: self.context_chars,
+                max_context_chars: self.max_context_chars,
+                default_tool_timeout: self.default_tool_timeout,
+            },
+        );
     }
 
     fn find_tool_mut(&mut self, call_id: &str) -> Option<&mut ToolEntry> {
@@ -816,6 +1026,10 @@ impl App {
     }
 
     fn cancel_ui_layer(&mut self) -> bool {
+        if self.completion_open() {
+            self.dismiss_completion();
+            return true;
+        }
         if let Some(selected) = self.selected_tool.clone() {
             if let Some(tool) = self.find_tool_mut(&selected)
                 && tool.expanded
@@ -848,35 +1062,132 @@ impl App {
                 .join(", ")
         }
     }
+
+    fn sync_agent_status<P>(&mut self, agent: &Agent<P>)
+    where
+        P: Provider,
+    {
+        self.model = agent.model().to_owned();
+        self.thinking_level = agent.thinking_level();
+        self.thinking_preference = agent.thinking_preference();
+        self.context_chars = agent.context_chars();
+        self.max_context_chars = agent.max_context_chars();
+    }
+
+    fn completion_matches(&self) -> Vec<&'static CommandSpec> {
+        let input = self.input.content.trim_start();
+        if self.busy
+            || self.completion.dismissed
+            || !input.starts_with('/')
+            || input.contains(char::is_whitespace)
+        {
+            return Vec::new();
+        }
+        command_specs()
+            .iter()
+            .filter(|command| command.name.starts_with(input))
+            .collect()
+    }
+
+    fn completion_open(&self) -> bool {
+        !self.completion_matches().is_empty()
+    }
+
+    fn refresh_completion(&mut self) {
+        self.completion.dismissed = false;
+        let count = self.completion_matches().len();
+        self.completion.selected = self.completion.selected.min(count.saturating_sub(1));
+    }
+
+    fn select_completion(&mut self, reverse: bool) {
+        let count = self.completion_matches().len();
+        if count == 0 {
+            return;
+        }
+        self.completion.selected = if reverse {
+            self.completion.selected.checked_sub(1).unwrap_or(count - 1)
+        } else {
+            (self.completion.selected + 1) % count
+        };
+    }
+
+    fn accept_completion(&mut self) {
+        let matches = self.completion_matches();
+        let Some(command) = matches.get(self.completion.selected) else {
+            return;
+        };
+        let completed = format!(
+            "{}{}",
+            command.name,
+            if command.accepts_arguments { " " } else { "" }
+        );
+        self.input.replace(&completed);
+        self.completion.dismissed = true;
+    }
+
+    fn complete_or_execute_selected(&mut self) -> bool {
+        let matches = self.completion_matches();
+        let Some(command) = matches.get(self.completion.selected) else {
+            return false;
+        };
+        if self.input.content.trim() == command.name {
+            return false;
+        }
+        self.accept_completion();
+        true
+    }
+
+    fn dismiss_completion(&mut self) {
+        self.completion.dismissed = true;
+    }
+}
+
+fn load_git_status(working_dir: &Path) -> Option<GitStatus> {
+    let branch = git_output(working_dir, &["branch", "--show-current"]).or_else(|| {
+        git_output(working_dir, &["rev-parse", "--short", "HEAD"])
+            .map(|commit| format!("detached:{commit}"))
+    })?;
+    let commit = git_output(working_dir, &["rev-parse", "--short", "HEAD"])?;
+    Some(GitStatus { branch, commit })
+}
+
+fn git_output(working_dir: &Path, arguments: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(working_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let input_height = input_height(&app.input, frame.area().width);
+    let completion_height = completion_height(app);
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Min(MIN_TRANSCRIPT_HEIGHT),
+            Constraint::Length(completion_height),
+            Constraint::Length(1),
             Constraint::Length(input_height),
             Constraint::Length(1),
         ])
         .split(frame.area());
 
-    render_status(frame, areas[0], app);
-    render_transcript(frame, areas[1], app);
-    render_input(frame, areas[2], app);
-    render_help(frame, areas[3], app);
+    render_transcript(frame, areas[0], app);
+    render_completion(frame, areas[1], app);
+    render_status(frame, areas[2], app);
+    render_input(frame, areas[3], app);
+    render_help(frame, areas[4], app);
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut spans = vec![
-        Span::styled(
-            " ZEX ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
         Span::styled(" model ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             single_line(&app.model, 48),
@@ -884,53 +1195,83 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  turn ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  ", Style::default()),
         Span::styled(
             app.status.label(),
             Style::default()
                 .fg(app.status.color())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  tool ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  cwd ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            single_line(&app.active_tool_summary(), 40),
-            Style::default().fg(Color::Cyan),
+            short_path(&app.working_dir, 28),
+            Style::default().fg(Color::Gray),
         ),
     ];
 
-    if app.status == Status::Error
-        && let Some(error) = app.errors.back()
-    {
+    if let Some(git) = &app.git_status {
+        spans.push(Span::styled("  git ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(
-            "  error ",
+            format!("{}@{}", single_line(&git.branch, 18), git.commit),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    spans.push(Span::styled(
+        "  think ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::styled(
+        app.thinking_level
+            .map_or_else(|| "n/a".to_owned(), |level| level.to_string()),
+        Style::default().fg(if app.thinking_level.is_some() {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        }),
+    ));
+    if app.thinking_level.is_none() {
+        spans.push(Span::styled(
+            format!("({})", app.thinking_preference),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    spans.push(Span::styled("  ctx ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!(
+            "{}%",
+            app.context_chars
+                .saturating_mul(100)
+                .checked_div(app.max_context_chars.max(1))
+                .unwrap_or(0)
+                .min(999)
+        ),
+        Style::default().fg(Color::Gray),
+    ));
+
+    if !app.active_tools.is_empty() {
+        spans.push(Span::styled(
+            "  tool ",
             Style::default().fg(Color::DarkGray),
         ));
         spans.push(Span::styled(
-            single_line(error, 80),
-            Style::default().fg(Color::Red),
+            single_line(&app.active_tool_summary(), 22),
+            Style::default().fg(Color::Cyan),
         ));
     }
 
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(24, 27, 33))),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(18, 21, 25))),
         area,
     );
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let text = transcript_text(app);
-    let block = Block::default()
-        .title(" Conversation ")
-        .title_style(
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
     let line_count = paragraph.line_count(area.width);
-    app.transcript_page_height = area.height.saturating_sub(2) as usize;
+    app.transcript_page_height = area.height as usize;
     app.max_scroll = line_count.saturating_sub(area.height as usize);
     if app.follow_output {
         app.scroll_top = app.max_scroll;
@@ -951,7 +1292,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             line_count
         );
         let width = indicator.chars().count().min(area.width as usize) as u16;
-        let x = area.right().saturating_sub(width + 1);
+        let x = area.right().saturating_sub(width);
         frame.render_widget(
             Paragraph::new(indicator).style(Style::default().fg(Color::Yellow)),
             Rect::new(x, area.y, width, 1),
@@ -959,11 +1300,64 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
+fn completion_height(app: &App) -> u16 {
+    if app.completion_open() {
+        (app.completion_matches()
+            .len()
+            .min(MAX_COMPLETION_ROWS.saturating_sub(2) as usize) as u16)
+            + 2
+    } else {
+        0
+    }
+}
+
+fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.height == 0 {
+        return;
+    }
+    let matches = app.completion_matches();
+    let lines = matches
+        .iter()
+        .take(area.height.saturating_sub(2) as usize)
+        .enumerate()
+        .map(|(index, command)| {
+            let selected = index == app.completion.selected;
+            Line::from(vec![
+                Span::styled(
+                    if selected { " › " } else { "   " },
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("{:<14}", command.name),
+                    Style::default()
+                        .fg(if selected { Color::White } else { Color::Gray })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(command.description, Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .style(Style::default().bg(Color::Rgb(24, 28, 33))),
+        area,
+    );
+}
+
 fn transcript_text(app: &App) -> Text<'static> {
     let mut lines = Vec::new();
     if app.transcript.is_empty() {
         lines.push(Line::from(Span::styled(
-            "Start a conversation. Tool calls will appear here as folded summaries.",
+            "Zex is ready. Type a task or / for commands.",
             Style::default().fg(Color::DarkGray),
         )));
         return Text::from(lines);
@@ -973,13 +1367,16 @@ fn transcript_text(app: &App) -> Text<'static> {
         match entry {
             TranscriptEntry::Message { role, content } => {
                 let (label, color) = match role {
-                    MessageRole::User => (" YOU ", Color::Blue),
-                    MessageRole::Assistant => (" ASSISTANT ", Color::Green),
+                    MessageRole::User => ("you", Color::Blue),
+                    MessageRole::Assistant => ("assistant", Color::Green),
                 };
-                lines.push(Line::from(Span::styled(
-                    label,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        label,
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
                 append_markdown_lines(&mut lines, content, *role);
                 lines.push(Line::default());
             }
@@ -1004,15 +1401,8 @@ fn transcript_text(app: &App) -> Text<'static> {
             }
             TranscriptEntry::Notice(message) => {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        " INFO ",
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(message.clone(), Style::default().fg(Color::Yellow)),
+                    Span::styled("  info · ", Style::default().fg(Color::Yellow)),
+                    Span::styled(message.clone(), Style::default().fg(Color::Gray)),
                 ]));
                 lines.push(Line::default());
             }
@@ -1096,65 +1486,110 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
 }
 
 fn append_tool_lines(lines: &mut Vec<Line<'static>>, tool: &ToolEntry, selected: bool) {
-    let marker = if selected { "▶" } else { " " };
-    let fold = if tool.expanded { "−" } else { "+" };
-    let summary = tool_summary(tool);
-    let selection_style = if selected {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
+    let marker = if selected { "›" } else { " " };
+    let fold = if tool.expanded {
+        "hide"
     } else {
-        Style::default().fg(Color::Gray)
+        "Ctrl+O expand"
+    };
+    let title = tool_title(tool);
+    let elapsed = tool_elapsed(tool);
+    let card_color = if selected {
+        Color::Cyan
+    } else {
+        Color::DarkGray
     };
     lines.push(Line::from(vec![
+        Span::styled(format!("  {marker} ┌ "), Style::default().fg(card_color)),
         Span::styled(
-            format!("{marker} {fold} TOOL "),
-            Style::default().fg(Color::Cyan),
+            title,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(tool.name.clone(), selection_style),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
         Span::styled(
             tool.status.label(),
-            Style::default().fg(tool.status.color()),
+            Style::default()
+                .fg(tool.status.color())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(summary, Style::default().fg(Color::DarkGray)),
     ]));
+
+    if !tool.expanded {
+        lines.push(Line::from(vec![
+            Span::styled("    │ ", Style::default().fg(card_color)),
+            Span::styled("Output · ", Style::default().fg(Color::DarkGray)),
+            Span::styled(tool_summary(tool), Style::default().fg(Color::Gray)),
+            Span::styled(format!("  [{fold}]"), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
 
     if tool.expanded {
         lines.push(Line::from(Span::styled(
-            "    arguments",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            "    │ Arguments",
+            Style::default().fg(Color::DarkGray),
         )));
         for line in tool.arguments.split('\n') {
             lines.push(Line::from(Span::styled(
-                format!("      {line}"),
+                format!("    │   {line}"),
                 Style::default().fg(Color::Gray),
             )));
         }
         lines.push(Line::from(Span::styled(
-            "    result",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            "    │ Output",
+            Style::default().fg(Color::DarkGray),
         )));
         if tool.output.is_empty() {
             lines.push(Line::from(Span::styled(
-                "      waiting for result…",
+                "    │   waiting for result…",
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
             for line in tool.output.split('\n') {
                 lines.push(Line::from(Span::styled(
-                    format!("      {line}"),
+                    format!("    │   {line}"),
                     Style::default().fg(Color::Gray),
                 )));
             }
         }
     }
+    lines.push(Line::from(vec![
+        Span::styled("    └ ", Style::default().fg(card_color)),
+        Span::styled(
+            format!(
+                "Wall {} · Timeout {}",
+                format_duration(elapsed),
+                format_duration(tool.timeout)
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
     lines.push(Line::default());
+}
+
+fn tool_title(tool: &ToolEntry) -> String {
+    if tool.name == "bash"
+        && let Ok(arguments) = serde_json::from_str::<Value>(&tool.arguments)
+        && let Some(command) = arguments.get("command").and_then(Value::as_str)
+    {
+        return format!("$ {}", single_line(command, 100));
+    }
+    tool.name.clone()
+}
+
+fn tool_elapsed(tool: &ToolEntry) -> Duration {
+    tool.elapsed
+        .or_else(|| tool.started_at.map(|started| started.elapsed()))
+        .unwrap_or(Duration::ZERO)
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() > 0 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
 }
 
 fn tool_summary(tool: &ToolEntry) -> String {
@@ -1180,30 +1615,19 @@ fn tool_summary(tool: &ToolEntry) -> String {
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let title = if app.busy {
-        " Prompt · locked during turn "
-    } else {
-        " Prompt "
-    };
     let block = Block::default()
-        .title(title)
-        .title_style(Style::default().fg(if app.busy {
-            Color::DarkGray
-        } else {
-            Color::Cyan
-        }))
-        .borders(Borders::ALL)
+        .borders(Borders::TOP)
         .border_style(Style::default().fg(if app.busy {
             Color::DarkGray
         } else {
-            Color::Gray
+            Color::Cyan
         }));
     let inner_width = area.width.saturating_sub(2).max(1) as usize;
-    let visible_rows = area.height.saturating_sub(2).max(1) as usize;
+    let visible_rows = area.height.saturating_sub(1).max(1) as usize;
 
     if app.busy {
         frame.render_widget(
-            Paragraph::new("Turn in progress — Ctrl+C interrupts it.")
+            Paragraph::new("› Turn in progress — Ctrl+C interrupts it.")
                 .block(block)
                 .style(Style::default().fg(Color::DarkGray)),
             area,
@@ -1214,12 +1638,15 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let metrics = input_metrics(&app.input.content, app.input.cursor, inner_width);
     let vertical_scroll = metrics.cursor_row.saturating_sub(visible_rows - 1);
     let content = if app.input.is_empty() {
-        Text::from(Line::from(Span::styled(
-            "Type a message or /help…",
-            Style::default().fg(Color::DarkGray),
-        )))
+        Text::from(Line::from(vec![
+            Span::styled("› ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "Type a message or / for commands…",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
     } else {
-        Text::from(app.input.content.clone())
+        Text::from(format!("› {}", app.input.content))
     };
     frame.render_widget(
         Paragraph::new(content)
@@ -1231,22 +1658,26 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let cursor_y = metrics.cursor_row.saturating_sub(vertical_scroll) as u16;
     frame.set_cursor_position((
-        area.x + 1 + metrics.cursor_column.min(inner_width - 1) as u16,
-        area.y + 1 + cursor_y.min(area.height.saturating_sub(3)),
+        area.x
+            + if metrics.cursor_row == 0 { 2 } else { 0 }
+            + metrics.cursor_column.min(inner_width - 1) as u16,
+        area.y + 1 + cursor_y.min(area.height.saturating_sub(2)),
     ));
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let help = if app.busy {
+    let help = if app.completion_open() {
+        " ↑/↓ choose · Tab complete · Enter complete/run · Esc close "
+    } else if app.busy {
         if area.width >= 92 {
-            " Ctrl+C interrupt  ·  PgUp/PgDn scroll  ·  Home/End history  ·  Tab select tool  ·  e expand  ·  Esc close "
+            " Ctrl+C interrupt  ·  PgUp/PgDn scroll  ·  Tab tool  ·  Ctrl+O expand  ·  Esc close "
         } else {
-            " Ctrl+C interrupt · PgUp/PgDn scroll · Tab tool · e expand "
+            " Ctrl+C interrupt · PgUp/PgDn scroll · Ctrl+O expand "
         }
     } else if area.width >= 110 {
-        " Enter send  ·  Shift/Alt+Enter newline  ·  Ctrl+C exit  ·  PgUp/PgDn scroll  ·  Home/End history  ·  Tab tool  ·  e expand "
+        " Enter send · Shift/Alt+Enter newline · Ctrl+T think · Ctrl+O tool · PgUp/PgDn scroll · Ctrl+C exit "
     } else {
-        " Enter send · Shift/Alt+Enter newline · Ctrl+C exit · PgUp/PgDn scroll · Tab tool "
+        " Enter send · Ctrl+T think · Ctrl+O tool · PgUp/PgDn scroll "
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
@@ -1301,7 +1732,7 @@ fn input_height(input: &InputBuffer, terminal_width: u16) -> u16 {
     let rows = input_metrics(&input.content, input.cursor, inner_width)
         .total_rows
         .min(MAX_INPUT_ROWS as usize) as u16;
-    rows + 2
+    rows + 1
 }
 
 fn format_json(value: &str) -> String {
@@ -1323,6 +1754,23 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 fn single_line(value: &str, max_chars: usize) -> String {
     truncate_chars(&value.replace(['\r', '\n'], " "), max_chars).replace("\n… truncated", " …")
+}
+
+fn short_path(path: &Path, max_chars: usize) -> String {
+    let display = path.display().to_string();
+    if display.chars().count() <= max_chars {
+        return display;
+    }
+    let keep = max_chars.saturating_sub(2);
+    let tail = display
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("…{tail}")
 }
 
 struct TerminalSession {
@@ -1393,17 +1841,31 @@ impl Drop for TerminalSession {
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, time::Duration};
+
     use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
-        App, InputAction, InputBuffer, Status, ToolStatus, TranscriptEntry, handle_key_event,
-        input_metrics, render, truncate_chars,
+        App, AppContext, InputAction, InputBuffer, KeyBurst, Status, ToolStatus, TranscriptEntry,
+        handle_key_event, handle_terminal_event, input_metrics, render, truncate_chars,
     };
     use crate::agent::{AgentEvent, MessageRole};
+    use crate::provider::ThinkingLevel;
 
     fn app() -> App {
-        App::new(&[], "test-model".to_owned())
+        App::new(
+            &[],
+            "test-model".to_owned(),
+            AppContext {
+                working_dir: PathBuf::from("."),
+                thinking_level: None,
+                thinking_preference: ThinkingLevel::Medium,
+                context_chars: 0,
+                max_context_chars: 120_000,
+                default_tool_timeout: Duration::from_secs(60),
+            },
+        )
     }
 
     fn key(code: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers) -> KeyEvent {
@@ -1431,12 +1893,14 @@ mod tests {
             call_id: "call-1".to_owned(),
             name: "read".to_owned(),
             arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+            timeout: Duration::from_secs(60),
         });
         app.apply_agent_event(AgentEvent::ToolEnd {
             call_id: "call-1".to_owned(),
             name: "read".to_owned(),
             output: "Cargo.toml".to_owned(),
             is_error: false,
+            elapsed: Duration::from_millis(12),
         });
         app.apply_agent_event(AgentEvent::TurnEnd);
 
@@ -1466,6 +1930,7 @@ mod tests {
             call_id: "call-1".to_owned(),
             name: "bash".to_owned(),
             arguments: r#"{"command":"sleep 30"}"#.to_owned(),
+            timeout: Duration::from_secs(60),
         });
 
         app.apply_agent_event(AgentEvent::TurnCancelled);
@@ -1508,12 +1973,14 @@ mod tests {
             call_id: "call-1".to_owned(),
             name: "read".to_owned(),
             arguments: r#"{"path":"missing"}"#.to_owned(),
+            timeout: Duration::from_secs(60),
         });
         app.apply_agent_event(AgentEvent::ToolEnd {
             call_id: "call-1".to_owned(),
             name: "read".to_owned(),
             output: "tool error: file not found".to_owned(),
             is_error: true,
+            elapsed: Duration::from_millis(8),
         });
 
         assert_eq!(
@@ -1565,6 +2032,7 @@ mod tests {
                 ),
                 &mut app,
                 false,
+                false,
             ),
             InputAction::None
         );
@@ -1577,6 +2045,7 @@ mod tests {
                 ),
                 &mut app,
                 true,
+                false,
             ),
             InputAction::Interrupt
         );
@@ -1587,6 +2056,7 @@ mod tests {
                     crossterm::event::KeyModifiers::CONTROL,
                 ),
                 &mut app,
+                false,
                 false,
             ),
             InputAction::Quit
@@ -1599,8 +2069,83 @@ mod tests {
                 ),
                 &mut app,
                 false,
+                false,
             ),
             InputAction::Submit("hello".to_owned())
+        );
+    }
+
+    #[test]
+    fn unbracketed_multiline_paste_keeps_newlines_without_submitting_first_line() {
+        let mut app = app();
+        let mut burst = KeyBurst::default();
+        let started = std::time::Instant::now();
+        let events = [
+            crossterm::event::KeyCode::Char('f'),
+            crossterm::event::KeyCode::Char('i'),
+            crossterm::event::KeyCode::Char('r'),
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyCode::Char('t'),
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyCode::Char('e'),
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyCode::Char('n'),
+            crossterm::event::KeyCode::Char('d'),
+        ];
+
+        for (index, code) in events.into_iter().enumerate() {
+            let action = handle_terminal_event(
+                crossterm::event::Event::Key(key(code, crossterm::event::KeyModifiers::NONE)),
+                &mut app,
+                false,
+                &mut burst,
+                started + Duration::from_millis(index as u64),
+            );
+            assert_eq!(action, InputAction::None);
+        }
+
+        assert_eq!(app.input.content, "first\nsecond");
+    }
+
+    #[test]
+    fn deliberate_enter_after_paste_burst_submits_all_lines() {
+        let mut app = app();
+        let mut burst = KeyBurst::default();
+        let started = std::time::Instant::now();
+        for (index, code) in [
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyCode::Char('b'),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                handle_terminal_event(
+                    crossterm::event::Event::Key(key(code, crossterm::event::KeyModifiers::NONE,)),
+                    &mut app,
+                    false,
+                    &mut burst,
+                    started + Duration::from_millis(index as u64),
+                ),
+                InputAction::None
+            );
+        }
+
+        assert_eq!(
+            handle_terminal_event(
+                crossterm::event::Event::Key(key(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                &mut app,
+                false,
+                &mut burst,
+                started + Duration::from_millis(100),
+            ),
+            InputAction::Submit("a\nb".to_owned())
         );
     }
 
@@ -1611,6 +2156,7 @@ mod tests {
             call_id: "call-1".to_owned(),
             name: "read".to_owned(),
             arguments: "{}".to_owned(),
+            timeout: Duration::from_secs(60),
         });
         app.select_tool(false);
         app.toggle_selected_tool();
@@ -1628,13 +2174,133 @@ mod tests {
     }
 
     #[test]
+    fn slash_completion_filters_selects_and_accepts_session_command() {
+        let mut app = app();
+        app.input.insert_str("/se");
+        app.refresh_completion();
+
+        let matches = app.completion_matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "/sessions");
+        assert_eq!(
+            handle_key_event(
+                key(
+                    crossterm::event::KeyCode::Tab,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                &mut app,
+                false,
+                false,
+            ),
+            InputAction::None
+        );
+        assert_eq!(app.input.content, "/sessions");
+        assert!(!app.completion_open());
+    }
+
+    #[test]
+    fn think_shortcut_submits_shared_slash_command() {
+        let mut app = app();
+
+        assert_eq!(
+            handle_key_event(
+                key(
+                    crossterm::event::KeyCode::Char('t'),
+                    crossterm::event::KeyModifiers::CONTROL,
+                ),
+                &mut app,
+                false,
+                false,
+            ),
+            InputAction::Submit("/think".to_owned())
+        );
+    }
+
+    #[test]
+    fn ctrl_o_expands_selected_tool() {
+        let mut app = app();
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"git status"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Char('o'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            &mut app,
+            false,
+            false,
+        );
+
+        let TranscriptEntry::Tool(tool) = &app.transcript[0] else {
+            panic!("expected tool entry");
+        };
+        assert!(tool.expanded);
+    }
+
+    #[test]
+    fn renders_multiple_shell_cards_and_completion_above_status_input() {
+        let mut app = app();
+        app.thinking_level = Some(ThinkingLevel::High);
+        for (index, command) in ["git status", "git rev-parse --short HEAD"]
+            .into_iter()
+            .enumerate()
+        {
+            let call_id = format!("call-{index}");
+            app.apply_agent_event(AgentEvent::ToolStart {
+                call_id: call_id.clone(),
+                name: "bash".to_owned(),
+                arguments: format!(r#"{{"command":"{command}"}}"#),
+                timeout: Duration::from_secs(30),
+            });
+            app.apply_agent_event(AgentEvent::ToolEnd {
+                call_id,
+                name: "bash".to_owned(),
+                output: "ok".to_owned(),
+                is_error: false,
+                elapsed: Duration::from_millis(20 + index as u64),
+            });
+        }
+        app.input.insert_str("/se");
+        app.refresh_completion();
+        let backend = TestBackend::new(120, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+
+        assert!(screen.contains("$ git status"));
+        assert!(screen.contains("$ git rev-parse --short HEAD"));
+        assert!(screen.contains("Wall 20ms · Timeout 30.0s"));
+        assert!(screen.contains("/sessions"));
+        assert!(screen.contains("List saved sessions"));
+        assert!(screen.contains("think high"));
+        assert!(screen.contains("› /se"));
+    }
+
+    #[test]
     fn long_tool_details_are_truncated() {
         assert_eq!(truncate_chars("abcdef", 4), "abcd\n… truncated");
     }
 
     #[test]
     fn slash_command_notices_render_readably_without_user_messages() {
-        let mut app = App::new(&[], "gpt-test".to_owned());
+        let mut app = App::new(
+            &[],
+            "gpt-test".to_owned(),
+            AppContext {
+                working_dir: PathBuf::from("."),
+                thinking_level: None,
+                thinking_preference: ThinkingLevel::Medium,
+                context_chars: 0,
+                max_context_chars: 120_000,
+                default_tool_timeout: Duration::from_secs(60),
+            },
+        );
         app.transcript.push(TranscriptEntry::Notice(
             "/help\n/model\n/clear\n/sessions\n/resume [id]\n/compact".to_owned(),
         ));
@@ -1644,15 +2310,26 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
 
-        assert!(screen.contains("INFO"));
+        assert!(screen.contains("info ·"));
         assert!(screen.contains("/help"));
         assert!(screen.contains("/compact"));
-        assert!(!screen.contains("YOU"));
+        assert!(!screen.contains("you"));
     }
 
     #[test]
     fn renders_status_conversation_folded_tool_input_and_help_regions() {
-        let mut app = App::new(&[], "gpt-test".to_owned());
+        let mut app = App::new(
+            &[],
+            "gpt-test".to_owned(),
+            AppContext {
+                working_dir: PathBuf::from("."),
+                thinking_level: None,
+                thinking_preference: ThinkingLevel::Medium,
+                context_chars: 0,
+                max_context_chars: 120_000,
+                default_tool_timeout: Duration::from_secs(60),
+            },
+        );
         app.apply_agent_event(AgentEvent::MessageDelta {
             role: MessageRole::User,
             delta: "Inspect the project".to_owned(),
@@ -1665,12 +2342,14 @@ mod tests {
             call_id: "call-1".to_owned(),
             name: "read".to_owned(),
             arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+            timeout: Duration::from_secs(60),
         });
         app.apply_agent_event(AgentEvent::ToolEnd {
             call_id: "call-1".to_owned(),
             name: "read".to_owned(),
             output: "package zex".to_owned(),
             is_error: false,
+            elapsed: Duration::from_millis(14),
         });
         app.input.insert_str("next prompt");
         let backend = TestBackend::new(120, 28);
@@ -1679,12 +2358,13 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
 
-        assert!(screen.contains("ZEX"));
         assert!(screen.contains("gpt-test"));
-        assert!(screen.contains("Conversation"));
-        assert!(screen.contains("YOU"));
-        assert!(screen.contains("ASSISTANT"));
-        assert!(screen.contains("+ TOOL read"));
+        assert!(screen.contains("you"));
+        assert!(screen.contains("assistant"));
+        assert!(screen.contains("read"));
+        assert!(screen.contains("done"));
+        assert!(screen.contains("Ctrl+O expand"));
+        assert!(screen.contains("Wall 14ms · Timeout 60.0s"));
         assert!(!screen.contains("\"path\": \"Cargo.toml\""));
         assert!(screen.contains("next prompt"));
         assert!(screen.contains("Enter send"));

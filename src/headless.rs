@@ -1,4 +1,7 @@
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    path::Path,
+};
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
@@ -15,13 +18,14 @@ pub async fn run_prompt<P>(
     prompt: String,
     session_store: &SessionStore,
     session_id: &mut Option<String>,
+    working_dir: &Path,
 ) -> Result<()>
 where
     P: Provider,
 {
     match parse(&prompt)? {
         Some(command) => {
-            let result = execute(command, agent, session_store, session_id).await?;
+            let result = execute(command, agent, session_store, session_id, working_dir).await?;
             if result.effect == CommandEffect::ReplaceView {
                 println!("[context] {} chars", agent.context_chars());
             }
@@ -36,6 +40,7 @@ pub async fn run_repl<P>(
     agent: &mut Agent<P>,
     session_store: &SessionStore,
     session_id: &mut Option<String>,
+    working_dir: &Path,
 ) -> Result<()>
 where
     P: Provider,
@@ -63,15 +68,17 @@ where
         }
 
         match parse(input) {
-            Ok(Some(command)) => match execute(command, agent, session_store, session_id).await {
-                Ok(result) => {
-                    if result.effect == CommandEffect::ReplaceView {
-                        println!("[context] {} chars", agent.context_chars());
+            Ok(Some(command)) => {
+                match execute(command, agent, session_store, session_id, working_dir).await {
+                    Ok(result) => {
+                        if result.effect == CommandEffect::ReplaceView {
+                            println!("[context] {} chars", agent.context_chars());
+                        }
+                        println!("{}", result.message);
                     }
-                    println!("{}", result.message);
+                    Err(error) => eprintln!("Zex command error: {error:#}"),
                 }
-                Err(error) => eprintln!("Zex command error: {error:#}"),
-            },
+            }
             Ok(None) => {
                 if agent.prompt(input).await.is_err() {
                     continue;

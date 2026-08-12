@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::{
     agent::{AgentEvent, AssistantMessage, EventSender, Message, MessageRole, ToolCall},
-    provider::{OpenAiApi, Provider, ToolDefinition},
+    provider::{OpenAiApi, Provider, ThinkingLevel, ToolDefinition},
 };
 
 #[derive(Debug, Clone)]
@@ -42,13 +42,21 @@ impl OpenAiProvider {
     async fn send_request(
         &self,
         model: &str,
+        thinking_level: Option<ThinkingLevel>,
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<reqwest::Response> {
         let request = self.client.post(&self.endpoint).bearer_auth(&self.api_key);
         let response = match self.api {
-            OpenAiApi::ChatCompletions => request.json(&ChatRequest::new(model, messages, tools)),
-            OpenAiApi::Responses => request.json(&ResponsesRequest::new(model, messages, tools)),
+            OpenAiApi::ChatCompletions => {
+                request.json(&ChatRequest::new(model, thinking_level, messages, tools))
+            }
+            OpenAiApi::Responses => request.json(&ResponsesRequest::new(
+                model,
+                thinking_level,
+                messages,
+                tools,
+            )),
         }
         .send()
         .await
@@ -68,14 +76,21 @@ impl OpenAiProvider {
 }
 
 impl Provider for OpenAiProvider {
+    fn supports_thinking(&self, model: &str) -> bool {
+        model_supports_thinking(model)
+    }
+
     async fn complete(
         &self,
         model: &str,
+        thinking_level: Option<ThinkingLevel>,
         messages: &[Message],
         tools: &[ToolDefinition],
         events: &EventSender,
     ) -> Result<AssistantMessage> {
-        let response = self.send_request(model, messages, tools).await?;
+        let response = self
+            .send_request(model, thinking_level, messages, tools)
+            .await?;
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -95,6 +110,8 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<WireMessage<'a>>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,11 +119,17 @@ struct ChatRequest<'a> {
 }
 
 impl<'a> ChatRequest<'a> {
-    fn new(model: &'a str, messages: &'a [Message], tools: &'a [ToolDefinition]) -> Self {
+    fn new(
+        model: &'a str,
+        thinking_level: Option<ThinkingLevel>,
+        messages: &'a [Message],
+        tools: &'a [ToolDefinition],
+    ) -> Self {
         Self {
             model,
             messages: messages.iter().map(WireMessage::from).collect(),
             stream: true,
+            reasoning_effort: thinking_level.and_then(ThinkingLevel::as_provider_value),
             tools: tools.iter().map(WireTool::from).collect(),
             tool_choice: (!tools.is_empty()).then_some("auto"),
         }
@@ -208,6 +231,8 @@ struct ResponsesRequest<'a> {
     input: Vec<ResponsesInputItem<'a>>,
     stream: bool,
     store: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ResponsesReasoning>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ResponsesTool<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -215,7 +240,12 @@ struct ResponsesRequest<'a> {
 }
 
 impl<'a> ResponsesRequest<'a> {
-    fn new(model: &'a str, messages: &'a [Message], tools: &'a [ToolDefinition]) -> Self {
+    fn new(
+        model: &'a str,
+        thinking_level: Option<ThinkingLevel>,
+        messages: &'a [Message],
+        tools: &'a [ToolDefinition],
+    ) -> Self {
         Self {
             model,
             input: messages
@@ -224,10 +254,18 @@ impl<'a> ResponsesRequest<'a> {
                 .collect(),
             stream: true,
             store: false,
+            reasoning: thinking_level
+                .and_then(ThinkingLevel::as_provider_value)
+                .map(|effort| ResponsesReasoning { effort }),
             tools: tools.iter().map(ResponsesTool::from).collect(),
             tool_choice: (!tools.is_empty()).then_some("auto"),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesReasoning {
+    effort: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -348,6 +386,15 @@ impl<'a> From<&'a ToolDefinition> for ResponsesTool<'a> {
             parameters: &tool.parameters,
         }
     }
+}
+
+fn model_supports_thinking(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.contains("reasoning")
 }
 
 #[derive(Debug, Serialize)]
@@ -771,7 +818,7 @@ mod tests {
 
     use crate::{
         agent::{AgentEvent, Message, MessageRole, ToolCall},
-        provider::{OpenAiApi, ToolDefinition},
+        provider::{OpenAiApi, ThinkingLevel, ToolDefinition},
     };
 
     use super::{
@@ -923,7 +970,8 @@ mod tests {
         }];
 
         let request =
-            serde_json::to_value(ResponsesRequest::new("test-model", &messages, &tools)).unwrap();
+            serde_json::to_value(ResponsesRequest::new("test-model", None, &messages, &tools))
+                .unwrap();
         assert_eq!(request["stream"], true);
         assert_eq!(request["store"], false);
         assert_eq!(request["tools"][0]["type"], "function");
@@ -933,6 +981,30 @@ mod tests {
         assert_eq!(request["input"][1]["call_id"], "call_read");
         assert_eq!(request["input"][2]["type"], "function_call_output");
         assert_eq!(request["input"][2]["call_id"], "call_read");
+    }
+
+    #[test]
+    fn serializes_supported_thinking_levels() {
+        let messages = vec![Message::User {
+            content: "think".to_owned(),
+        }];
+        let responses = serde_json::to_value(ResponsesRequest::new(
+            "gpt-5",
+            Some(ThinkingLevel::High),
+            &messages,
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(responses["reasoning"]["effort"], "high");
+
+        let chat = serde_json::to_value(super::ChatRequest::new(
+            "gpt-5",
+            Some(ThinkingLevel::Low),
+            &messages,
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(chat["reasoning_effort"], "low");
     }
 
     #[test]

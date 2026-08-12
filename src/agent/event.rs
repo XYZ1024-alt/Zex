@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tokio::sync::mpsc;
 
 use crate::agent::CompactStats;
@@ -18,12 +20,14 @@ pub enum AgentEvent {
         call_id: String,
         name: String,
         arguments: String,
+        timeout: Duration,
     },
     ToolEnd {
         call_id: String,
         name: String,
         output: String,
         is_error: bool,
+        elapsed: Duration,
     },
     Error {
         message: String,
