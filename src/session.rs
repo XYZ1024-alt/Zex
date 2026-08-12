@@ -18,7 +18,6 @@ pub struct SessionStore {
 #[derive(Debug, Clone)]
 pub struct LoadedSession {
     pub id: String,
-    pub model: Option<String>,
     pub messages: Vec<Message>,
 }
 
@@ -122,7 +121,6 @@ impl SessionStore {
         match read_session(&path).await {
             Ok((header, messages)) => Ok(Some(LoadedSession {
                 id: header.id,
-                model: header.model,
                 messages,
             })),
             Err(error)
@@ -367,7 +365,6 @@ mod tests {
         let id = store.save(None, "model-a", &first).await.unwrap();
         let resumed = store.load(Some(&id)).await.unwrap().unwrap();
         assert_eq!(resumed.id, id);
-        assert_eq!(resumed.model.as_deref(), Some("model-a"));
         assert_eq!(resumed.messages, first);
 
         store.save(Some(&id), "model-b", &second).await.unwrap();
@@ -424,7 +421,6 @@ mod tests {
 
         let loaded = store.load(Some(id)).await.unwrap().unwrap();
 
-        assert!(loaded.model.is_none());
         assert!(matches!(
             &loaded.messages[0],
             Message::User { content } if content == "legacy"

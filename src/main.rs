@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command};
 use config::Config;
-use provider::OpenAiProvider;
+use provider::ProviderRegistry;
 use session::{SessionStore, format_session_summaries};
 use tokio::sync::mpsc;
 use tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, ToolRegistry, WriteTool};
@@ -41,16 +41,12 @@ async fn main() -> Result<()> {
     };
     let config = Config::load().await?;
     let mut session_id = loaded_session.as_ref().map(|session| session.id.clone());
-    let session_model = loaded_session
-        .as_ref()
-        .and_then(|session| session.model.clone());
     let resumed_messages = loaded_session.map(|session| session.messages);
     let Config {
-        api_key,
-        base_url,
-        model,
-        openai_api,
+        providers,
+        active_model,
         working_dir,
+        configured,
         tool_timeout,
         agent_timeout,
         max_turns,
@@ -60,8 +56,12 @@ async fn main() -> Result<()> {
         thinking_level,
         show_thinking,
     } = config;
-    let model = session_model.unwrap_or(model);
-    let provider = OpenAiProvider::new(&base_url, api_key, openai_api, agent_timeout)?;
+    if !configured && !tui::is_available() {
+        anyhow::bail!("no Provider configured; start Zex in a TTY and use /provider");
+    }
+    let model = active_model.map_or_else(String::new, |active_model| active_model.key());
+    let provider = ProviderRegistry::new(&providers, agent_timeout)?;
+    let provider_registry = provider.clone();
     let (events, event_receiver) = mpsc::unbounded_channel();
     let mut tools = ToolRegistry::new(tool_timeout, max_tool_output_chars);
     tools.register(ReadTool::new(working_dir.clone()));
@@ -105,8 +105,12 @@ async fn main() -> Result<()> {
                 event_receiver,
                 &session_store,
                 &mut session_id,
-                &working_dir,
-                show_thinking,
+                tui::TuiContext {
+                    working_dir: &working_dir,
+                    show_thinking,
+                    providers,
+                    provider_registry,
+                },
             )
             .await,
             None,

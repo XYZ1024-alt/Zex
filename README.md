@@ -30,15 +30,13 @@ Zex 按以下顺序合并配置，后者覆盖前者：
 
 可用 `ZEX_CONFIG_DIR` 覆盖整个全局目录，便于便携安装和隔离测试。
 
-会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建/更新时间和当前 model；后续每行是一条 Agent 消息。会话不保存 API Key、base URL 或其他敏感运行配置。旧的 format 1 会话若没有 model 字段，恢复时继续使用当前配置的 model。
+会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建/更新时间和保存时的 model；后续每行是一条 Agent 消息。会话不保存 API Key、base URL 或其他敏感运行配置。恢复会话只恢复消息，不改变当前通过 `/model` 选择的模型。
 
 项目配置示例：
 
 ```toml
 # .zex/config.toml
-model = "gpt-4.1-mini"
-base_url = "https://api.openai.com/v1"
-openai_api = "responses"
+active_model = { provider_id = "openai", model_id = "gpt-4.1-mini" }
 max_turns = 12
 tool_timeout_seconds = 60
 agent_timeout_seconds = 600
@@ -47,16 +45,26 @@ max_context_chars = 120000
 compact_keep_turns = 6
 thinking_level = "medium"
 show_thinking = true
+
+[[providers]]
+id = "openai"
+display_name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+api_key = "your-api-key"
+openai_api = "responses"
+
+[[providers.models]]
+id = "gpt-4.1-mini"
+display_name = "GPT-4.1 Mini"
+supports_thinking = false
 ```
 
 支持的 TOML 字段：
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `api_key` | 无 | API Key；允许配置，但推荐只用环境变量 |
-| `model` | 无 | 必填模型名 |
-| `base_url` | `https://api.openai.com/v1` | OpenAI 兼容 API 根地址 |
-| `openai_api` | `chat-completions` | `chat-completions` 或 `responses` |
+| `active_model` | 无 | 当前模型的 `{ provider_id, model_id }` 引用；由 `/model` 写入 |
+| `providers` | `[]` | Provider 及其模型目录；由 `/provider` 管理 |
 | `max_turns` | `12` | 单轮最大 Provider 调用次数 |
 | `tool_timeout_seconds` | `60` | 所有内置工具的默认单次超时；每次调用可用 `timeout_seconds` 覆盖 |
 | `agent_timeout_seconds` | `600` | 单轮 Agent 总超时 |
@@ -67,7 +75,7 @@ show_thinking = true
 | `show_thinking` | `true` | 是否在 TUI 时间流中显示默认折叠的思考卡片；隐藏不删除会话数据，也不影响模型实际思考 |
 | `session_dir` | 全局 `sessions` 目录 | 自定义会话目录；相对路径基于项目工作目录 |
 
-环境变量优先级高于两个 TOML 文件。API Key 使用 `ZEX_API_KEY`，未设置或为空时再读 `OPENAI_API_KEY`；因此可把非敏感配置提交到项目配置，同时保证密钥不进入仓库。
+旧的顶层 `api_key`、`model`、`base_url`、`openai_api` 仍会在没有 `providers` 时作为单个 `default` Provider 载入；首次从 `/provider` 保存后会写入新结构并移除这些顶层字段。对应环境变量仅参与这个旧配置迁移路径。
 
 | 变量 | 备用变量 | 对应字段 |
 | --- | --- | --- |
@@ -181,11 +189,11 @@ TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册�
 | 命令 | 行为 |
 | --- | --- |
 | `/help` | 打开有限高度的命令面板；Esc 关闭，不写入对话时间流 |
-| `/model` | 显示当前会话正在使用的 model |
-| `/model <name>` | 立即切换后续 Provider 请求使用的 model；保存会话时一并记录 |
+| `/model` | 用主区轻量列表选择已配置模型；Enter 立即切换并持久化，Esc/q 取消 |
+| `/provider` | 打开双栏 Provider 配置页，管理 Provider、端点、密钥及模型列表 |
 | `/clear` | 清空当前 TUI/REPL 上下文；TUI 同时清空对话视图。不删除磁盘会话，下一条普通消息创建新会话 |
 | `/sessions` | 查看保存的会话；复用 `SessionStore::list` 列出 ID、更新时间、消息数和预览 |
-| `/resume [id]` | 无参数时打开历史会话选择列表；有参数时直接恢复指定会话。恢复消息及该会话保存的 model |
+| `/resume [id]` | 无参数时打开历史会话选择列表；有参数时直接恢复指定会话。只恢复消息，不改变当前模型 |
 | `/compact` | 立即压缩旧上下文，显示压缩前后字符数、约释放字符数、保留轮次和摘要数量 |
 | `/think [off\|low\|medium\|high]` | 无参数时循环切换；有参数时直接设置。写入项目 `.zex/config.toml`；模型不支持时显示 `n/a` 并保留偏好 |
 | `/thinking [show\|hide]` | 无参数时显示当前思考卡片可见性；有参数时独立设置并写入项目 `.zex/config.toml` |
@@ -372,7 +380,7 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 
 10. 验证内置搜索：在 TUI 或非 TTY REPL 中要求模型“必须用 `grep` 搜索 `Cargo.toml` 中的 `name`，再用 `glob` 查找 `src/**/*.rs`”。预期出现两个内置 tool 事件，不调用 `rg`/`fd`，并且 `.gitignore` 中排除的路径不出现在结果里。
 
-11. 验证斜杠命令：在 TUI 中依次输入 `/help`、`/model`、`/model <另一个可用模型>`、`/sessions`。预期 `/help` 与 `/sessions` 进入 feed；model 查询和切换只显示短暂 toast，不出现用户消息；状态栏 model 在切换后更新。输入 `/resume` 后出现按最近更新排序的历史会话选择列表，Up/Down 选择、Enter 恢复、Esc 取消；输入 `/resume <id>` 后直接恢复指定会话并替换视图。输入 `/clear` 后对话区清空，仅在底部显示短暂反馈，磁盘会话文件仍存在。
+11. 验证配置命令：输入 `/provider`，新增或编辑 Provider 和模型后按 `Ctrl-S` 保存；退出后输入 `/model`，用 Up/Down 或 j/k 选择另一个模型并按 Enter。预期配置页与模型页都替换主区、不写入对话 feed；状态栏立即更新，项目 `.zex/config.toml` 持久化 `providers` 与 `active_model`。输入 `/resume` 恢复历史会话后，当前模型保持不变。
 
 12. 验证 `/compact` 前后上下文变化：
 

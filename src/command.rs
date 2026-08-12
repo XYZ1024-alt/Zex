@@ -27,9 +27,15 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/model",
-        usage: "/model [name]",
-        description: "Show or switch the active model",
-        accepts_arguments: true,
+        usage: "/model",
+        description: "Choose the active configured model",
+        accepts_arguments: false,
+    },
+    CommandSpec {
+        name: "/provider",
+        usage: "/provider",
+        description: "Configure Providers and their models",
+        accepts_arguments: false,
     },
     CommandSpec {
         name: "/clear",
@@ -82,7 +88,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
-    Model(Option<String>),
+    Model,
+    Provider,
     NewSession,
     Sessions,
     Resume(Option<String>),
@@ -122,7 +129,8 @@ pub fn parse(input: &str) -> Result<Option<SlashCommand>> {
     let arguments = parts.collect::<Vec<_>>();
     let command = match name {
         "/help" if arguments.is_empty() => SlashCommand::Help,
-        "/model" => SlashCommand::Model((!arguments.is_empty()).then(|| arguments.join(" "))),
+        "/model" if arguments.is_empty() => SlashCommand::Model,
+        "/provider" if arguments.is_empty() => SlashCommand::Provider,
         "/clear" | "/new" if arguments.is_empty() => SlashCommand::NewSession,
         "/sessions" if arguments.is_empty() => SlashCommand::Sessions,
         "/resume" if arguments.len() <= 1 => {
@@ -142,7 +150,7 @@ pub fn parse(input: &str) -> Result<Option<SlashCommand>> {
                 })
                 .transpose()?,
         ),
-        "/help" | "/clear" | "/new" | "/sessions" | "/compact" => {
+        "/help" | "/model" | "/provider" | "/clear" | "/new" | "/sessions" | "/compact" => {
             bail!("{name} does not accept arguments")
         }
         "/resume" => bail!("/resume accepts at most one session ID"),
@@ -168,20 +176,8 @@ where
             output: CommandOutput::Help,
             effect: CommandEffect::None,
         }),
-        SlashCommand::Model(None) => Ok(CommandResult {
-            output: CommandOutput::Status(format!("Model · {}", agent.model())),
-            effect: CommandEffect::None,
-        }),
-        SlashCommand::Model(Some(model)) => {
-            let model = model.trim();
-            if model.is_empty() {
-                bail!("model name must not be empty");
-            }
-            agent.set_model(model.to_owned());
-            Ok(CommandResult {
-                output: CommandOutput::Status(format!("Model · {model}")),
-                effect: CommandEffect::None,
-            })
+        SlashCommand::Model | SlashCommand::Provider => {
+            unreachable!("configuration pages are handled by the TUI")
         }
         SlashCommand::NewSession => {
             let saved_id = if agent.has_conversation() {
@@ -224,9 +220,6 @@ where
                     format!("Session {requested_id:?} not found. Use /resume to choose a session.")
                 })?;
             let resumed_id = loaded.id;
-            if let Some(model) = loaded.model {
-                agent.set_model(model);
-            }
             agent.replace_messages(loaded.messages);
             *session_id = Some(resumed_id.clone());
             Ok(CommandResult {
@@ -382,7 +375,7 @@ mod execution_tests {
     }
 
     #[tokio::test]
-    async fn model_and_resume_update_agent_session_state_and_visible_timeline() {
+    async fn resume_updates_session_state_without_changing_the_active_model() {
         let directory = temporary_directory();
         let store = SessionStore::new(directory.clone());
         let resumed_id = store
@@ -398,17 +391,6 @@ mod execution_tests {
         let mut agent = agent(Vec::new());
         let mut session_id = None;
 
-        execute(
-            SlashCommand::Model(Some("model-b".to_owned())),
-            &mut agent,
-            &store,
-            &mut session_id,
-            &directory,
-        )
-        .await
-        .unwrap();
-        assert_eq!(agent.model(), "model-b");
-
         let result = execute(
             SlashCommand::Resume(Some(resumed_id.clone())),
             &mut agent,
@@ -420,7 +402,7 @@ mod execution_tests {
         .unwrap();
         assert_eq!(result.effect, CommandEffect::ReplaceView);
         assert_eq!(session_id.as_deref(), Some(resumed_id.as_str()));
-        assert_eq!(agent.model(), "saved-model");
+        assert_eq!(agent.model(), "model-a");
         assert!(agent.messages().iter().any(
             |message| matches!(message, Message::User { content } if content == "saved context")
         ));
@@ -728,10 +710,9 @@ mod tests {
         assert_eq!(parse("/help").unwrap(), Some(SlashCommand::Help));
         assert_eq!(parse("/clear").unwrap(), Some(SlashCommand::NewSession));
         assert_eq!(parse("/new").unwrap(), Some(SlashCommand::NewSession));
-        assert_eq!(
-            parse("/model gpt-5").unwrap(),
-            Some(SlashCommand::Model(Some("gpt-5".to_owned())))
-        );
+        assert_eq!(parse("/model").unwrap(), Some(SlashCommand::Model));
+        assert_eq!(parse("/provider").unwrap(), Some(SlashCommand::Provider));
+        assert!(parse("/model gpt-5").is_err());
         assert!(parse("/unknown").is_err());
         assert_eq!(
             parse("/think high").unwrap(),

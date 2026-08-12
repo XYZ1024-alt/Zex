@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -33,8 +33,11 @@ use crate::{
     command::{
         CommandEffect, CommandOutput, CommandSpec, SlashCommand, command_specs, execute, parse,
     },
-    config::persist_show_thinking,
-    provider::{Provider, ThinkingLevel},
+    config::{
+        ModelChoice, ModelConfig, ModelRef, ProviderCatalog, ProviderConfig, SecretValue,
+        persist_active_model, persist_provider_catalog, persist_show_thinking,
+    },
+    provider::{OpenAiApi, Provider, ProviderRegistry, ThinkingLevel},
     session::{SessionStore, SessionSummary},
 };
 
@@ -67,17 +70,13 @@ pub fn is_available() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
-pub async fn run<P>(
-    agent: &mut Agent<P>,
+pub async fn run(
+    agent: &mut Agent<ProviderRegistry>,
     event_receiver: mpsc::UnboundedReceiver<AgentEvent>,
     session_store: &SessionStore,
     session_id: &mut Option<String>,
-    working_dir: &Path,
-    show_thinking: bool,
-) -> Result<()>
-where
-    P: Provider,
-{
+    context: TuiContext<'_>,
+) -> Result<()> {
     let mut terminal = TerminalSession::start()?;
     let result = run_loop(
         terminal.terminal_mut(),
@@ -87,8 +86,10 @@ where
         session_store,
         session_id,
         RunContext {
-            working_dir,
-            show_thinking,
+            working_dir: context.working_dir,
+            show_thinking: context.show_thinking,
+            providers: context.providers,
+            provider_registry: context.provider_registry,
         },
     )
     .await;
@@ -101,24 +102,30 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+pub struct TuiContext<'a> {
+    pub working_dir: &'a Path,
+    pub show_thinking: bool,
+    pub providers: ProviderCatalog,
+    pub provider_registry: ProviderRegistry,
+}
+
+#[derive(Clone)]
 struct RunContext<'a> {
     working_dir: &'a Path,
     show_thinking: bool,
+    providers: ProviderCatalog,
+    provider_registry: ProviderRegistry,
 }
 
-async fn run_loop<P>(
+async fn run_loop(
     terminal: &mut DefaultTerminal,
-    agent: &mut Agent<P>,
+    agent: &mut Agent<ProviderRegistry>,
     mut event_receiver: mpsc::UnboundedReceiver<AgentEvent>,
     mut terminal_events: EventStream,
     session_store: &SessionStore,
     session_id: &mut Option<String>,
     context: RunContext<'_>,
-) -> Result<()>
-where
-    P: Provider,
-{
+) -> Result<()> {
     let mut app = App::new(
         agent.messages(),
         agent.model().to_owned(),
@@ -131,6 +138,7 @@ where
             max_context_chars: agent.max_context_chars(),
             default_tool_timeout: agent.default_tool_timeout(),
             show_thinking: context.show_thinking,
+            providers: context.providers.clone(),
         },
     );
     let mut redraw = tokio::time::interval(FRAME_INTERVAL);
@@ -171,6 +179,33 @@ where
                         InputAction::None => {}
                         InputAction::Quit => return Ok(()),
                         InputAction::Interrupt => {}
+                        InputAction::SwitchModel(target) => {
+                            if let Err(error) =
+                                switch_model(
+                                    agent,
+                                    &mut app,
+                                    context.working_dir,
+                                    session_id.as_deref(),
+                                    target,
+                                )
+                                .await
+                            {
+                                app.record_error(format!("{error:#}"));
+                            }
+                        }
+                        InputAction::SaveProviders(catalog) => {
+                            if let Err(error) = save_provider_changes(
+                                agent,
+                                &mut app,
+                                context.working_dir,
+                                &context.provider_registry,
+                                catalog,
+                            )
+                            .await
+                            {
+                                app.record_error(format!("{error:#}"));
+                            }
+                        }
                         InputAction::Resume(requested_id) => {
                             match execute(
                                 crate::command::SlashCommand::Resume(Some(requested_id)),
@@ -200,6 +235,12 @@ where
                         InputAction::Submit(prompt) => {
                             app.remember_submission(&prompt);
                             match parse(&prompt) {
+                                Ok(Some(SlashCommand::Model)) => {
+                                    app.open_model_picker();
+                                }
+                                Ok(Some(SlashCommand::Provider)) => {
+                                    app.open_provider_editor();
+                                }
                                 Ok(Some(SlashCommand::Thinking(requested))) => {
                                     if let Some(show_thinking) = requested {
                                         match persist_show_thinking(
@@ -270,6 +311,97 @@ where
             }
         }
     }
+}
+
+async fn switch_model<P>(
+    agent: &mut Agent<P>,
+    app: &mut App,
+    working_dir: &Path,
+    session_id: Option<&str>,
+    target: ModelRef,
+) -> Result<()>
+where
+    P: Provider,
+{
+    if !app.providers.contains(&target) {
+        bail!("model {} is no longer configured", target.key());
+    }
+    persist_active_model(working_dir, &target).await?;
+    app.providers.active_model = Some(target.clone());
+    agent.set_model(target.key());
+    app.sync_agent_status(agent, session_id);
+    app.dismiss_model_picker();
+    let label = app
+        .providers
+        .model(&target)
+        .map(|(provider, model)| format!("{} / {}", provider.display_name, model.display_name))
+        .unwrap_or_else(|| target.key());
+    app.show_toast(format!("Model switched · {label}"), ToastTone::Success);
+    Ok(())
+}
+
+fn checked_provider_catalog(
+    agent: &Agent<ProviderRegistry>,
+    editor: Option<&ProviderEditor>,
+    mut catalog: ProviderCatalog,
+) -> Result<(ProviderCatalog, Option<ModelRef>)> {
+    let Some(active) = ModelRef::from_key(agent.model()) else {
+        catalog.validate()?;
+        return Ok((catalog, None));
+    };
+    if catalog.contains(&active) {
+        catalog.validate()?;
+        return Ok((catalog, None));
+    }
+    if let Some(editor) = editor
+        && let Some(remapped) = remap_active_model(editor, &active)
+        && editor.draft.contains(&remapped)
+    {
+        catalog.active_model = Some(remapped.clone());
+        catalog.validate()?;
+        return Ok((catalog, Some(remapped)));
+    }
+    bail!("switch away from the active model before removing it")
+}
+
+async fn save_provider_changes(
+    agent: &mut Agent<ProviderRegistry>,
+    app: &mut App,
+    working_dir: &Path,
+    provider_registry: &ProviderRegistry,
+    catalog: ProviderCatalog,
+) -> Result<()> {
+    let (catalog, renamed_active) =
+        checked_provider_catalog(agent, app.provider_editor.as_ref(), catalog)?;
+    let registry_update = provider_registry.prepare_update(&catalog)?;
+    persist_provider_catalog(working_dir, &catalog).await?;
+    provider_registry.apply_update(registry_update)?;
+    if let Some(active) = renamed_active {
+        agent.set_model(active.key());
+    }
+    app.providers = catalog.clone();
+    app.finish_provider_save(catalog);
+    let session_id = app.session_id.clone();
+    app.sync_agent_status(agent, session_id.as_deref());
+    Ok(())
+}
+
+fn remap_active_model(editor: &ProviderEditor, active: &ModelRef) -> Option<ModelRef> {
+    let provider_index = editor
+        .original
+        .providers
+        .iter()
+        .position(|provider| provider.id == active.provider_id)?;
+    let model_index = editor.original.providers[provider_index]
+        .models
+        .iter()
+        .position(|model| model.id == active.model_id)?;
+    let provider = editor.draft.providers.get(provider_index)?;
+    let model = provider.models.get(model_index)?;
+    Some(ModelRef {
+        provider_id: provider.id.clone(),
+        model_id: model.id.clone(),
+    })
 }
 
 async fn run_turn<P>(
@@ -353,7 +485,11 @@ where
                             let _ = cancel_sender.send(true);
                         }
                         InputAction::None | InputAction::Interrupt => {}
-                        InputAction::Quit | InputAction::Resume(_) | InputAction::Submit(_) => {}
+                        InputAction::Quit
+                        | InputAction::Resume(_)
+                        | InputAction::SwitchModel(_)
+                        | InputAction::SaveProviders(_)
+                        | InputAction::Submit(_) => {}
                     },
                     Some(Err(error)) => {
                         return Err(error).context("failed to read terminal event");
@@ -378,6 +514,8 @@ enum InputAction {
     Quit,
     Interrupt,
     Resume(String),
+    SwitchModel(ModelRef),
+    SaveProviders(ProviderCatalog),
     Submit(String),
 }
 
@@ -424,12 +562,23 @@ fn handle_terminal_event(
     match event {
         Event::Paste(content) if !turn_active => {
             burst.reset();
-            app.prepare_input_edit();
-            app.input.insert_str(&content);
-            app.refresh_completion();
+            if app.provider_editor_is_editing() {
+                for character in content.chars() {
+                    app.provider_input_insert(character);
+                }
+            } else if !app.model_picker_open() && !app.provider_editor_open() {
+                app.prepare_input_edit();
+                app.input.insert_str(&content);
+                app.refresh_completion();
+            }
             InputAction::None
         }
-        Event::Mouse(mouse) if !app.completion_open() && !app.session_picker_open() => {
+        Event::Mouse(mouse)
+            if !app.completion_open()
+                && !app.session_picker_open()
+                && !app.model_picker_open()
+                && !app.provider_editor_open() =>
+        {
             match mouse.kind {
                 MouseEventKind::ScrollUp => app.scroll_lines_up(SCROLL_STEP),
                 MouseEventKind::ScrollDown => app.scroll_lines_down(SCROLL_STEP),
@@ -457,6 +606,74 @@ fn handle_key_event(
         } else {
             InputAction::Quit
         };
+    }
+
+    if app.model_picker_open() && !turn_active {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => app.select_model(true),
+            KeyCode::Down | KeyCode::Char('j') => app.select_model(false),
+            KeyCode::Home | KeyCode::Char('g') => app.select_first_model(),
+            KeyCode::End | KeyCode::Char('G') => app.select_last_model(),
+            KeyCode::Enter => {
+                if let Some(target) = app.take_selected_model() {
+                    return InputAction::SwitchModel(target);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => app.dismiss_model_picker(),
+            _ => {}
+        }
+        return InputAction::None;
+    }
+
+    if app.provider_editor_open() && !turn_active {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            return app
+                .provider_catalog_to_save()
+                .map(InputAction::SaveProviders)
+                .unwrap_or(InputAction::None);
+        }
+        if app.provider_editor_is_confirming() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => app.confirm_provider_action(),
+                KeyCode::Esc | KeyCode::Char('n') => app.cancel_provider_action(),
+                _ => {}
+            }
+            return InputAction::None;
+        }
+        if app.provider_editor_is_editing() {
+            match key.code {
+                KeyCode::Enter => app.commit_provider_field(),
+                KeyCode::Esc => app.cancel_provider_field(),
+                KeyCode::Backspace => app.provider_input_backspace(),
+                KeyCode::Delete => app.provider_input_delete(),
+                KeyCode::Left => app.provider_input_left(),
+                KeyCode::Right => app.provider_input_right(),
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    app.provider_input_insert(character);
+                }
+                _ => {}
+            }
+            return InputAction::None;
+        }
+        match key.code {
+            KeyCode::Tab | KeyCode::Char('l') => app.next_provider_pane(false),
+            KeyCode::BackTab | KeyCode::Char('h') => app.next_provider_pane(true),
+            KeyCode::Up | KeyCode::Char('k') => app.select_provider_item(true),
+            KeyCode::Down | KeyCode::Char('j') => app.select_provider_item(false),
+            KeyCode::Enter | KeyCode::Char('e') => app.edit_provider_item(),
+            KeyCode::Char('i') => app.edit_selected_model_id(),
+            KeyCode::Char('t') => app.cycle_selected_model_thinking_level(),
+            KeyCode::Char('n') => app.new_provider_item(),
+            KeyCode::Char('d') => app.request_provider_delete(),
+            KeyCode::Esc | KeyCode::Char('q') => app.request_provider_exit(),
+            KeyCode::Char(' ') => app.toggle_provider_value(),
+            _ => {}
+        }
+        return InputAction::None;
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
@@ -856,6 +1073,118 @@ struct SessionPicker {
     selected: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelPicker {
+    choices: Vec<ModelChoice>,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderPane {
+    Providers,
+    Details,
+    Models,
+}
+
+impl ProviderPane {
+    fn next(self, reverse: bool) -> Self {
+        match (self, reverse) {
+            (Self::Providers, false) | (Self::Details, true) => Self::Details,
+            (Self::Details, false) | (Self::Models, true) => Self::Models,
+            (Self::Models, false) | (Self::Providers, true) => Self::Providers,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderField {
+    Id,
+    DisplayName,
+    BaseUrl,
+    ApiKey,
+}
+
+impl ProviderField {
+    const COUNT: usize = 5;
+
+    fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Id),
+            1 => Some(Self::DisplayName),
+            2 => Some(Self::BaseUrl),
+            3 => Some(Self::ApiKey),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderEditTarget {
+    Provider(ProviderField),
+    ModelId { model_index: usize },
+    ModelName { model_index: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteTarget {
+    Provider(usize),
+    Model {
+        provider_index: usize,
+        model_index: usize,
+    },
+}
+
+#[derive(Debug)]
+struct FieldEditor {
+    target: ProviderEditTarget,
+    input: InputBuffer,
+}
+
+#[derive(Debug)]
+enum ProviderDialog {
+    Delete(DeleteTarget),
+    Discard,
+}
+
+#[derive(Debug)]
+struct ProviderEditor {
+    original: ProviderCatalog,
+    draft: ProviderCatalog,
+    pane: ProviderPane,
+    provider_selected: usize,
+    detail_selected: usize,
+    model_selected: usize,
+    field_editor: Option<FieldEditor>,
+    dialog: Option<ProviderDialog>,
+}
+
+impl ProviderEditor {
+    fn new(catalog: ProviderCatalog) -> Self {
+        Self {
+            original: catalog.clone(),
+            draft: catalog,
+            pane: ProviderPane::Providers,
+            provider_selected: 0,
+            detail_selected: 0,
+            model_selected: 0,
+            field_editor: None,
+            dialog: None,
+        }
+    }
+
+    fn dirty(&self) -> bool {
+        self.original != self.draft
+    }
+
+    fn selected_provider(&self) -> Option<&ProviderConfig> {
+        self.draft.providers.get(self.provider_selected)
+    }
+
+    fn selected_provider_mut(&mut self) -> Option<&mut ProviderConfig> {
+        self.draft.providers.get_mut(self.provider_selected)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AppContext {
     working_dir: PathBuf,
@@ -865,6 +1194,7 @@ struct AppContext {
     max_context_chars: usize,
     default_tool_timeout: Duration,
     show_thinking: bool,
+    providers: ProviderCatalog,
 }
 
 #[derive(Debug)]
@@ -897,6 +1227,9 @@ struct App {
     toast: Option<Toast>,
     help_open: bool,
     session_picker: Option<SessionPicker>,
+    providers: ProviderCatalog,
+    model_picker: Option<ModelPicker>,
+    provider_editor: Option<ProviderEditor>,
 }
 
 impl App {
@@ -939,6 +1272,9 @@ impl App {
             toast: None,
             help_open: false,
             session_picker: None,
+            providers: context.providers,
+            model_picker: None,
+            provider_editor: None,
         };
 
         for message in messages {
@@ -1155,6 +1491,8 @@ impl App {
         self.toast = None;
         self.help_open = false;
         self.session_picker = None;
+        self.model_picker = None;
+        self.provider_editor = None;
         self.scroll_to_bottom();
     }
 
@@ -1172,6 +1510,7 @@ impl App {
                 max_context_chars: self.max_context_chars,
                 default_tool_timeout: self.default_tool_timeout,
                 show_thinking: self.show_thinking,
+                providers: self.providers.clone(),
             },
         );
     }
@@ -1341,6 +1680,14 @@ impl App {
     }
 
     fn cancel_ui_layer(&mut self) -> bool {
+        if self.provider_editor_open() {
+            self.request_provider_exit();
+            return true;
+        }
+        if self.model_picker_open() {
+            self.dismiss_model_picker();
+            return true;
+        }
         if self.session_picker_open() {
             self.dismiss_session_picker();
             return true;
@@ -1595,6 +1942,568 @@ impl App {
         }
         false
     }
+
+    fn open_model_picker(&mut self) {
+        self.help_open = false;
+        self.session_picker = None;
+        self.provider_editor = None;
+        self.input.clear();
+        self.reset_history_navigation();
+        let choices = self.providers.choices();
+        let selected = self
+            .providers
+            .active_model
+            .as_ref()
+            .and_then(|active| choices.iter().position(|choice| choice.target == *active))
+            .unwrap_or(0);
+        self.model_picker = Some(ModelPicker { choices, selected });
+    }
+
+    fn model_picker_open(&self) -> bool {
+        self.model_picker.is_some()
+    }
+
+    fn dismiss_model_picker(&mut self) {
+        self.model_picker = None;
+    }
+
+    fn select_model(&mut self, reverse: bool) {
+        let Some(picker) = &mut self.model_picker else {
+            return;
+        };
+        if picker.choices.is_empty() {
+            return;
+        }
+        picker.selected = if reverse {
+            picker
+                .selected
+                .checked_sub(1)
+                .unwrap_or(picker.choices.len() - 1)
+        } else {
+            (picker.selected + 1) % picker.choices.len()
+        };
+    }
+
+    fn select_first_model(&mut self) {
+        if let Some(picker) = &mut self.model_picker {
+            picker.selected = 0;
+        }
+    }
+
+    fn select_last_model(&mut self) {
+        if let Some(picker) = &mut self.model_picker
+            && !picker.choices.is_empty()
+        {
+            picker.selected = picker.choices.len() - 1;
+        }
+    }
+
+    fn take_selected_model(&self) -> Option<ModelRef> {
+        let picker = self.model_picker.as_ref()?;
+        picker
+            .choices
+            .get(picker.selected)
+            .map(|choice| choice.target.clone())
+    }
+
+    fn open_provider_editor(&mut self) {
+        self.help_open = false;
+        self.session_picker = None;
+        self.model_picker = None;
+        self.input.clear();
+        self.reset_history_navigation();
+        self.provider_editor = Some(ProviderEditor::new(self.providers.clone()));
+    }
+
+    fn provider_editor_open(&self) -> bool {
+        self.provider_editor.is_some()
+    }
+
+    fn provider_editor_is_editing(&self) -> bool {
+        self.provider_editor
+            .as_ref()
+            .is_some_and(|editor| editor.field_editor.is_some())
+    }
+
+    fn provider_editor_is_confirming(&self) -> bool {
+        self.provider_editor
+            .as_ref()
+            .is_some_and(|editor| editor.dialog.is_some())
+    }
+
+    fn next_provider_pane(&mut self, reverse: bool) {
+        if let Some(editor) = &mut self.provider_editor {
+            editor.pane = editor.pane.next(reverse);
+        }
+    }
+
+    fn select_provider_item(&mut self, reverse: bool) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        match editor.pane {
+            ProviderPane::Providers => {
+                let count = editor.draft.providers.len();
+                if count == 0 {
+                    return;
+                }
+                editor.provider_selected = if reverse {
+                    editor.provider_selected.checked_sub(1).unwrap_or(count - 1)
+                } else {
+                    (editor.provider_selected + 1) % count
+                };
+                editor.detail_selected = 0;
+                editor.model_selected = 0;
+            }
+            ProviderPane::Details => {
+                editor.detail_selected = if reverse {
+                    editor
+                        .detail_selected
+                        .checked_sub(1)
+                        .unwrap_or(ProviderField::COUNT - 1)
+                } else {
+                    (editor.detail_selected + 1) % ProviderField::COUNT
+                };
+            }
+            ProviderPane::Models => {
+                let count = editor
+                    .selected_provider()
+                    .map_or(0, |provider| provider.models.len());
+                if count == 0 {
+                    return;
+                }
+                editor.model_selected = if reverse {
+                    editor.model_selected.checked_sub(1).unwrap_or(count - 1)
+                } else {
+                    (editor.model_selected + 1) % count
+                };
+            }
+        }
+    }
+
+    fn edit_provider_item(&mut self) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        let target = match editor.pane {
+            ProviderPane::Providers => {
+                if editor.selected_provider().is_some() {
+                    editor.pane = ProviderPane::Details;
+                }
+                return;
+            }
+            ProviderPane::Details => match ProviderField::from_index(editor.detail_selected) {
+                Some(field) => {
+                    if editor.detail_selected == 4 {
+                        if let Some(provider) = editor.selected_provider_mut() {
+                            provider.openai_api = match provider.openai_api {
+                                OpenAiApi::ChatCompletions => OpenAiApi::Responses,
+                                OpenAiApi::Responses => OpenAiApi::ChatCompletions,
+                            };
+                        }
+                        return;
+                    }
+                    ProviderEditTarget::Provider(field)
+                }
+                None => return,
+            },
+            ProviderPane::Models => {
+                if editor
+                    .selected_provider()
+                    .and_then(|provider| provider.models.get(editor.model_selected))
+                    .is_none()
+                {
+                    return;
+                }
+                ProviderEditTarget::ModelName {
+                    model_index: editor.model_selected,
+                }
+            }
+        };
+        let value = provider_field_value(editor, target);
+        let mut input = InputBuffer::default();
+        if !matches!(target, ProviderEditTarget::Provider(ProviderField::ApiKey)) {
+            input.replace(&value);
+        }
+        editor.field_editor = Some(FieldEditor { target, input });
+    }
+
+    fn edit_selected_model_id(&mut self) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        if editor.pane != ProviderPane::Models {
+            return;
+        }
+        let model_index = editor.model_selected;
+        let Some(model) = editor
+            .selected_provider()
+            .and_then(|provider| provider.models.get(model_index))
+        else {
+            return;
+        };
+        let mut input = InputBuffer::default();
+        input.replace(&model.id);
+        editor.field_editor = Some(FieldEditor {
+            target: ProviderEditTarget::ModelId { model_index },
+            input,
+        });
+    }
+
+    fn cycle_selected_model_thinking_level(&mut self) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        if editor.pane != ProviderPane::Models {
+            return;
+        }
+        let model_selected = editor.model_selected;
+        if let Some(model) = editor
+            .selected_provider_mut()
+            .and_then(|provider| provider.models.get_mut(model_selected))
+            && model.supports_thinking
+        {
+            model.default_thinking_level =
+                Some(model.default_thinking_level.unwrap_or_default().next());
+        }
+    }
+
+    fn new_provider_item(&mut self) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        match editor.pane {
+            ProviderPane::Providers | ProviderPane::Details => {
+                let number = editor.draft.providers.len() + 1;
+                editor.draft.providers.push(ProviderConfig {
+                    id: format!("provider-{number}"),
+                    display_name: format!("Provider {number}"),
+                    base_url: "https://api.openai.com/v1".to_owned(),
+                    api_key: SecretValue::new(String::new()),
+                    openai_api: OpenAiApi::Responses,
+                    models: Vec::new(),
+                });
+                editor.provider_selected = editor.draft.providers.len() - 1;
+                editor.detail_selected = 0;
+                editor.model_selected = 0;
+                editor.pane = ProviderPane::Details;
+                self.edit_provider_item();
+            }
+            ProviderPane::Models => {
+                let provider_index = editor.provider_selected;
+                let Some(provider) = editor.draft.providers.get_mut(provider_index) else {
+                    return;
+                };
+                let number = provider.models.len() + 1;
+                provider.models.push(ModelConfig {
+                    id: format!("model-{number}"),
+                    display_name: format!("Model {number}"),
+                    supports_thinking: false,
+                    default_thinking_level: None,
+                });
+                let model_selected = provider.models.len() - 1;
+                let model_id = provider.models[model_selected].id.clone();
+                editor.model_selected = model_selected;
+                let target = ProviderEditTarget::ModelId {
+                    model_index: model_selected,
+                };
+                let mut input = InputBuffer::default();
+                input.replace(&model_id);
+                editor.field_editor = Some(FieldEditor { target, input });
+            }
+        }
+    }
+
+    fn request_provider_delete(&mut self) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        let target = match editor.pane {
+            ProviderPane::Providers | ProviderPane::Details => {
+                if editor.selected_provider().is_none() {
+                    return;
+                }
+                DeleteTarget::Provider(editor.provider_selected)
+            }
+            ProviderPane::Models => {
+                if editor
+                    .selected_provider()
+                    .and_then(|provider| provider.models.get(editor.model_selected))
+                    .is_none()
+                {
+                    return;
+                }
+                DeleteTarget::Model {
+                    provider_index: editor.provider_selected,
+                    model_index: editor.model_selected,
+                }
+            }
+        };
+        if delete_target_contains_active(&editor.draft, target) {
+            self.show_toast(
+                "Switch away from the active model before deleting it".to_owned(),
+                ToastTone::Neutral,
+            );
+            return;
+        }
+        editor.dialog = Some(ProviderDialog::Delete(target));
+    }
+
+    fn request_provider_exit(&mut self) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        if editor.dirty() {
+            editor.dialog = Some(ProviderDialog::Discard);
+        } else {
+            self.provider_editor = None;
+        }
+    }
+
+    fn confirm_provider_action(&mut self) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        match editor.dialog.take() {
+            Some(ProviderDialog::Discard) => {
+                self.provider_editor = None;
+            }
+            Some(ProviderDialog::Delete(DeleteTarget::Provider(index))) => {
+                if index < editor.draft.providers.len() {
+                    editor.draft.providers.remove(index);
+                    editor.provider_selected = editor
+                        .provider_selected
+                        .min(editor.draft.providers.len().saturating_sub(1));
+                    editor.model_selected = 0;
+                }
+            }
+            Some(ProviderDialog::Delete(DeleteTarget::Model {
+                provider_index,
+                model_index,
+            })) => {
+                if let Some(provider) = editor.draft.providers.get_mut(provider_index)
+                    && model_index < provider.models.len()
+                {
+                    provider.models.remove(model_index);
+                    editor.model_selected = editor
+                        .model_selected
+                        .min(provider.models.len().saturating_sub(1));
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn cancel_provider_action(&mut self) {
+        if let Some(editor) = &mut self.provider_editor {
+            editor.dialog = None;
+        }
+    }
+
+    fn toggle_provider_value(&mut self) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        match editor.pane {
+            ProviderPane::Details if editor.detail_selected == 4 => {
+                if let Some(provider) = editor.selected_provider_mut() {
+                    provider.openai_api = match provider.openai_api {
+                        OpenAiApi::ChatCompletions => OpenAiApi::Responses,
+                        OpenAiApi::Responses => OpenAiApi::ChatCompletions,
+                    };
+                }
+            }
+            ProviderPane::Models => {
+                let model_selected = editor.model_selected;
+                if let Some(model) = editor
+                    .selected_provider_mut()
+                    .and_then(|provider| provider.models.get_mut(model_selected))
+                {
+                    model.supports_thinking = !model.supports_thinking;
+                    model.default_thinking_level =
+                        model.supports_thinking.then_some(ThinkingLevel::default());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn provider_input_insert(&mut self, character: char) {
+        if let Some(input) = self
+            .provider_editor
+            .as_mut()
+            .and_then(|editor| editor.field_editor.as_mut())
+            .map(|field| &mut field.input)
+        {
+            input.insert_char(character);
+        }
+    }
+
+    fn provider_input_backspace(&mut self) {
+        if let Some(input) = self
+            .provider_editor
+            .as_mut()
+            .and_then(|editor| editor.field_editor.as_mut())
+            .map(|field| &mut field.input)
+        {
+            input.backspace();
+        }
+    }
+
+    fn provider_input_delete(&mut self) {
+        if let Some(input) = self
+            .provider_editor
+            .as_mut()
+            .and_then(|editor| editor.field_editor.as_mut())
+            .map(|field| &mut field.input)
+        {
+            input.delete();
+        }
+    }
+
+    fn provider_input_left(&mut self) {
+        if let Some(input) = self
+            .provider_editor
+            .as_mut()
+            .and_then(|editor| editor.field_editor.as_mut())
+            .map(|field| &mut field.input)
+        {
+            input.move_left();
+        }
+    }
+
+    fn provider_input_right(&mut self) {
+        if let Some(input) = self
+            .provider_editor
+            .as_mut()
+            .and_then(|editor| editor.field_editor.as_mut())
+            .map(|field| &mut field.input)
+        {
+            input.move_right();
+        }
+    }
+
+    fn commit_provider_field(&mut self) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        let Some(field_editor) = editor.field_editor.take() else {
+            return;
+        };
+        let value = field_editor.input.content.trim().to_owned();
+        match field_editor.target {
+            ProviderEditTarget::Provider(field) => {
+                let Some(provider) = editor.selected_provider_mut() else {
+                    return;
+                };
+                match field {
+                    ProviderField::Id => provider.id = value,
+                    ProviderField::DisplayName => provider.display_name = value,
+                    ProviderField::BaseUrl => provider.base_url = value,
+                    ProviderField::ApiKey if value.is_empty() => {}
+                    ProviderField::ApiKey => provider.api_key = SecretValue::new(value),
+                }
+            }
+            ProviderEditTarget::ModelName { model_index } => {
+                let Some(model) = editor
+                    .selected_provider_mut()
+                    .and_then(|provider| provider.models.get_mut(model_index))
+                else {
+                    return;
+                };
+                model.display_name = value;
+            }
+            ProviderEditTarget::ModelId { model_index } => {
+                let Some(model) = editor
+                    .selected_provider_mut()
+                    .and_then(|provider| provider.models.get_mut(model_index))
+                else {
+                    return;
+                };
+                model.id = value;
+            }
+        }
+    }
+
+    fn cancel_provider_field(&mut self) {
+        if let Some(editor) = &mut self.provider_editor {
+            editor.field_editor = None;
+        }
+    }
+
+    fn provider_catalog_to_save(&mut self) -> Option<ProviderCatalog> {
+        self.commit_provider_field();
+        let editor = self.provider_editor.as_ref()?;
+        Some(editor.draft.clone())
+    }
+
+    fn finish_provider_save(&mut self, catalog: ProviderCatalog) {
+        if let Some(editor) = &mut self.provider_editor {
+            editor.original = catalog.clone();
+            editor.draft = catalog;
+        }
+        self.show_toast(
+            "Provider configuration saved".to_owned(),
+            ToastTone::Success,
+        );
+    }
+}
+
+fn provider_field_value(editor: &ProviderEditor, target: ProviderEditTarget) -> String {
+    match target {
+        ProviderEditTarget::Provider(field) => {
+            let Some(provider) = editor.selected_provider() else {
+                return String::new();
+            };
+            match field {
+                ProviderField::Id => provider.id.clone(),
+                ProviderField::DisplayName => provider.display_name.clone(),
+                ProviderField::BaseUrl => provider.base_url.clone(),
+                ProviderField::ApiKey => provider.api_key.expose().to_owned(),
+            }
+        }
+        ProviderEditTarget::ModelId { model_index }
+        | ProviderEditTarget::ModelName { model_index } => {
+            let Some(model) = editor
+                .selected_provider()
+                .and_then(|provider| provider.models.get(model_index))
+            else {
+                return String::new();
+            };
+            match target {
+                ProviderEditTarget::ModelId { .. } => model.id.clone(),
+                ProviderEditTarget::ModelName { .. } => model.display_name.clone(),
+                ProviderEditTarget::Provider(_) => unreachable!(),
+            }
+        }
+    }
+}
+
+fn delete_target_contains_active(catalog: &ProviderCatalog, target: DeleteTarget) -> bool {
+    let Some(active) = &catalog.active_model else {
+        return false;
+    };
+    match target {
+        DeleteTarget::Provider(provider_index) => catalog
+            .providers
+            .get(provider_index)
+            .is_some_and(|provider| provider.id == active.provider_id),
+        DeleteTarget::Model {
+            provider_index,
+            model_index,
+        } => catalog
+            .providers
+            .get(provider_index)
+            .and_then(|provider| {
+                provider
+                    .models
+                    .get(model_index)
+                    .map(|model| (provider, model))
+            })
+            .is_some_and(|(provider, model)| {
+                provider.id == active.provider_id && model.id == active.model_id
+            }),
+    }
 }
 
 fn load_git_status(working_dir: &Path) -> Option<GitStatus> {
@@ -1624,13 +2533,21 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(Clear, frame.area());
     let regions = ui_regions(frame.area(), app);
 
-    render_transcript(frame, regions.transcript, app);
-    render_completion(frame, regions.completion, app);
+    if app.model_picker_open() {
+        render_model_picker(frame, regions.transcript, app);
+    } else if app.provider_editor_open() {
+        render_provider_editor(frame, regions.transcript, app);
+    } else {
+        render_transcript(frame, regions.transcript, app);
+        render_completion(frame, regions.completion, app);
+    }
     render_status(frame, regions.status, app);
     render_keymap(frame, regions.keymap, app);
-    render_input(frame, regions.input, app);
-    render_help_overlay(frame, regions.transcript, app);
-    render_session_picker(frame, regions.transcript, app);
+    if !app.model_picker_open() && !app.provider_editor_open() {
+        render_input(frame, regions.input, app);
+        render_help_overlay(frame, regions.transcript, app);
+        render_session_picker(frame, regions.transcript, app);
+    }
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1676,6 +2593,13 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .as_deref()
         .map(short_session_id)
         .unwrap_or("new");
+    let model_label = ModelRef::from_key(&app.model)
+        .and_then(|target| {
+            app.providers.model(&target).map(|(provider, model)| {
+                format!("{} / {}", provider.display_name, model.display_name)
+            })
+        })
+        .unwrap_or_else(|| app.model.clone());
 
     let right_text = if content.width >= 18 {
         format!("ctx {context_percent}%")
@@ -1716,7 +2640,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         Span::styled("  ·  ", Style::default().fg(MUTED)),
         Span::styled(
-            single_line(&app.model, model_limit),
+            single_line(&model_label, model_limit),
             Style::default().fg(TEXT_STRONG),
         ),
     ];
@@ -1888,6 +2812,332 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &App) {
     );
 }
 
+fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(picker) = &app.model_picker else {
+        return;
+    };
+    if area.is_empty() {
+        return;
+    }
+    let area = horizontal_inset(content_area(area), HORIZONTAL_GUTTER);
+    let active = app.providers.active_model.as_ref();
+    let current = active
+        .and_then(|target| app.providers.model(target))
+        .map(|(provider, model)| format!("{} / {}", provider.display_name, model.display_name))
+        .unwrap_or_else(|| "none".to_owned());
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "Models",
+                Style::default()
+                    .fg(TEXT_STRONG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Current: ", Style::default().fg(DIM)),
+            Span::styled(current, Style::default().fg(TEXT)),
+        ]),
+        Line::default(),
+    ];
+
+    if picker.choices.is_empty() {
+        lines.extend([
+            Line::from(Span::styled(
+                "No configured models",
+                Style::default().fg(TEXT_STRONG),
+            )),
+            Line::from(Span::styled(
+                "Add a Provider and at least one model with /provider.",
+                Style::default().fg(DIM),
+            )),
+        ]);
+    } else {
+        let mut provider = "";
+        for (index, choice) in picker.choices.iter().enumerate() {
+            if choice.provider_name != provider {
+                if !provider.is_empty() {
+                    lines.push(Line::default());
+                }
+                provider = &choice.provider_name;
+                lines.push(Line::from(Span::styled(
+                    provider.to_owned(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )));
+            }
+            let selected = index == picker.selected;
+            let current = active.is_some_and(|active| *active == choice.target);
+            let background = if selected {
+                SURFACE_RAISED
+            } else {
+                Color::Reset
+            };
+            let marker = if selected { "›" } else { " " };
+            let current_marker = if current { "●" } else { " " };
+            let thinking = if choice.supports_thinking {
+                choice
+                    .default_thinking_level
+                    .map(|level| level.to_string())
+                    .unwrap_or_else(|| "yes".to_owned())
+            } else {
+                "n/a".to_owned()
+            };
+            lines.push(
+                Line::from(vec![
+                    Span::styled(
+                        format!("{marker} {current_marker} "),
+                        Style::default().fg(if current { SUCCESS } else { ACCENT }),
+                    ),
+                    Span::styled(
+                        pad_display(&single_line(&choice.model_name, 30), 32),
+                        Style::default().fg(TEXT_STRONG),
+                    ),
+                    Span::styled(
+                        pad_display(&single_line(&choice.target.model_id, 28), 30),
+                        Style::default().fg(DIM),
+                    ),
+                    Span::styled(format!("think {thinking}"), Style::default().fg(DIM)),
+                ])
+                .style(Style::default().bg(background)),
+            );
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(editor) = &app.provider_editor else {
+        return;
+    };
+    if area.is_empty() {
+        return;
+    }
+    let area = content_area(area);
+    let left_width = if area.width < 50 {
+        area.width
+    } else {
+        (area.width / 3).clamp(24, 38)
+    };
+    let left = Rect::new(area.x, area.y, left_width, area.height);
+    let right = Rect::new(
+        left.right(),
+        area.y,
+        area.width.saturating_sub(left_width),
+        area.height,
+    );
+    let left_style = if editor.pane == ProviderPane::Providers {
+        Style::default().fg(ACCENT)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    let mut provider_lines = vec![
+        Line::from(Span::styled(
+            "Providers",
+            Style::default()
+                .fg(TEXT_STRONG)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+    ];
+    if editor.draft.providers.is_empty() {
+        provider_lines.push(Line::from(Span::styled(
+            "No Providers configured",
+            Style::default().fg(DIM),
+        )));
+        provider_lines.push(Line::from(Span::styled(
+            "Press n to add one.",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        for (index, provider) in editor.draft.providers.iter().enumerate() {
+            let selected = index == editor.provider_selected;
+            provider_lines.push(
+                Line::from(vec![
+                    Span::styled(
+                        if selected { "› " } else { "  " },
+                        Style::default().fg(ACCENT),
+                    ),
+                    Span::styled(
+                        single_line(
+                            &provider.display_name,
+                            left_width.saturating_sub(5) as usize,
+                        ),
+                        Style::default().fg(if selected { TEXT_STRONG } else { TEXT }),
+                    ),
+                ])
+                .style(Style::default().bg(
+                    if selected && editor.pane == ProviderPane::Providers {
+                        SURFACE_RAISED
+                    } else {
+                        Color::Reset
+                    },
+                )),
+            );
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(provider_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::RIGHT)
+                    .border_style(left_style),
+            )
+            .wrap(Wrap { trim: false }),
+        left,
+    );
+
+    if right.is_empty() {
+        return;
+    }
+    let right = horizontal_inset(right, 2);
+    let Some(provider) = editor.selected_provider() else {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Provider details",
+                    Style::default()
+                        .fg(TEXT_STRONG)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::default(),
+                Line::from(Span::styled(
+                    "Create a Provider to configure its endpoint and models.",
+                    Style::default().fg(DIM),
+                )),
+            ]),
+            right,
+        );
+        return;
+    };
+
+    let detail_active = editor.pane == ProviderPane::Details;
+    let model_active = editor.pane == ProviderPane::Models;
+    let api_key = if provider.api_key.is_empty() {
+        "<required>".to_owned()
+    } else {
+        "••••••••••••".to_owned()
+    };
+    let fields = [
+        ("ID", provider.id.clone()),
+        ("Name", provider.display_name.clone()),
+        ("Base URL", provider.base_url.clone()),
+        ("API key", api_key),
+        ("API", provider.openai_api.to_string()),
+    ];
+    let mut lines = vec![Line::from(Span::styled(
+        "Provider details",
+        Style::default()
+            .fg(if detail_active { ACCENT } else { TEXT_STRONG })
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for (index, (label, value)) in fields.into_iter().enumerate() {
+        let selected = detail_active && editor.detail_selected == index;
+        lines.push(
+            Line::from(vec![
+                Span::styled(
+                    format!("{} {:<10}", if selected { "›" } else { " " }, label),
+                    Style::default().fg(if selected { ACCENT } else { DIM }),
+                ),
+                Span::styled(single_line(&value, 70), Style::default().fg(TEXT_STRONG)),
+            ])
+            .style(Style::default().bg(if selected {
+                SURFACE_RAISED
+            } else {
+                Color::Reset
+            })),
+        );
+    }
+    lines.extend([
+        Line::default(),
+        Line::from(Span::styled(
+            "Models",
+            Style::default()
+                .fg(if model_active { ACCENT } else { TEXT_STRONG })
+                .add_modifier(Modifier::BOLD),
+        )),
+    ]);
+    if provider.models.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No models · focus Models and press n",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        for (index, model) in provider.models.iter().enumerate() {
+            let selected = model_active && editor.model_selected == index;
+            let thinking = if model.supports_thinking {
+                model
+                    .default_thinking_level
+                    .map(|level| level.to_string())
+                    .unwrap_or_else(|| "yes".to_owned())
+            } else {
+                "n/a".to_owned()
+            };
+            lines.push(
+                Line::from(vec![
+                    Span::styled(
+                        if selected { "› " } else { "  " },
+                        Style::default().fg(ACCENT),
+                    ),
+                    Span::styled(
+                        pad_display(&single_line(&model.display_name, 28), 30),
+                        Style::default().fg(TEXT_STRONG),
+                    ),
+                    Span::styled(
+                        pad_display(&single_line(&model.id, 24), 26),
+                        Style::default().fg(DIM),
+                    ),
+                    Span::styled(format!("think {thinking}"), Style::default().fg(DIM)),
+                ])
+                .style(Style::default().bg(if selected {
+                    SURFACE_RAISED
+                } else {
+                    Color::Reset
+                })),
+            );
+        }
+    }
+    if let Some(field_editor) = &editor.field_editor {
+        lines.extend([
+            Line::default(),
+            Line::from(Span::styled(
+                "Edit value",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                if matches!(
+                    field_editor.target,
+                    ProviderEditTarget::Provider(ProviderField::ApiKey)
+                ) {
+                    "•".repeat(field_editor.input.content.chars().count())
+                } else {
+                    field_editor.input.content.clone()
+                },
+                Style::default().fg(TEXT_STRONG).bg(SURFACE_RAISED),
+            )),
+            Line::from(Span::styled(
+                "Enter apply field · Esc cancel",
+                Style::default().fg(DIM),
+            )),
+        ]);
+    }
+    if let Some(dialog) = &editor.dialog {
+        lines.extend([
+            Line::default(),
+            Line::from(Span::styled(
+                match dialog {
+                    ProviderDialog::Delete(_) => "Delete selected item?",
+                    ProviderDialog::Discard => "Discard unsaved changes?",
+                },
+                Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "Enter/y confirm · Esc/n cancel",
+                Style::default().fg(DIM),
+            )),
+        ]);
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), right);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UiRegions {
     transcript: Rect,
@@ -1898,7 +3148,11 @@ struct UiRegions {
 }
 
 fn ui_regions(area: Rect, app: &App) -> UiRegions {
-    let desired_input = input_height(&app.input, area.width);
+    let desired_input = if app.model_picker_open() || app.provider_editor_open() {
+        0
+    } else {
+        input_height(&app.input, area.width)
+    };
     let input_height = desired_input
         .min(area.height.saturating_sub(2).max(1))
         .min(area.height);
@@ -2042,6 +3296,9 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn completion_height(app: &App) -> u16 {
+    if app.model_picker_open() || app.provider_editor_open() {
+        return 0;
+    }
     if app.completion_open() {
         app.completion_matches().len() as u16 + 2
     } else {
@@ -2719,7 +3976,21 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
-    let hint = if app.session_picker_open() {
+    let hint = if app.model_picker_open() {
+        Line::from(Span::styled(
+            "↑↓/jk select · Enter switch · Esc/q cancel",
+            Style::default().fg(DIM),
+        ))
+    } else if app.provider_editor_open() {
+        let text = if app.provider_editor_is_confirming() {
+            "Enter/y confirm · Esc/n cancel"
+        } else if app.provider_editor_is_editing() {
+            "Enter apply field · Esc cancel · Ctrl+S save"
+        } else {
+            "Tab pane · ↑↓/jk select · Enter name · i ID · Space thinking · t level · n new · d delete · Ctrl+S save · Esc exit"
+        };
+        Line::from(Span::styled(text, Style::default().fg(DIM)))
+    } else if app.session_picker_open() {
         Line::from(Span::styled(
             "↑↓ select · Enter resume · Esc cancel",
             Style::default().fg(DIM),
@@ -2969,13 +4240,14 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
-        ACCENT, App, AppContext, CommandOutput, InputAction, InputBuffer, KeyBurst, SCROLL_STEP,
-        SURFACE, SURFACE_RAISED, Status, ThinkingEntry, ToolStatus, TranscriptEntry, UiRegions,
-        command_specs, handle_key_event, handle_terminal_event, input_metrics, render,
+        ACCENT, App, AppContext, CommandOutput, InputAction, InputBuffer, KeyBurst, ProviderPane,
+        SCROLL_STEP, SURFACE, SURFACE_RAISED, Status, ThinkingEntry, ToolStatus, TranscriptEntry,
+        UiRegions, command_specs, handle_key_event, handle_terminal_event, input_metrics, render,
         truncate_chars, ui_regions,
     };
     use crate::agent::{AgentEvent, Message, MessageRole};
-    use crate::provider::ThinkingLevel;
+    use crate::config::{ModelConfig, ModelRef, ProviderCatalog, ProviderConfig, SecretValue};
+    use crate::provider::{OpenAiApi, ThinkingLevel};
 
     fn app() -> App {
         App::new(
@@ -2990,7 +4262,75 @@ mod tests {
                 max_context_chars: 120_000,
                 default_tool_timeout: Duration::from_secs(60),
                 show_thinking: true,
+                providers: ProviderCatalog::default(),
             },
+        )
+    }
+
+    fn configured_app() -> App {
+        let active_model = ModelRef {
+            provider_id: "openai".to_owned(),
+            model_id: "gpt-5".to_owned(),
+        };
+        let providers = ProviderCatalog {
+            active_model: Some(active_model.clone()),
+            providers: vec![ProviderConfig {
+                id: "openai".to_owned(),
+                display_name: "OpenAI".to_owned(),
+                base_url: "https://api.openai.com/v1".to_owned(),
+                api_key: SecretValue::new("secret".to_owned()),
+                openai_api: OpenAiApi::Responses,
+                models: vec![
+                    ModelConfig {
+                        id: "gpt-5".to_owned(),
+                        display_name: "GPT-5".to_owned(),
+                        supports_thinking: true,
+                        default_thinking_level: Some(ThinkingLevel::High),
+                    },
+                    ModelConfig {
+                        id: "gpt-4.1-mini".to_owned(),
+                        display_name: "GPT-4.1 Mini".to_owned(),
+                        supports_thinking: false,
+                        default_thinking_level: None,
+                    },
+                ],
+            }],
+        };
+        App::new(
+            &[],
+            active_model.key(),
+            None,
+            AppContext {
+                working_dir: PathBuf::from("."),
+                thinking_level: Some(ThinkingLevel::High),
+                thinking_preference: ThinkingLevel::High,
+                context_chars: 0,
+                max_context_chars: 120_000,
+                default_tool_timeout: Duration::from_secs(60),
+                show_thinking: true,
+                providers,
+            },
+        )
+    }
+
+    fn registry_agent(
+        catalog: &ProviderCatalog,
+        active_model: &ModelRef,
+    ) -> crate::agent::Agent<crate::provider::ProviderRegistry> {
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        crate::agent::Agent::new(
+            crate::provider::ProviderRegistry::new(catalog, Duration::from_secs(1)).unwrap(),
+            crate::tools::ToolRegistry::new(Duration::from_secs(1), 32_000),
+            events,
+            crate::agent::AgentOptions {
+                model: active_model.key(),
+                turn_timeout: Duration::from_secs(1),
+                max_turns: 1,
+                max_context_chars: 120_000,
+                compact_keep_turns: 6,
+                thinking_level: ThinkingLevel::High,
+            },
+            None,
         )
     }
 
@@ -3014,6 +4354,258 @@ mod tests {
         assert_eq!(regions.keymap.y, regions.status.bottom());
         assert_eq!(regions.input.y, regions.keymap.bottom());
         assert_eq!(regions.input.bottom(), area.bottom());
+    }
+
+    #[test]
+    fn model_picker_selects_configured_models_without_editing_the_catalog() {
+        let mut app = configured_app();
+        app.open_model_picker();
+
+        assert_eq!(app.model_picker.as_ref().unwrap().selected, 0);
+        let action = handle_key_event(
+            key(
+                crossterm::event::KeyCode::Char('j'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        );
+        assert_eq!(action, InputAction::None);
+        let action = handle_key_event(
+            key(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        );
+        assert!(matches!(
+            action,
+            InputAction::SwitchModel(ModelRef {
+                provider_id,
+                model_id
+            }) if provider_id == "openai" && model_id == "gpt-4.1-mini"
+        ));
+        assert_eq!(
+            app.providers.active_model.as_ref().unwrap().model_id,
+            "gpt-5"
+        );
+    }
+
+    #[test]
+    fn model_picker_and_provider_editor_replace_the_main_area() {
+        let mut app = configured_app();
+        app.open_model_picker();
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        assert!(screen.contains("Models"));
+        assert!(screen.contains("Current: OpenAI / GPT-5"));
+        assert!(!screen.contains("Ask anything, or type / for commands"));
+
+        app.dismiss_model_picker();
+        app.open_provider_editor();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        assert!(screen.contains("Providers"));
+        assert!(screen.contains("Provider details"));
+        assert!(screen.contains("API key"));
+        assert!(!screen.contains("secret"));
+        assert!(!screen.contains("Ask anything, or type / for commands"));
+    }
+
+    #[test]
+    fn provider_editor_protects_the_active_model_from_deletion() {
+        let mut app = configured_app();
+        app.open_provider_editor();
+        app.provider_editor.as_mut().unwrap().pane = ProviderPane::Models;
+        app.provider_editor.as_mut().unwrap().model_selected = 0;
+
+        app.request_provider_delete();
+
+        assert!(app.provider_editor.as_ref().unwrap().dialog.is_none());
+        assert!(app.toast.is_some());
+        assert_eq!(
+            app.provider_editor.as_ref().unwrap().draft.providers[0]
+                .models
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn provider_editor_can_add_and_edit_a_model_draft() {
+        let mut app = configured_app();
+        app.open_provider_editor();
+        app.provider_editor.as_mut().unwrap().pane = ProviderPane::Models;
+
+        app.new_provider_item();
+        let editor = app.provider_editor.as_ref().unwrap();
+        assert_eq!(editor.draft.providers[0].models.len(), 3);
+        assert!(editor.field_editor.is_some());
+
+        app.provider_editor
+            .as_mut()
+            .unwrap()
+            .field_editor
+            .as_mut()
+            .unwrap()
+            .input
+            .replace("custom-model");
+        app.commit_provider_field();
+
+        assert_eq!(
+            app.provider_editor.as_ref().unwrap().draft.providers[0].models[2].id,
+            "custom-model"
+        );
+        assert_eq!(
+            app.providers.providers[0].models.len(),
+            2,
+            "editing remains isolated until save"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_switch_persists_and_updates_agent_status_without_touching_transcript() {
+        let root = std::env::temp_dir().join(format!(
+            "zex-model-switch-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let mut app = configured_app();
+        let original_transcript = app.transcript.clone();
+        let active = app.providers.active_model.clone().unwrap();
+        let mut agent = registry_agent(&app.providers, &active);
+        let target = ModelRef {
+            provider_id: "openai".to_owned(),
+            model_id: "gpt-4.1-mini".to_owned(),
+        };
+
+        super::switch_model(&mut agent, &mut app, &root, None, target.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(agent.model(), target.key());
+        assert_eq!(app.model, target.key());
+        assert_eq!(app.transcript, original_transcript);
+        let config = tokio::fs::read_to_string(root.join(".zex/config.toml"))
+            .await
+            .unwrap();
+        assert!(config.contains("provider_id = \"openai\""));
+        assert!(config.contains("model_id = \"gpt-4.1-mini\""));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_save_refreshes_runtime_registry_and_model_picker_catalog() {
+        let root = std::env::temp_dir().join(format!(
+            "zex-provider-save-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let mut app = configured_app();
+        let active = app.providers.active_model.clone().unwrap();
+        let registry =
+            crate::provider::ProviderRegistry::new(&app.providers, Duration::from_secs(1)).unwrap();
+        let mut agent = crate::agent::Agent::new(
+            registry.clone(),
+            crate::tools::ToolRegistry::new(Duration::from_secs(1), 32_000),
+            tokio::sync::mpsc::unbounded_channel().0,
+            crate::agent::AgentOptions {
+                model: active.key(),
+                turn_timeout: Duration::from_secs(1),
+                max_turns: 1,
+                max_context_chars: 120_000,
+                compact_keep_turns: 6,
+                thinking_level: ThinkingLevel::High,
+            },
+            None,
+        );
+        app.open_provider_editor();
+        let mut draft = app.providers.clone();
+        draft.providers[0].models.push(ModelConfig {
+            id: "new-model".to_owned(),
+            display_name: "New Model".to_owned(),
+            supports_thinking: true,
+            default_thinking_level: Some(ThinkingLevel::Medium),
+        });
+
+        super::save_provider_changes(&mut agent, &mut app, &root, &registry, draft)
+            .await
+            .unwrap();
+        app.open_model_picker();
+
+        assert!(
+            app.model_picker
+                .as_ref()
+                .unwrap()
+                .choices
+                .iter()
+                .any(|choice| choice.target.model_id == "new-model" && choice.supports_thinking)
+        );
+        let config = tokio::fs::read_to_string(root.join(".zex/config.toml"))
+            .await
+            .unwrap();
+        assert!(config.contains("id = \"new-model\""));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_save_remaps_the_active_target_when_ids_are_renamed() {
+        let root = std::env::temp_dir().join(format!(
+            "zex-provider-rename-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let mut app = configured_app();
+        let active = app.providers.active_model.clone().unwrap();
+        let registry =
+            crate::provider::ProviderRegistry::new(&app.providers, Duration::from_secs(1)).unwrap();
+        let mut agent = crate::agent::Agent::new(
+            registry.clone(),
+            crate::tools::ToolRegistry::new(Duration::from_secs(1), 32_000),
+            tokio::sync::mpsc::unbounded_channel().0,
+            crate::agent::AgentOptions {
+                model: active.key(),
+                turn_timeout: Duration::from_secs(1),
+                max_turns: 1,
+                max_context_chars: 120_000,
+                compact_keep_turns: 6,
+                thinking_level: ThinkingLevel::High,
+            },
+            None,
+        );
+        app.open_provider_editor();
+        app.provider_editor.as_mut().unwrap().draft.providers[0].id = "renamed".to_owned();
+        app.provider_editor.as_mut().unwrap().draft.providers[0].models[0].id =
+            "renamed-model".to_owned();
+        app.provider_editor.as_mut().unwrap().draft.active_model = Some(ModelRef {
+            provider_id: "openai".to_owned(),
+            model_id: "gpt-5".to_owned(),
+        });
+        let draft = app.provider_editor.as_ref().unwrap().draft.clone();
+
+        super::save_provider_changes(&mut agent, &mut app, &root, &registry, draft)
+            .await
+            .unwrap();
+
+        assert_eq!(agent.model(), "renamed/renamed-model");
+        assert_eq!(
+            app.providers.active_model.as_ref().unwrap().key(),
+            "renamed/renamed-model"
+        );
+        let config = tokio::fs::read_to_string(root.join(".zex/config.toml"))
+            .await
+            .unwrap();
+        assert!(config.contains("provider_id = \"renamed\""));
+        assert!(config.contains("model_id = \"renamed-model\""));
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[test]
@@ -3400,6 +4992,7 @@ mod tests {
                 max_context_chars: 120_000,
                 default_tool_timeout: Duration::from_secs(60),
                 show_thinking: false,
+                providers: ProviderCatalog::default(),
             },
         );
 
@@ -4302,6 +5895,7 @@ mod tests {
                 max_context_chars: 120_000,
                 default_tool_timeout: Duration::from_secs(60),
                 show_thinking: true,
+                providers: ProviderCatalog::default(),
             },
         );
         app.transcript.push(TranscriptEntry::Message {
@@ -4461,6 +6055,7 @@ mod tests {
                 max_context_chars: 120_000,
                 default_tool_timeout: Duration::from_secs(60),
                 show_thinking: true,
+                providers: ProviderCatalog::default(),
             },
         );
         app.apply_agent_event(AgentEvent::MessageDelta {

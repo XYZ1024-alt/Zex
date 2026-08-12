@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::provider::{OpenAiApi, ThinkingLevel};
 
@@ -19,13 +19,199 @@ const DEFAULT_MAX_CONTEXT_CHARS: usize = 120_000;
 const DEFAULT_COMPACT_KEEP_TURNS: usize = 6;
 const PROJECT_CONFIG_PATH: &str = ".zex/config.toml";
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRef {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+impl ModelRef {
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.provider_id, self.model_id)
+    }
+
+    pub fn from_key(value: &str) -> Option<Self> {
+        let (provider_id, model_id) = value.split_once('/')?;
+        (!provider_id.is_empty() && !model_id.is_empty()).then(|| Self {
+            provider_id: provider_id.to_owned(),
+            model_id: model_id.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretValue(String);
+
+impl SecretValue {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.trim().is_empty()
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub supports_thinking: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<ThinkingLevel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    pub id: String,
+    pub display_name: String,
+    pub base_url: String,
+    pub api_key: SecretValue,
+    #[serde(default)]
+    pub openai_api: OpenAiApi,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCatalog {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<ModelRef>,
+    #[serde(default)]
+    pub providers: Vec<ProviderConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub target: ModelRef,
+    pub provider_name: String,
+    pub model_name: String,
+    pub supports_thinking: bool,
+    pub default_thinking_level: Option<ThinkingLevel>,
+}
+
+impl ProviderCatalog {
+    pub fn choices(&self) -> Vec<ModelChoice> {
+        self.providers
+            .iter()
+            .flat_map(|provider| {
+                provider.models.iter().map(|model| ModelChoice {
+                    target: ModelRef {
+                        provider_id: provider.id.clone(),
+                        model_id: model.id.clone(),
+                    },
+                    provider_name: provider.display_name.clone(),
+                    model_name: model.display_name.clone(),
+                    supports_thinking: model.supports_thinking,
+                    default_thinking_level: model.default_thinking_level,
+                })
+            })
+            .collect()
+    }
+
+    pub fn provider(&self, provider_id: &str) -> Option<&ProviderConfig> {
+        self.providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+    }
+
+    pub fn model(&self, target: &ModelRef) -> Option<(&ProviderConfig, &ModelConfig)> {
+        let provider = self.provider(&target.provider_id)?;
+        let model = provider
+            .models
+            .iter()
+            .find(|model| model.id == target.model_id)?;
+        Some((provider, model))
+    }
+
+    pub fn contains(&self, target: &ModelRef) -> bool {
+        self.model(target).is_some()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let mut provider_ids = std::collections::BTreeSet::new();
+        for provider in &self.providers {
+            if provider.id.trim().is_empty() {
+                bail!("provider ID must not be empty");
+            }
+            if provider.id.contains('/') {
+                bail!("provider ID {:?} must not contain '/'", provider.id);
+            }
+            if provider.display_name.trim().is_empty() {
+                bail!("provider display name must not be empty");
+            }
+            if provider.base_url.trim().is_empty() {
+                bail!("provider base URL must not be empty");
+            }
+            if provider.api_key.is_empty() {
+                bail!("provider {} API key must not be empty", provider.id);
+            }
+            if !provider_ids.insert(provider.id.as_str()) {
+                bail!("provider ID {:?} is duplicated", provider.id);
+            }
+
+            let mut model_ids = std::collections::BTreeSet::new();
+            for model in &provider.models {
+                if model.id.trim().is_empty() {
+                    bail!("model ID must not be empty for provider {}", provider.id);
+                }
+                if model.display_name.trim().is_empty() {
+                    bail!(
+                        "model display name must not be empty for {}/{}",
+                        provider.id,
+                        model.id
+                    );
+                }
+                if !model_ids.insert(model.id.as_str()) {
+                    bail!(
+                        "model ID {:?} is duplicated for provider {}",
+                        model.id,
+                        provider.id
+                    );
+                }
+                if !model.supports_thinking && model.default_thinking_level.is_some() {
+                    bail!(
+                        "model {}/{} cannot define a thinking level when thinking is disabled",
+                        provider.id,
+                        model.id
+                    );
+                }
+            }
+        }
+
+        if let Some(active_model) = &self.active_model
+            && !self.contains(active_model)
+        {
+            bail!("active model {} is not configured", active_model.key());
+        }
+        Ok(())
+    }
+
+    pub fn has_ready_model(&self) -> bool {
+        self.active_model
+            .as_ref()
+            .is_some_and(|active| self.contains(active))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub api_key: String,
-    pub base_url: String,
-    pub model: String,
-    pub openai_api: OpenAiApi,
+    pub providers: ProviderCatalog,
+    pub active_model: Option<ModelRef>,
     pub working_dir: PathBuf,
+    pub configured: bool,
     pub tool_timeout: Duration,
     pub agent_timeout: Duration,
     pub max_turns: usize,
@@ -56,29 +242,55 @@ impl Config {
         let project = read_config_file(&project_path).await?;
         let file = global.merge(project);
 
-        let api_key = preferred_env("ZEX_API_KEY", "OPENAI_API_KEY")
-            .or_else(|| non_empty_file_value(file.api_key))
-            .context("set ZEX_API_KEY or OPENAI_API_KEY, or add api_key to a Zex config file")?;
-        let model = preferred_env("ZEX_MODEL", "OPENAI_MODEL")
-            .or_else(|| non_empty_file_value(file.model))
-            .context("set ZEX_MODEL or OPENAI_MODEL, or add model to a Zex config file")?;
-        let base_url = preferred_env("ZEX_BASE_URL", "OPENAI_BASE_URL")
-            .or_else(|| non_empty_file_value(file.base_url))
+        let legacy_api_key = preferred_env("ZEX_API_KEY", "OPENAI_API_KEY")
+            .or_else(|| non_empty_file_value(file.api_key.clone()));
+        let legacy_model = preferred_env("ZEX_MODEL", "OPENAI_MODEL")
+            .or_else(|| non_empty_file_value(file.model.clone()));
+        let legacy_base_url = preferred_env("ZEX_BASE_URL", "OPENAI_BASE_URL")
+            .or_else(|| non_empty_file_value(file.base_url.clone()))
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
-        let openai_api = env::var("ZEX_OPENAI_API")
+        let legacy_openai_api = env::var("ZEX_OPENAI_API")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.parse())
             .transpose()?
             .or(file.openai_api)
             .unwrap_or(OpenAiApi::ChatCompletions);
+        let mut providers = ProviderCatalog {
+            active_model: file.active_model,
+            providers: file.providers,
+        };
+        if providers.providers.is_empty()
+            && let (Some(api_key), Some(model)) = (legacy_api_key, legacy_model)
+        {
+            let supports_thinking = legacy_model_supports_thinking(&model);
+            providers.providers.push(ProviderConfig {
+                id: "default".to_owned(),
+                display_name: "Default".to_owned(),
+                base_url: legacy_base_url,
+                api_key: SecretValue::new(api_key),
+                openai_api: legacy_openai_api,
+                models: vec![ModelConfig {
+                    display_name: model.clone(),
+                    id: model.clone(),
+                    supports_thinking,
+                    default_thinking_level: supports_thinking.then_some(ThinkingLevel::default()),
+                }],
+            });
+            providers.active_model = Some(ModelRef {
+                provider_id: "default".to_owned(),
+                model_id: model,
+            });
+        }
+        providers.validate()?;
+        let active_model = providers.active_model.clone();
+        let configured = providers.has_ready_model();
 
         Ok(Self {
-            api_key,
-            base_url,
-            model,
-            openai_api,
+            providers,
+            active_model,
             working_dir: working_dir.to_path_buf(),
+            configured,
             tool_timeout: Duration::from_secs(positive_u64(
                 "tool_timeout_seconds",
                 env_or_file(
@@ -150,6 +362,9 @@ struct FileConfig {
     model: Option<String>,
     base_url: Option<String>,
     openai_api: Option<OpenAiApi>,
+    active_model: Option<ModelRef>,
+    #[serde(default)]
+    providers: Vec<ProviderConfig>,
     max_turns: Option<usize>,
     tool_timeout_seconds: Option<u64>,
     agent_timeout_seconds: Option<u64>,
@@ -168,6 +383,12 @@ impl FileConfig {
             model: project.model.or(self.model),
             base_url: project.base_url.or(self.base_url),
             openai_api: project.openai_api.or(self.openai_api),
+            active_model: project.active_model.or(self.active_model),
+            providers: if project.providers.is_empty() {
+                self.providers
+            } else {
+                project.providers
+            },
             max_turns: project.max_turns.or(self.max_turns),
             tool_timeout_seconds: project.tool_timeout_seconds.or(self.tool_timeout_seconds),
             agent_timeout_seconds: project.agent_timeout_seconds.or(self.agent_timeout_seconds),
@@ -181,9 +402,68 @@ impl FileConfig {
     }
 }
 
+pub async fn persist_active_model(working_dir: &Path, active_model: &ModelRef) -> Result<()> {
+    update_project_config(working_dir, |table| {
+        table.insert(
+            "active_model".to_owned(),
+            toml::Value::try_from(active_model).expect("ModelRef is TOML serializable"),
+        );
+    })
+    .await
+}
+
+pub async fn persist_provider_catalog(working_dir: &Path, catalog: &ProviderCatalog) -> Result<()> {
+    catalog.validate()?;
+    update_project_config(working_dir, |table| {
+        table.insert(
+            "providers".to_owned(),
+            toml::Value::try_from(&catalog.providers).expect("providers are TOML serializable"),
+        );
+        match &catalog.active_model {
+            Some(active_model) => {
+                table.insert(
+                    "active_model".to_owned(),
+                    toml::Value::try_from(active_model).expect("ModelRef is TOML serializable"),
+                );
+            }
+            None => {
+                table.remove("active_model");
+            }
+        }
+        table.remove("api_key");
+        table.remove("base_url");
+        table.remove("model");
+        table.remove("openai_api");
+    })
+    .await
+}
+
 pub async fn persist_thinking_level(
     working_dir: &Path,
     thinking_level: ThinkingLevel,
+) -> Result<()> {
+    update_project_config(working_dir, |table| {
+        table.insert(
+            "thinking_level".to_owned(),
+            toml::Value::String(thinking_level.to_string()),
+        );
+    })
+    .await
+}
+
+pub async fn persist_show_thinking(working_dir: &Path, show_thinking: bool) -> Result<()> {
+    update_project_config(working_dir, |table| {
+        table.insert(
+            "show_thinking".to_owned(),
+            toml::Value::Boolean(show_thinking),
+        );
+    })
+    .await
+}
+
+async fn update_project_config(
+    working_dir: &Path,
+    update: impl FnOnce(&mut toml::Table),
 ) -> Result<()> {
     let path = working_dir.join(PROJECT_CONFIG_PATH);
     let content = match tokio::fs::read_to_string(&path).await {
@@ -200,10 +480,7 @@ pub async fn persist_thinking_level(
         toml::from_str::<toml::Table>(&content)
             .with_context(|| format!("failed to parse config file {}", path.display()))?
     };
-    table.insert(
-        "thinking_level".to_owned(),
-        toml::Value::String(thinking_level.to_string()),
-    );
+    update(&mut table);
     let serialized =
         toml::to_string_pretty(&table).context("failed to serialize project config")?;
     if let Some(parent) = path.parent() {
@@ -211,41 +488,35 @@ pub async fn persist_thinking_level(
             .await
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    tokio::fs::write(&path, serialized)
+    let temporary_path = path.with_extension("toml.tmp");
+    tokio::fs::write(&temporary_path, serialized)
         .await
-        .with_context(|| format!("failed to write config file {}", path.display()))
+        .with_context(|| format!("failed to write config file {}", temporary_path.display()))?;
+    match tokio::fs::rename(&temporary_path, &path).await {
+        Ok(()) => Ok(()),
+        Err(_error) if cfg!(windows) && path.exists() => {
+            tokio::fs::remove_file(&path)
+                .await
+                .with_context(|| format!("failed to replace config file {}", path.display()))?;
+            tokio::fs::rename(&temporary_path, &path)
+                .await
+                .with_context(|| format!("failed to replace config file {}", path.display()))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to replace config file {}", path.display()))
+        }
+    }
 }
 
-pub async fn persist_show_thinking(working_dir: &Path, show_thinking: bool) -> Result<()> {
-    let path = working_dir.join(PROJECT_CONFIG_PATH);
-    let content = match tokio::fs::read_to_string(&path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read config file {}", path.display()));
-        }
-    };
-    let mut table = if content.trim().is_empty() {
-        toml::Table::new()
-    } else {
-        toml::from_str::<toml::Table>(&content)
-            .with_context(|| format!("failed to parse config file {}", path.display()))?
-    };
-    table.insert(
-        "show_thinking".to_owned(),
-        toml::Value::Boolean(show_thinking),
-    );
-    let serialized =
-        toml::to_string_pretty(&table).context("failed to serialize project config")?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    tokio::fs::write(&path, serialized)
-        .await
-        .with_context(|| format!("failed to write config file {}", path.display()))
+fn legacy_model_supports_thinking(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.contains("reasoner")
+        || model.contains("thinking")
+        || model.contains("claude")
 }
 
 fn global_config_dir() -> Result<PathBuf> {
@@ -440,7 +711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_config_overrides_global_and_environment_overrides_both() {
+    async fn provider_catalog_overrides_legacy_values_and_environment_overrides_runtime_settings() {
         let _environment = EnvGuard::clear();
         let root = temp_directory("config");
         let project = root.join("project");
@@ -458,7 +729,20 @@ max_turns = 4
         write_config(
             &project.join(".zex/config.toml"),
             r#"
-model = "project-model"
+active_model = { provider_id = "project", model_id = "project-model" }
+
+[[providers]]
+id = "project"
+display_name = "Project"
+base_url = "https://project.example/v1"
+api_key = "project-secret"
+openai_api = "responses"
+
+[[providers.models]]
+id = "project-model"
+display_name = "Project Model"
+supports_thinking = true
+
 max_turns = 8
 "#,
         )
@@ -470,9 +754,11 @@ max_turns = 8
 
         let config = Config::load_from(&project, &global).await.unwrap();
 
-        assert_eq!(config.api_key, "environment-secret");
-        assert_eq!(config.model, "project-model");
-        assert_eq!(config.base_url, "https://global.example/v1");
+        let active = config.active_model.as_ref().unwrap();
+        let (provider, model) = config.providers.model(active).unwrap();
+        assert_eq!(provider.api_key.expose(), "project-secret");
+        assert_eq!(model.id, "project-model");
+        assert_eq!(provider.base_url, "https://project.example/v1");
         assert_eq!(config.max_turns, 10);
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
@@ -519,6 +805,52 @@ show_thinking = false
             .await
             .unwrap();
         assert!(content.contains("show_thinking = true"));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persists_provider_catalog_and_active_model_without_legacy_fields() {
+        let _environment = EnvGuard::clear();
+        let root = temp_directory("provider-catalog");
+        let project = root.join("project");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        write_config(
+            &project.join(".zex/config.toml"),
+            "model = \"legacy\"\napi_key = \"legacy-secret\"\n",
+        )
+        .await;
+        let active_model = super::ModelRef {
+            provider_id: "openai".to_owned(),
+            model_id: "gpt-5".to_owned(),
+        };
+        let catalog = super::ProviderCatalog {
+            active_model: Some(active_model.clone()),
+            providers: vec![super::ProviderConfig {
+                id: "openai".to_owned(),
+                display_name: "OpenAI".to_owned(),
+                base_url: "https://api.openai.com/v1".to_owned(),
+                api_key: super::SecretValue::new("secret".to_owned()),
+                openai_api: crate::provider::OpenAiApi::Responses,
+                models: vec![super::ModelConfig {
+                    id: "gpt-5".to_owned(),
+                    display_name: "GPT-5".to_owned(),
+                    supports_thinking: true,
+                    default_thinking_level: Some(crate::provider::ThinkingLevel::High),
+                }],
+            }],
+        };
+
+        super::persist_provider_catalog(&project, &catalog)
+            .await
+            .unwrap();
+        let content = tokio::fs::read_to_string(project.join(".zex/config.toml"))
+            .await
+            .unwrap();
+
+        assert!(content.contains("[[providers]]"));
+        assert!(content.contains("provider_id = \"openai\""));
+        assert!(!content.contains("model = \"legacy\""));
+        assert!(!content.contains("api_key = \"legacy-secret\""));
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 

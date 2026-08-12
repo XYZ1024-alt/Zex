@@ -24,8 +24,12 @@ where
     P: Provider,
 {
     match parse(&prompt)? {
-        Some(crate::command::SlashCommand::Thinking(_)) => {
-            bail!("/thinking is available only in the TUI")
+        Some(
+            crate::command::SlashCommand::Thinking(_)
+            | crate::command::SlashCommand::Model
+            | crate::command::SlashCommand::Provider,
+        ) => {
+            bail!("this command is available only in the TUI")
         }
         Some(command) => {
             let result = execute(command, agent, session_store, session_id, working_dir).await?;
@@ -71,8 +75,12 @@ where
         }
 
         match parse(input) {
-            Ok(Some(crate::command::SlashCommand::Thinking(_))) => {
-                eprintln!("Zex command error: /thinking is available only in the TUI");
+            Ok(Some(
+                crate::command::SlashCommand::Thinking(_)
+                | crate::command::SlashCommand::Model
+                | crate::command::SlashCommand::Provider,
+            )) => {
+                eprintln!("Zex command error: this command is available only in the TUI");
             }
             Ok(Some(command)) => {
                 match execute(command, agent, session_store, session_id, working_dir).await {
