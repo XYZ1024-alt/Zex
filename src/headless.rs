@@ -8,9 +8,9 @@ use tokio::sync::mpsc;
 
 use crate::{
     agent::{Agent, AgentEvent, MessageRole},
-    command::{CommandEffect, execute, parse},
+    command::{CommandEffect, CommandOutput, command_specs, execute, parse},
     provider::Provider,
-    session::SessionStore,
+    session::{SessionStore, format_session_summaries},
 };
 
 pub async fn run_prompt<P>(
@@ -29,7 +29,7 @@ where
             if result.effect == CommandEffect::ReplaceView {
                 println!("[context] {} chars", agent.context_chars());
             }
-            println!("{}", result.message);
+            print_command_output(&result.output)?;
             Ok(())
         }
         None => agent.prompt(prompt).await.map(|_| ()),
@@ -74,7 +74,7 @@ where
                         if result.effect == CommandEffect::ReplaceView {
                             println!("[context] {} chars", agent.context_chars());
                         }
-                        println!("{}", result.message);
+                        print_command_output(&result.output)?;
                     }
                     Err(error) => eprintln!("Zex command error: {error:#}"),
                 }
@@ -88,6 +88,24 @@ where
         }
     }
 
+    Ok(())
+}
+
+fn print_command_output(output: &CommandOutput) -> Result<()> {
+    match output {
+        CommandOutput::Help => {
+            let usage_width = command_specs()
+                .iter()
+                .map(|command| command.usage.len())
+                .max()
+                .unwrap_or(0);
+            for command in command_specs() {
+                println!("{:<usage_width$}  {}", command.usage, command.description);
+            }
+        }
+        CommandOutput::Sessions(sessions) => println!("{}", format_session_summaries(sessions)?),
+        CommandOutput::Text(message) => println!("{message}"),
+    }
     Ok(())
 }
 

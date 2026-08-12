@@ -22,7 +22,7 @@ pub struct LoadedSession {
     pub messages: Vec<Message>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
     pub id: String,
     pub updated_at: OffsetDateTime,
@@ -219,10 +219,7 @@ pub fn format_session_summaries(sessions: &[SessionSummary]) -> Result<String> {
         return Ok("No saved sessions.".to_owned());
     }
 
-    let mut output = format!(
-        "{:<28}  {:<25}  {:>8}  Preview\n",
-        "ID", "Updated", "Messages"
-    );
+    let mut records = Vec::with_capacity(sessions.len());
     let local_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
     for session in sessions {
         let updated_at = session
@@ -230,12 +227,12 @@ pub fn format_session_summaries(sessions: &[SessionSummary]) -> Result<String> {
             .to_offset(local_offset)
             .format(&Rfc3339)
             .context("failed to format session timestamp")?;
-        output.push_str(&format!(
-            "{:<28}  {:<25}  {:>8}  {}\n",
-            session.id, updated_at, session.message_count, session.preview
+        records.push(format!(
+            "{}\n  Updated: {updated_at} · Messages: {}\n  {}",
+            session.id, session.message_count, session.preview
         ));
     }
-    Ok(output.trim_end().to_owned())
+    Ok(records.join("\n\n"))
 }
 
 fn validate_session_id(id: &str) -> Result<&str> {
@@ -360,7 +357,7 @@ mod tests {
 
     use crate::agent::Message;
 
-    use super::SessionStore;
+    use super::{SessionStore, SessionSummary, format_session_summaries};
 
     fn temp_directory(label: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -486,5 +483,29 @@ mod tests {
 
         assert_eq!(loaded.id, older);
         tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[test]
+    fn session_summary_formatter_uses_record_blocks_instead_of_fixed_columns() {
+        let output = format_session_summaries(&[
+            SessionSummary {
+                id: "session-one".to_owned(),
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                message_count: 2,
+                preview: "first task".to_owned(),
+            },
+            SessionSummary {
+                id: "session-two".to_owned(),
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                message_count: 1,
+                preview: "second task".to_owned(),
+            },
+        ])
+        .unwrap();
+
+        assert!(output.contains("session-one\n  Updated:"));
+        assert!(output.contains("Messages: 2\n  first task"));
+        assert!(output.contains("\n\nsession-two\n  Updated:"));
+        assert!(!output.contains("ID                          Updated"));
     }
 }

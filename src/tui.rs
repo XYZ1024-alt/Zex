@@ -30,7 +30,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     agent::{Agent, AgentEvent, Message, MessageRole, PromptOutcome},
-    command::{CommandEffect, CommandSpec, command_specs, execute, parse},
+    command::{CommandEffect, CommandOutput, CommandSpec, command_specs, execute, parse},
     provider::{Provider, ThinkingLevel},
     session::SessionStore,
 };
@@ -41,7 +41,6 @@ const MAX_TOOL_DETAIL_CHARS: usize = 4_000;
 const MAX_TOOL_ARGUMENT_CHARS: usize = 2_000;
 const MAX_INPUT_ROWS: u16 = 6;
 const MIN_TRANSCRIPT_HEIGHT: u16 = 3;
-const MAX_COMPLETION_ROWS: u16 = 7;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 
 pub fn is_available() -> bool {
@@ -158,7 +157,7 @@ where
                                                     app.replace_transcript(agent.messages());
                                                 }
                                             }
-                                            app.transcript.push(TranscriptEntry::Notice(result.message));
+                                            app.push_command_output(result.output);
                                             app.scroll_to_bottom();
                                         }
                                         Err(error) => app.record_error(format!("{error:#}")),
@@ -583,6 +582,8 @@ enum TranscriptEntry {
     Tool(ToolEntry),
     Error(String),
     Notice(String),
+    Help,
+    Sessions(Vec<crate::session::SessionSummary>),
 }
 
 #[derive(Debug, Default)]
@@ -954,6 +955,14 @@ impl App {
         self.record_error(message);
     }
 
+    fn push_command_output(&mut self, output: CommandOutput) {
+        self.transcript.push(match output {
+            CommandOutput::Help => TranscriptEntry::Help,
+            CommandOutput::Sessions(sessions) => TranscriptEntry::Sessions(sessions),
+            CommandOutput::Text(message) => TranscriptEntry::Notice(message),
+        });
+    }
+
     fn scroll_page_up(&mut self) {
         self.follow_output = false;
         self.scroll_top = self
@@ -1302,10 +1311,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
 fn completion_height(app: &App) -> u16 {
     if app.completion_open() {
-        (app.completion_matches()
-            .len()
-            .min(MAX_COMPLETION_ROWS.saturating_sub(2) as usize) as u16)
-            + 2
+        app.completion_matches().len() as u16 + 2
     } else {
         0
     }
@@ -1322,23 +1328,37 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .enumerate()
         .map(|(index, command)| {
             let selected = index == app.completion.selected;
-            Line::from(vec![
-                Span::styled(
-                    if selected { " › " } else { "   " },
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(
-                    format!("{:<14}", command.name),
-                    Style::default()
-                        .fg(if selected { Color::White } else { Color::Gray })
-                        .add_modifier(if selected {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(command.description, Style::default().fg(Color::DarkGray)),
-            ])
+            let marker = if selected { " › " } else { "   " };
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let available = inner_width.saturating_sub(marker.len());
+            let usage_width = matches
+                .iter()
+                .map(|command| command.usage.len())
+                .max()
+                .unwrap_or(0);
+            let wide = available >= usage_width + 2 + 18;
+            let command_style = Style::default()
+                .fg(if selected { Color::White } else { Color::Gray })
+                .add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                });
+            if wide {
+                Line::from(vec![
+                    Span::styled(marker, Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("{:<usage_width$}", command.usage), command_style),
+                    Span::raw("  "),
+                    Span::styled(command.description, Style::default().fg(Color::DarkGray)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(marker, Style::default().fg(Color::Cyan)),
+                    Span::styled(command.usage, command_style),
+                    Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(command.description, Style::default().fg(Color::DarkGray)),
+                ])
+            }
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -1348,7 +1368,8 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray)),
             )
-            .style(Style::default().bg(Color::Rgb(24, 28, 33))),
+            .style(Style::default().bg(Color::Rgb(24, 28, 33)))
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -1386,30 +1407,129 @@ fn transcript_text(app: &App) -> Text<'static> {
                 app.selected_tool.as_deref() == Some(tool.call_id.as_str()),
             ),
             TranscriptEntry::Error(message) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        " ERROR ",
-                        Style::default()
-                            .fg(Color::White)
-                            .bg(Color::Red)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(single_line(message, 320), Style::default().fg(Color::Red)),
-                ]));
+                append_labeled_text(
+                    &mut lines,
+                    " ERROR ",
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                    message,
+                    Style::default().fg(Color::Red),
+                );
                 lines.push(Line::default());
             }
             TranscriptEntry::Notice(message) => {
-                lines.push(Line::from(vec![
-                    Span::styled("  info · ", Style::default().fg(Color::Yellow)),
-                    Span::styled(message.clone(), Style::default().fg(Color::Gray)),
-                ]));
+                append_labeled_text(
+                    &mut lines,
+                    "  info · ",
+                    Style::default().fg(Color::Yellow),
+                    message,
+                    Style::default().fg(Color::Gray),
+                );
+                lines.push(Line::default());
+            }
+            TranscriptEntry::Help => {
+                append_help_lines(&mut lines);
+                lines.push(Line::default());
+            }
+            TranscriptEntry::Sessions(sessions) => {
+                append_session_lines(&mut lines, sessions);
                 lines.push(Line::default());
             }
         }
     }
 
     Text::from(lines)
+}
+
+fn append_labeled_text(
+    lines: &mut Vec<Line<'static>>,
+    label: &'static str,
+    label_style: Style,
+    content: &str,
+    content_style: Style,
+) {
+    for (index, source_line) in content.lines().enumerate() {
+        if index == 0 {
+            lines.push(Line::from(vec![
+                Span::styled(label, label_style),
+                Span::styled(source_line.to_owned(), content_style),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("{}{}", " ".repeat(label.chars().count()), source_line),
+                content_style,
+            )));
+        }
+    }
+    if content.is_empty() {
+        lines.push(Line::from(Span::styled(label, label_style)));
+    }
+}
+
+fn append_help_lines(lines: &mut Vec<Line<'static>>) {
+    let usage_width = command_specs()
+        .iter()
+        .map(|command| command.usage.len())
+        .max()
+        .unwrap_or(0);
+    lines.push(Line::from(Span::styled(
+        "  Slash commands",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for command in command_specs() {
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("{:<usage_width$}", command.usage),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(command.description, Style::default().fg(Color::Gray)),
+        ]));
+    }
+}
+
+fn append_session_lines(
+    lines: &mut Vec<Line<'static>>,
+    sessions: &[crate::session::SessionSummary],
+) {
+    if sessions.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  info · ", Style::default().fg(Color::Yellow)),
+            Span::styled("No saved sessions.", Style::default().fg(Color::Gray)),
+        ]));
+        return;
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!("  Saved sessions ({})", sessions.len()),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for session in sessions {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", session.id),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "    {} message{} · {}",
+                session.message_count,
+                if session.message_count == 1 { "" } else { "s" },
+                session.preview
+            ),
+            Style::default().fg(Color::Gray),
+        )));
+    }
 }
 
 fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: MessageRole) {
@@ -1847,8 +1967,9 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
-        App, AppContext, InputAction, InputBuffer, KeyBurst, Status, ToolStatus, TranscriptEntry,
-        handle_key_event, handle_terminal_event, input_metrics, render, truncate_chars,
+        App, AppContext, CommandOutput, InputAction, InputBuffer, KeyBurst, Status, ToolStatus,
+        TranscriptEntry, command_specs, handle_key_event, handle_terminal_event, input_metrics,
+        render, truncate_chars,
     };
     use crate::agent::{AgentEvent, MessageRole};
     use crate::provider::ThinkingLevel;
@@ -2288,7 +2409,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_command_notices_render_readably_without_user_messages() {
+    fn help_renders_one_registered_command_per_row_on_wide_terminals() {
         let mut app = App::new(
             &[],
             "gpt-test".to_owned(),
@@ -2301,19 +2422,138 @@ mod tests {
                 default_tool_timeout: Duration::from_secs(60),
             },
         );
-        app.transcript.push(TranscriptEntry::Notice(
-            "/help\n/model\n/clear\n/sessions\n/resume [id]\n/compact".to_owned(),
-        ));
-        let backend = TestBackend::new(100, 20);
+        app.push_command_output(CommandOutput::Help);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        for command in command_specs() {
+            assert!(
+                screen.lines().any(|row| {
+                    let command_column = row.find('/').unwrap_or(usize::MAX);
+                    let description_column = row.find(command.description).unwrap_or(0);
+                    row.contains(command.usage)
+                        && description_column > command_column
+                        && command_specs()
+                            .iter()
+                            .filter(|candidate| {
+                                row.get(command_column..)
+                                    .is_some_and(|content| content.starts_with(candidate.usage))
+                            })
+                            .max_by_key(|candidate| candidate.usage.len())
+                            == Some(command)
+                }),
+                "missing row for {}\nscreen:\n{screen}",
+                command.usage
+            );
+        }
+        assert!(!screen.contains("you"));
+    }
+
+    #[test]
+    fn help_wraps_without_merging_adjacent_commands_on_narrow_terminals() {
+        let mut app = app();
+        app.push_command_output(CommandOutput::Help);
+        let backend = TestBackend::new(38, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        let rows = screen.lines().collect::<Vec<_>>();
+
+        for command in command_specs() {
+            assert!(
+                rows.iter().any(|row| row.contains(command.usage)),
+                "missing {} in narrow help",
+                command.usage
+            );
+        }
+        assert!(
+            !rows.iter().any(|row| {
+                command_specs()
+                    .iter()
+                    .filter(|command| row.trim_start().starts_with(command.usage))
+                    .count()
+                    > 1
+            }),
+            "multiple commands merged onto one row"
+        );
+    }
+
+    #[test]
+    fn completion_uses_the_registered_usage_and_description() {
+        let mut app = app();
+        app.input.insert_str("/");
+        app.refresh_completion();
+        let backend = TestBackend::new(120, 56);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
 
-        assert!(screen.contains("info ·"));
-        assert!(screen.contains("/help"));
-        assert!(screen.contains("/compact"));
-        assert!(!screen.contains("you"));
+        for command in command_specs() {
+            assert!(
+                screen.contains(command.usage),
+                "missing {}\nscreen:\n{screen}",
+                command.usage
+            );
+            assert!(
+                screen.contains(command.description),
+                "missing description for {}",
+                command.usage
+            );
+        }
+    }
+
+    #[test]
+    fn session_records_and_multiline_feedback_keep_explicit_boundaries() {
+        let mut app = app();
+        app.push_command_output(CommandOutput::Sessions(vec![
+            crate::session::SessionSummary {
+                id: "20260812-120000-deadbeef".to_owned(),
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                message_count: 2,
+                preview: "first task".to_owned(),
+            },
+            crate::session::SessionSummary {
+                id: "20260812-121500-cafebabe".to_owned(),
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                message_count: 1,
+                preview: "second task with a narrow layout".to_owned(),
+            },
+        ]));
+        app.transcript.push(TranscriptEntry::Notice(
+            "First status line\nSecond status line".to_owned(),
+        ));
+        app.record_error("First error line\nSecond error line".to_owned());
+        let backend = TestBackend::new(38, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        let rows = screen.lines().collect::<Vec<_>>();
+
+        for value in [
+            "20260812-120000-deadbeef",
+            "20260812-121500-cafebabe",
+            "first task",
+            "second task",
+            "First status line",
+            "Second status line",
+            "First error line",
+            "Second error line",
+        ] {
+            assert!(screen.contains(value), "missing {value}");
+        }
+        assert!(
+            !rows.iter().any(|row| {
+                row.contains("20260812-120000-deadbeef") && row.contains("20260812-121500-cafebabe")
+            }),
+            "session records merged"
+        );
+        assert_eq!(screen.matches("info ·").count(), 1);
+        assert_eq!(screen.matches("ERROR").count(), 1);
     }
 
     #[test]
