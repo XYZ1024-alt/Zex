@@ -19,14 +19,14 @@ use futures_util::StreamExt;
 use ratatui::{
     DefaultTerminal, Frame, TerminalOptions, Viewport,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     agent::{Agent, AgentEvent, Message, MessageRole, PromptOutcome},
@@ -43,13 +43,12 @@ const MAX_TOOL_DETAIL_CHARS: usize = 4_000;
 const MAX_TOOL_ARGUMENT_CHARS: usize = 2_000;
 const MAX_INPUT_HISTORY: usize = 100;
 const MAX_INPUT_ROWS: u16 = 6;
-const MIN_TRANSCRIPT_HEIGHT: u16 = 3;
-const MAX_FEED_WIDTH: u16 = 140;
-const FEED_HORIZONTAL_GUTTER: u16 = 2;
+const MIN_TRANSCRIPT_HEIGHT: u16 = 2;
+const HORIZONTAL_GUTTER: u16 = 1;
+const INPUT_PROMPT: &str = "› ";
 const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 
-const BACKGROUND: Color = Color::Rgb(13, 15, 18);
 const SURFACE: Color = Color::Rgb(20, 23, 28);
 const SURFACE_RAISED: Color = Color::Rgb(27, 31, 37);
 const TEXT: Color = Color::Rgb(207, 213, 220);
@@ -1402,33 +1401,32 @@ fn git_output(working_dir: &Path, arguments: &[&str]) -> Option<String> {
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
-    frame.render_widget(
-        Block::default().style(Style::default().bg(BACKGROUND)),
-        frame.area(),
-    );
-    let input_height = input_height(&app.input, frame.area().width);
-    let completion_height = completion_height(app);
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(MIN_TRANSCRIPT_HEIGHT),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(completion_height),
-            Constraint::Length(input_height),
-        ])
-        .split(frame.area());
+    frame.render_widget(Clear, frame.area());
+    let regions = ui_regions(frame.area(), app);
 
-    render_transcript(frame, areas[0], app);
-    render_status(frame, areas[1], app);
-    render_keymap(frame, areas[2], app);
-    render_completion(frame, areas[3], app);
-    render_input(frame, areas[4], app);
-    render_help_overlay(frame, app);
+    render_transcript(frame, regions.transcript, app);
+    render_completion(frame, regions.completion, app);
+    render_status(frame, regions.status, app);
+    render_keymap(frame, regions.keymap, app);
+    render_input(frame, regions.input, app);
+    render_help_overlay(frame, regions.transcript, app);
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let content = centered_feed_area(area);
+    if area.is_empty() {
+        return;
+    }
+    let footer = content_area(area);
+    let rail_color = if app.busy {
+        ACCENT
+    } else {
+        status_rail_color(app.status)
+    };
+    let content = render_footer_rails(frame, footer, rail_color);
+    let content = horizontal_inset(content, 1);
+    if content.is_empty() {
+        return;
+    }
     let context_percent = app
         .context_chars
         .saturating_mul(100)
@@ -1441,74 +1439,194 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
     let location = match &app.git_status {
         Some(git) => format!(
-            "{} · {}@{}",
-            short_path(&app.working_dir, 24),
-            single_line(&git.branch, 16),
+            "{}  {}@{}",
+            short_path(&app.working_dir, 32),
+            single_line(&git.branch, 18),
             git.commit
         ),
-        None => short_path(&app.working_dir, 36),
+        None => short_path(&app.working_dir, 48),
     };
-    let spans = vec![
-        Span::styled(" ", Style::default()),
-        Span::styled(app.status.symbol(), Style::default().fg(app.status.color())),
-        Span::styled(
-            format!(" {} ", app.status.label()),
-            Style::default().fg(app.status.color()),
-        ),
-        Span::styled("· ", Style::default().fg(MUTED)),
-        Span::styled(
-            single_line(&app.model, 34),
-            Style::default()
-                .fg(TEXT_STRONG)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  think ", Style::default().fg(DIM)),
-        Span::styled(thinking, Style::default().fg(TEXT)),
-        Span::styled("  ctx ", Style::default().fg(DIM)),
-        Span::styled(format!("{context_percent}%"), Style::default().fg(TEXT)),
-        Span::styled("  ", Style::default()),
-        Span::styled(location, Style::default().fg(DIM)),
-    ];
-    let compact_spans = vec![
-        Span::styled(" ", Style::default()),
-        Span::styled(app.status.symbol(), Style::default().fg(app.status.color())),
-        Span::styled(
-            format!(" {} ", app.status.label()),
-            Style::default().fg(app.status.color()),
-        ),
-        Span::styled("· ", Style::default().fg(MUTED)),
-        Span::styled(
-            single_line(&app.model, 22),
-            Style::default()
-                .fg(TEXT_STRONG)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  think ", Style::default().fg(DIM)),
-        Span::styled(
-            app.thinking_level
-                .map_or_else(|| "n/a".to_owned(), |level| level.to_string()),
-            Style::default().fg(TEXT),
-        ),
-        Span::styled("  ", Style::default()),
-        Span::styled(short_path(&app.working_dir, 20), Style::default().fg(DIM)),
-    ];
-    let line = Line::from(spans);
-    let line = if line.width() <= content.width as usize {
-        line
+
+    let right_text = if content.width >= 18 {
+        format!("ctx {context_percent}%")
     } else {
-        Line::from(compact_spans)
+        format!("{context_percent}%")
     };
-    frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(SURFACE)),
-        content,
+    let right_width = UnicodeWidthStr::width(right_text.as_str()).min(content.width as usize);
+    let gap = usize::from(content.width as usize > right_width + 1);
+    let left_width = content
+        .width
+        .saturating_sub(right_width as u16)
+        .saturating_sub(gap as u16);
+    let left = Rect::new(content.x, content.y, left_width, content.height);
+    let right = Rect::new(
+        content.right().saturating_sub(right_width as u16),
+        content.y,
+        right_width as u16,
+        content.height,
     );
+
+    let model_limit = if left_width >= 80 {
+        32
+    } else if left_width >= 52 {
+        24
+    } else {
+        14
+    };
+    let mut spans = vec![
+        Span::styled(
+            "ZEX",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(app.status.symbol(), Style::default().fg(app.status.color())),
+        Span::styled(
+            format!(" {}", app.status.label()),
+            Style::default().fg(app.status.color()),
+        ),
+        Span::styled("  ·  ", Style::default().fg(MUTED)),
+        Span::styled(
+            single_line(&app.model, model_limit),
+            Style::default().fg(TEXT_STRONG),
+        ),
+    ];
+    if left_width >= 42 {
+        spans.extend([
+            Span::styled("  ·  think ", Style::default().fg(DIM)),
+            Span::styled(thinking, Style::default().fg(TEXT)),
+        ]);
+    }
+    if left_width >= 76 {
+        spans.extend([
+            Span::styled("  ·  ", Style::default().fg(MUTED)),
+            Span::styled(location, Style::default().fg(DIM)),
+        ]);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), left);
+    if right.width > 0 {
+        frame.render_widget(
+            Paragraph::new(if content.width >= 18 {
+                Line::from(vec![
+                    Span::styled("ctx ", Style::default().fg(DIM)),
+                    Span::styled(
+                        format!("{context_percent}%"),
+                        Style::default().fg(TEXT_STRONG),
+                    ),
+                ])
+            } else {
+                Line::from(Span::styled(
+                    format!("{context_percent}%"),
+                    Style::default().fg(TEXT_STRONG),
+                ))
+            })
+            .alignment(Alignment::Right),
+            right,
+        );
+    } else if content.width > 0 {
+        frame.render_widget(
+            Paragraph::new(right_text)
+                .style(Style::default().fg(TEXT_STRONG))
+                .alignment(Alignment::Right),
+            content,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UiRegions {
+    transcript: Rect,
+    completion: Rect,
+    status: Rect,
+    keymap: Rect,
+    input: Rect,
+}
+
+fn ui_regions(area: Rect, app: &App) -> UiRegions {
+    let desired_input = input_height(&app.input, area.width);
+    let input_height = desired_input
+        .min(area.height.saturating_sub(2).max(1))
+        .min(area.height);
+    let status_height = u16::from(area.height > input_height);
+    let keymap_height = u16::from(area.height > input_height + status_height);
+    let fixed_height = input_height + status_height + keymap_height;
+    let remaining = area.height.saturating_sub(fixed_height);
+    let transcript_reserve = MIN_TRANSCRIPT_HEIGHT.min(remaining);
+    let completion_height =
+        completion_height(app).min(remaining.saturating_sub(transcript_reserve));
+    let transcript_height = remaining.saturating_sub(completion_height);
+
+    let transcript = Rect::new(area.x, area.y, area.width, transcript_height);
+    let completion = Rect::new(area.x, transcript.bottom(), area.width, completion_height);
+    let status = Rect::new(area.x, completion.bottom(), area.width, status_height);
+    let keymap = Rect::new(area.x, status.bottom(), area.width, keymap_height);
+    let input = Rect::new(area.x, keymap.bottom(), area.width, input_height);
+
+    debug_assert_eq!(input.bottom(), area.bottom());
+    debug_assert!(
+        transcript.height + completion.height + status.height + keymap.height + input.height
+            == area.height
+    );
+
+    UiRegions {
+        transcript,
+        completion,
+        status,
+        keymap,
+        input,
+    }
+}
+
+fn render_footer_rails(frame: &mut Frame<'_>, area: Rect, color: Color) -> Rect {
+    if area.width < 2 || area.height == 0 {
+        return area;
+    }
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::LEFT | Borders::RIGHT)
+            .border_type(BorderType::Thick)
+            .border_style(Style::default().fg(color)),
+        area,
+    );
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
+    )
+}
+
+fn horizontal_inset(area: Rect, amount: u16) -> Rect {
+    if area.width <= amount.saturating_mul(2) {
+        Rect::new(area.x, area.y, 0, area.height)
+    } else {
+        Rect::new(
+            area.x + amount,
+            area.y,
+            area.width - amount.saturating_mul(2),
+            area.height,
+        )
+    }
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let area = centered_feed_area(area);
+    if area.is_empty() {
+        app.transcript_page_height = 0;
+        app.max_scroll = 0;
+        app.scroll_top = 0;
+        return;
+    }
+    let area = content_area(area);
+    if app.transcript.is_empty() {
+        app.transcript_page_height = area.height as usize;
+        app.max_scroll = 0;
+        app.scroll_top = 0;
+        render_empty_state(frame, area);
+        return;
+    }
+
     let text = transcript_text(app);
     let paragraph = Paragraph::new(text)
-        .style(Style::default().fg(TEXT).bg(BACKGROUND))
+        .style(Style::default().fg(TEXT))
         .wrap(Wrap { trim: false });
     let line_count = paragraph.line_count(area.width.max(1));
     app.transcript_page_height = area.height as usize;
@@ -1534,15 +1652,42 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let width = indicator.chars().count().min(area.width as usize) as u16;
         let x = area.right().saturating_sub(width);
         frame.render_widget(
-            Paragraph::new(indicator).style(Style::default().fg(DIM).bg(BACKGROUND)),
+            Paragraph::new(indicator).style(Style::default().fg(DIM)),
             Rect::new(x, area.y, width, 1),
         );
     }
 }
 
+fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+    let height = area.height.min(2);
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let empty_area = Rect::new(area.x, y, area.width, height);
+    let mut lines = vec![Line::from(Span::styled(
+        "Zex",
+        Style::default()
+            .fg(TEXT_STRONG)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if height > 1 {
+        lines.push(Line::from(Span::styled(
+            "Ask anything, or type / for commands",
+            Style::default().fg(DIM),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        empty_area,
+    );
+}
+
 fn completion_height(app: &App) -> u16 {
     if app.completion_open() {
-        app.completion_matches().len() as u16 + 1
+        app.completion_matches().len() as u16 + 2
     } else {
         0
     }
@@ -1552,44 +1697,64 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.height == 0 {
         return;
     }
-    let area = centered_feed_area(area);
+    let area = content_area(area);
+    if area.is_empty() {
+        return;
+    }
     let matches = app.completion_matches();
+    let inner_width = area.width.saturating_sub(4) as usize;
+    let usage_width = matches
+        .iter()
+        .map(|command| UnicodeWidthStr::width(command.usage))
+        .max()
+        .unwrap_or(0);
     let lines = matches
         .iter()
-        .take(area.height.saturating_sub(1) as usize)
+        .take(area.height.saturating_sub(2) as usize)
         .enumerate()
         .map(|(index, command)| {
             let selected = index == app.completion.selected;
-            let marker = if selected { "› " } else { "  " };
-            let inner_width = area.width.saturating_sub(4) as usize;
-            let available = inner_width.saturating_sub(marker.len());
-            let usage_width = matches
-                .iter()
-                .map(|command| command.usage.len())
-                .max()
-                .unwrap_or(0);
+            let marker = if selected { "›" } else { " " };
+            let available = inner_width.saturating_sub(2);
             let wide = available >= usage_width + 2 + 18;
             let command_style = Style::default()
-                .fg(if selected { TEXT_STRONG } else { TEXT })
+                .fg(if selected { Color::Black } else { TEXT })
+                .bg(if selected { ACCENT } else { SURFACE_RAISED })
                 .add_modifier(if selected {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
                 });
+            let marker_style = Style::default()
+                .fg(if selected { Color::Black } else { MUTED })
+                .bg(if selected { ACCENT } else { SURFACE_RAISED });
+            let description_style = Style::default()
+                .fg(if selected { Color::Black } else { DIM })
+                .bg(if selected { ACCENT } else { SURFACE_RAISED });
             if wide {
                 Line::from(vec![
-                    Span::styled(marker, Style::default().fg(ACCENT)),
-                    Span::styled(format!("{:<usage_width$}", command.usage), command_style),
+                    Span::styled(format!("{marker} "), marker_style),
+                    Span::styled(pad_display(command.usage, usage_width), command_style),
                     Span::raw("  "),
-                    Span::styled(command.description, Style::default().fg(DIM)),
+                    Span::styled(command.description, description_style),
                 ])
+                .style(if selected {
+                    Style::default().bg(ACCENT)
+                } else {
+                    Style::default().bg(SURFACE_RAISED)
+                })
             } else {
                 Line::from(vec![
-                    Span::styled(marker, Style::default().fg(ACCENT)),
+                    Span::styled(format!("{marker} "), marker_style),
                     Span::styled(command.usage, command_style),
-                    Span::styled(" · ", Style::default().fg(MUTED)),
-                    Span::styled(command.description, Style::default().fg(DIM)),
+                    Span::styled(" · ", description_style),
+                    Span::styled(command.description, description_style),
                 ])
+                .style(if selected {
+                    Style::default().bg(ACCENT)
+                } else {
+                    Style::default().bg(SURFACE_RAISED)
+                })
             }
         })
         .collect::<Vec<_>>();
@@ -1597,9 +1762,9 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(Style::default().fg(MUTED))
-                    .padding(ratatui::widgets::Padding::horizontal(2)),
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT))
+                    .padding(ratatui::widgets::Padding::horizontal(1)),
             )
             .style(Style::default().bg(SURFACE_RAISED))
             .wrap(Wrap { trim: false }),
@@ -1609,34 +1774,14 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn transcript_text(app: &App) -> Text<'static> {
     let mut lines = Vec::new();
-    if app.transcript.is_empty() {
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "  What would you like to build?",
-            Style::default()
-                .fg(TEXT_STRONG)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  Type a task, or / to browse commands.",
-            Style::default().fg(DIM),
-        )));
-        return Text::from(lines);
-    }
-
     for entry in &app.transcript {
         match entry {
             TranscriptEntry::Message { role, content } => {
-                match role {
-                    MessageRole::User => {
-                        lines.push(Line::from(vec![
-                            Span::styled("  you", Style::default().fg(DIM)),
-                            Span::styled("  ›", Style::default().fg(ACCENT)),
-                        ]));
-                    }
-                    MessageRole::Assistant => {
-                        lines.push(Line::from(Span::styled("  zex", Style::default().fg(DIM))));
-                    }
+                if *role == MessageRole::User {
+                    lines.push(Line::from(Span::styled(
+                        "›",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )));
                 }
                 append_markdown_lines(&mut lines, content, *role);
                 lines.push(Line::default());
@@ -1688,18 +1833,18 @@ fn transcript_text(app: &App) -> Text<'static> {
     Text::from(lines)
 }
 
-fn render_help_overlay(frame: &mut Frame<'_>, app: &App) {
-    if !app.help_open {
+fn render_help_overlay(frame: &mut Frame<'_>, viewport: Rect, app: &App) {
+    if !app.help_open || viewport.is_empty() {
         return;
     }
 
-    let viewport = centered_feed_area(frame.area());
-    let width = viewport.width.min(76).max(1);
+    let viewport = content_area(viewport);
+    let width = viewport.width.clamp(1, 76);
     let desired_height = command_specs().len() as u16 + 4;
     let height = viewport.height.min(desired_height).max(1);
     let area = Rect::new(
-        viewport.x + viewport.width.saturating_sub(width) / 2,
-        viewport.y + viewport.height.saturating_sub(height) / 2,
+        viewport.x,
+        viewport.bottom().saturating_sub(height),
         width,
         height,
     );
@@ -1712,7 +1857,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(MUTED))
+                    .border_style(Style::default().fg(ACCENT))
                     .style(Style::default().bg(SURFACE_RAISED))
                     .padding(ratatui::widgets::Padding::horizontal(1)),
             )
@@ -1796,8 +1941,8 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
         MessageRole::Assistant => TEXT,
     };
     let content_prefix = match role {
-        MessageRole::User => "    ",
-        MessageRole::Assistant => "  ",
+        MessageRole::User => "  ",
+        MessageRole::Assistant => "",
     };
     let mut in_code_block = false;
 
@@ -1807,30 +1952,42 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
             in_code_block = !in_code_block;
             let language = trimmed.trim_start_matches('`').trim();
             if in_code_block {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{content_prefix}┌"), Style::default().fg(MUTED)),
-                    Span::styled(
-                        if language.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {language}")
-                        },
-                        Style::default().fg(DIM),
-                    ),
-                ]));
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{content_prefix}▌ "),
+                            Style::default().fg(ACCENT).bg(SURFACE),
+                        ),
+                        Span::styled(
+                            if language.is_empty() {
+                                "code".to_owned()
+                            } else {
+                                language.to_owned()
+                            },
+                            Style::default().fg(DIM).bg(SURFACE),
+                        ),
+                    ])
+                    .style(Style::default().bg(SURFACE)),
+                );
             } else {
-                lines.push(Line::from(Span::styled(
-                    format!("{content_prefix}└"),
-                    Style::default().fg(MUTED),
-                )));
+                lines.push(Line::default());
             }
             continue;
         }
         if in_code_block {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{content_prefix}│ "), Style::default().fg(MUTED)),
-                Span::styled(source_line.to_owned(), Style::default().fg(TEXT_STRONG)),
-            ]));
+            lines.push(
+                Line::from(vec![
+                    Span::styled(
+                        format!("{content_prefix}▌ "),
+                        Style::default().fg(ACCENT).bg(SURFACE),
+                    ),
+                    Span::styled(
+                        source_line.to_owned(),
+                        Style::default().fg(TEXT_STRONG).bg(SURFACE),
+                    ),
+                ])
+                .style(Style::default().bg(SURFACE)),
+            );
             continue;
         }
         if let Some(heading) = trimmed.strip_prefix("### ") {
@@ -1881,67 +2038,99 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
 }
 
 fn append_tool_lines(lines: &mut Vec<Line<'static>>, tool: &ToolEntry, selected: bool) {
-    let marker = if selected { "› " } else { "  " };
+    let marker = if selected { "›" } else { " " };
     let fold = if tool.expanded { "▾" } else { "▸" };
     let title = tool_title(tool);
     let elapsed = tool_elapsed(tool);
-    let rail_color = if selected { ACCENT } else { MUTED };
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("  {marker}{fold} "),
-            Style::default().fg(rail_color),
-        ),
-        Span::styled(title, Style::default().fg(TEXT_STRONG)),
-        Span::raw("  "),
-        Span::styled(
-            format!("{} {}", tool.status.symbol(), tool.status.label()),
-            Style::default().fg(tool.status.color()),
-        ),
-        Span::styled(
-            format!("  {}", format_duration(elapsed)),
-            Style::default().fg(DIM),
-        ),
-    ]));
+    let card_style = Style::default().bg(SURFACE);
+    let rail_color = if selected {
+        ACCENT
+    } else {
+        Color::Rgb(55, 65, 74)
+    };
+    lines.push(
+        Line::from(vec![
+            Span::styled(
+                format!("{marker} {fold} "),
+                Style::default().fg(rail_color).bg(SURFACE),
+            ),
+            Span::styled(title, Style::default().fg(TEXT_STRONG).bg(SURFACE)),
+            Span::styled("  ", card_style),
+            Span::styled(
+                format!("{} {}", tool.status.symbol(), tool.status.label()),
+                Style::default().fg(tool.status.color()).bg(SURFACE),
+            ),
+            Span::styled(
+                format!("  {}", format_duration(elapsed)),
+                Style::default().fg(DIM).bg(SURFACE),
+            ),
+        ])
+        .style(card_style),
+    );
 
     if !tool.expanded {
-        lines.push(Line::from(Span::styled(
-            format!("      {}", tool_summary(tool)),
-            Style::default().fg(DIM),
-        )));
+        lines.push(
+            Line::from(vec![
+                Span::styled("  │  ", Style::default().fg(rail_color).bg(SURFACE)),
+                Span::styled(tool_summary(tool), Style::default().fg(DIM).bg(SURFACE)),
+            ])
+            .style(card_style),
+        );
     }
 
     if tool.expanded {
-        lines.push(Line::from(Span::styled(
-            "      input",
-            Style::default().fg(DIM),
-        )));
+        lines.push(
+            Line::from(vec![
+                Span::styled("  │  ", Style::default().fg(rail_color).bg(SURFACE)),
+                Span::styled("input", Style::default().fg(DIM).bg(SURFACE)),
+            ])
+            .style(card_style),
+        );
         for line in tool.arguments.split('\n') {
-            lines.push(Line::from(vec![
-                Span::styled("      │ ", Style::default().fg(MUTED)),
-                Span::styled(line.to_owned(), Style::default().fg(TEXT)),
-            ]));
+            lines.push(
+                Line::from(vec![
+                    Span::styled("  │    ", Style::default().fg(rail_color).bg(SURFACE)),
+                    Span::styled(line.to_owned(), Style::default().fg(TEXT).bg(SURFACE)),
+                ])
+                .style(card_style),
+            );
         }
-        lines.push(Line::from(Span::styled(
-            "      output",
-            Style::default().fg(DIM),
-        )));
+        lines.push(
+            Line::from(vec![
+                Span::styled("  │  ", Style::default().fg(rail_color).bg(SURFACE)),
+                Span::styled("output", Style::default().fg(DIM).bg(SURFACE)),
+            ])
+            .style(card_style),
+        );
         if tool.output.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "      │ waiting for result…",
-                Style::default().fg(DIM),
-            )));
+            lines.push(
+                Line::from(vec![
+                    Span::styled("  │    ", Style::default().fg(rail_color).bg(SURFACE)),
+                    Span::styled("waiting for result…", Style::default().fg(DIM).bg(SURFACE)),
+                ])
+                .style(card_style),
+            );
         } else {
             for line in tool.output.split('\n') {
-                lines.push(Line::from(vec![
-                    Span::styled("      │ ", Style::default().fg(MUTED)),
-                    Span::styled(line.to_owned(), Style::default().fg(TEXT)),
-                ]));
+                lines.push(
+                    Line::from(vec![
+                        Span::styled("  │    ", Style::default().fg(rail_color).bg(SURFACE)),
+                        Span::styled(line.to_owned(), Style::default().fg(TEXT).bg(SURFACE)),
+                    ])
+                    .style(card_style),
+                );
             }
         }
-        lines.push(Line::from(Span::styled(
-            format!("      timeout {}", format_duration(tool.timeout)),
-            Style::default().fg(DIM),
-        )));
+        lines.push(
+            Line::from(vec![
+                Span::styled("  └  ", Style::default().fg(rail_color).bg(SURFACE)),
+                Span::styled(
+                    format!("timeout {}", format_duration(tool.timeout)),
+                    Style::default().fg(DIM).bg(SURFACE),
+                ),
+            ])
+            .style(card_style),
+        );
     }
     lines.push(Line::default());
 }
@@ -2016,93 +2205,132 @@ fn bash_output_summary(output: &str) -> Option<String> {
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let area = centered_feed_area(area);
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(if app.busy { MUTED } else { ACCENT }))
-        .padding(ratatui::widgets::Padding::horizontal(1));
-    let inner_width = area.width.saturating_sub(2).max(1) as usize;
-    let visible_rows = area.height.saturating_sub(1).max(1) as usize;
+    if area.is_empty() {
+        return;
+    }
+    let footer = content_area(area);
+    let rail_color = if app.busy {
+        ACCENT
+    } else {
+        status_rail_color(app.status)
+    };
+    let input_area = horizontal_inset(render_footer_rails(frame, footer, rail_color), 1);
+    if input_area.is_empty() {
+        return;
+    }
 
     if app.busy {
+        let busy_text = match app.status {
+            Status::Thinking => "Agent is thinking",
+            Status::RunningTool => "Agent is working",
+            Status::Cancelling => "Stopping agent",
+            Status::Error => "Agent stopped with an error",
+            Status::Idle => "Agent is working",
+        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("  ", Style::default()),
                 Span::styled("◌ ", Style::default().fg(ACCENT)),
-                Span::styled("Agent is working", Style::default().fg(TEXT)),
+                Span::styled(busy_text, Style::default().fg(TEXT)),
                 Span::styled(" · Ctrl+C to stop", Style::default().fg(DIM)),
             ]))
-            .block(block)
-            .style(Style::default().bg(SURFACE)),
-            area,
+            .wrap(Wrap { trim: false }),
+            input_area,
         );
         return;
     }
 
-    let metrics = input_metrics(&app.input.content, app.input.cursor, inner_width);
+    let prompt_width = UnicodeWidthStr::width(INPUT_PROMPT).min(input_area.width as usize) as u16;
+    let prompt_area = Rect::new(input_area.x, input_area.y, prompt_width, input_area.height);
+    let editor_area = Rect::new(
+        prompt_area.right(),
+        input_area.y,
+        input_area.width.saturating_sub(prompt_width),
+        input_area.height,
+    );
+    if editor_area.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(INPUT_PROMPT, Style::default().fg(ACCENT))),
+            input_area,
+        );
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(INPUT_PROMPT, Style::default().fg(ACCENT))),
+        prompt_area,
+    );
+
+    let editor_width = editor_area.width.max(1) as usize;
+    let visible_rows = editor_area.height.max(1) as usize;
+    let metrics = input_metrics(&app.input.content, app.input.cursor, editor_width);
     let vertical_scroll = metrics.cursor_row.saturating_sub(visible_rows - 1);
-    let content = if app.input.is_empty() {
-        Text::from(Line::from(vec![
-            Span::styled("› ", Style::default().fg(ACCENT)),
-            Span::styled("Ask Zex…", Style::default().fg(DIM)),
-        ]))
+    let editor = if app.input.is_empty() {
+        Text::from(Line::from(Span::styled(
+            "Ask Zex...",
+            Style::default().fg(DIM),
+        )))
     } else {
-        Text::from(Line::from(vec![
-            Span::styled("› ", Style::default().fg(ACCENT)),
-            Span::styled(app.input.content.clone(), Style::default().fg(TEXT_STRONG)),
-        ]))
+        Text::from(Line::from(Span::styled(
+            app.input.content.clone(),
+            Style::default().fg(TEXT_STRONG),
+        )))
     };
     frame.render_widget(
-        Paragraph::new(content)
-            .block(block)
-            .style(Style::default().bg(SURFACE))
+        Paragraph::new(editor)
             .wrap(Wrap { trim: false })
             .scroll((vertical_scroll.min(u16::MAX as usize) as u16, 0)),
-        area,
+        editor_area,
     );
 
     let cursor_y = metrics.cursor_row.saturating_sub(vertical_scroll) as u16;
     frame.set_cursor_position((
-        area.x
-            + 1
-            + if metrics.cursor_row == 0 { 2 } else { 0 }
-            + metrics.cursor_column.min(inner_width - 1) as u16,
-        area.y + 1 + cursor_y.min(area.height.saturating_sub(2)),
+        editor_area.x + metrics.cursor_column.min(editor_width - 1) as u16,
+        editor_area.y + cursor_y.min(editor_area.height.saturating_sub(1)),
     ));
 }
 
+fn status_rail_color(status: Status) -> Color {
+    match status {
+        Status::Idle => Color::Rgb(76, 128, 145),
+        Status::Thinking | Status::RunningTool | Status::Cancelling => ACCENT,
+        Status::Error => ERROR,
+    }
+}
+
 fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let area = centered_feed_area(area);
+    if area.is_empty() {
+        return;
+    }
+    let area = horizontal_inset(content_area(area), 2);
+    if area.is_empty() {
+        return;
+    }
     let hint = if let Some(toast) = &app.toast {
         Line::from(vec![
-            Span::styled("  ", Style::default()),
             Span::styled("● ", Style::default().fg(toast.color())),
             Span::styled(toast.message.clone(), Style::default().fg(TEXT)),
         ])
     } else if app.completion_open() {
         Line::from(Span::styled(
-            "  ↑↓ select · Tab complete · Enter run · Esc close",
+            "↑↓ select · Tab complete · Enter run · Esc close",
             Style::default().fg(DIM),
         ))
     } else if app.busy {
-        let text = if area.width >= 92 {
-            "  Ctrl+C stop · PgUp/PgDn scroll · Tab tool · Ctrl+O details"
+        let text = if area.width >= 72 {
+            "Ctrl+C stop · PgUp/PgDn scroll · Ctrl+O tool details"
         } else {
-            "  Ctrl+C stop · PgUp/PgDn scroll · Ctrl+O details"
+            "Ctrl+C stop · PgUp/PgDn scroll"
         };
         Line::from(Span::styled(text, Style::default().fg(DIM)))
     } else {
-        let text = if area.width >= 110 {
-            "  Enter send · Shift/Alt+Enter newline · ↑↓ history · / commands · Ctrl+T think · Ctrl+O tool"
+        let text = if area.width >= 92 {
+            "Enter send · Shift+Enter newline · ↑↓ history · / commands"
         } else {
-            "  Enter send · ↑↓ history · / commands · Ctrl+T think · Ctrl+O tool"
+            "Enter send · ↑↓ history · / commands"
         };
         Line::from(Span::styled(text, Style::default().fg(DIM)))
     };
-    frame.render_widget(
-        Paragraph::new(hint).style(Style::default().bg(BACKGROUND)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(hint), area);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2148,12 +2376,12 @@ fn wrapped_position(input: &str, width: usize) -> (usize, usize) {
 }
 
 fn input_height(input: &InputBuffer, terminal_width: u16) -> u16 {
-    let feed_width = usable_feed_width(terminal_width);
-    let inner_width = feed_width.saturating_sub(2).max(1) as usize;
+    let content_width = content_area(Rect::new(0, 0, terminal_width, 1)).width;
+    let inner_width = content_width.saturating_sub(6).max(1) as usize;
     let rows = input_metrics(&input.content, input.cursor, inner_width)
         .total_rows
         .min(MAX_INPUT_ROWS as usize) as u16;
-    rows + 1
+    rows.max(1)
 }
 
 fn format_json(value: &str) -> String {
@@ -2194,21 +2422,22 @@ fn short_path(path: &Path, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
-fn centered_feed_area(area: Rect) -> Rect {
-    let width = usable_feed_width(area.width);
+fn content_area(area: Rect) -> Rect {
+    let gutter = HORIZONTAL_GUTTER.min(area.width / 2);
     Rect::new(
-        area.x + (area.width - width) / 2,
+        area.x + gutter,
         area.y,
-        width,
+        area.width.saturating_sub(gutter.saturating_mul(2)),
         area.height,
     )
 }
 
-fn usable_feed_width(terminal_width: u16) -> u16 {
-    terminal_width
-        .saturating_sub(FEED_HORIZONTAL_GUTTER.saturating_mul(2))
-        .min(MAX_FEED_WIDTH)
-        .max(1)
+fn pad_display(value: &str, width: usize) -> String {
+    let value_width = UnicodeWidthStr::width(value);
+    let mut padded = String::with_capacity(value.len() + width.saturating_sub(value_width));
+    padded.push_str(value);
+    padded.extend(std::iter::repeat_n(' ', width.saturating_sub(value_width)));
+    padded
 }
 
 fn numbered_list_item(line: &str) -> Option<(&str, &str)> {
@@ -2307,9 +2536,9 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
-        App, AppContext, CommandOutput, InputAction, InputBuffer, KeyBurst, SCROLL_STEP, Status,
-        ToolStatus, TranscriptEntry, command_specs, handle_key_event, handle_terminal_event,
-        input_metrics, render, truncate_chars,
+        ACCENT, App, AppContext, CommandOutput, InputAction, InputBuffer, KeyBurst, SCROLL_STEP,
+        SURFACE, SURFACE_RAISED, Status, ToolStatus, TranscriptEntry, UiRegions, command_specs,
+        handle_key_event, handle_terminal_event, input_metrics, render, truncate_chars, ui_regions,
     };
     use crate::agent::{AgentEvent, MessageRole};
     use crate::provider::ThinkingLevel;
@@ -2336,6 +2565,269 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    fn style_at(terminal: &Terminal<TestBackend>, x: u16, y: u16) -> ratatui::style::Style {
+        terminal.backend().buffer()[(x, y)].style()
+    }
+
+    fn assert_regions_fill(area: ratatui::layout::Rect, regions: UiRegions) {
+        assert_eq!(regions.transcript.y, area.y);
+        assert_eq!(regions.completion.y, regions.transcript.bottom());
+        assert_eq!(regions.status.y, regions.completion.bottom());
+        assert_eq!(regions.keymap.y, regions.status.bottom());
+        assert_eq!(regions.input.y, regions.keymap.bottom());
+        assert_eq!(regions.input.bottom(), area.bottom());
+    }
+
+    #[test]
+    fn empty_state_uses_native_background_and_full_width_footer_rails() {
+        let mut app = app();
+        app.working_dir = PathBuf::from("D:/workspaces/zex");
+        app.git_status = Some(super::GitStatus {
+            branch: "main".to_owned(),
+            commit: "a1b2c3d".to_owned(),
+        });
+        app.thinking_level = Some(ThinkingLevel::High);
+        app.context_chars = 30_000;
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 100, 24), &app);
+
+        assert!(screen.contains("Zex"));
+        assert!(screen.contains("Ask anything, or type / for commands"));
+        assert!(screen.contains("ZEX"));
+        assert!(screen.contains("Ask Zex..."));
+        assert!(screen.contains("Enter send"));
+        assert!(screen.contains("think high"));
+        assert!(screen.contains("main@a1b2c3d"));
+        assert!(screen.contains("ctx 25%"));
+        assert_ne!(style_at(&terminal, 0, 0).bg, Some(SURFACE));
+        assert_ne!(style_at(&terminal, 0, 0).bg, Some(SURFACE_RAISED));
+        assert_eq!(
+            style_at(&terminal, 1, regions.status.y).fg,
+            Some(super::status_rail_color(Status::Idle))
+        );
+        assert_eq!(
+            style_at(&terminal, 98, regions.input.y).fg,
+            Some(super::status_rail_color(Status::Idle))
+        );
+        assert_regions_fill(ratatui::layout::Rect::new(0, 0, 100, 24), regions);
+    }
+
+    #[test]
+    fn empty_input_cursor_starts_on_the_placeholder_not_before_it() {
+        let mut app = app();
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let input = ui_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app).input;
+
+        terminal.backend_mut().assert_cursor_position((5, input.y));
+        assert_eq!(
+            terminal.backend().buffer()[(5, input.y)].symbol(),
+            "A",
+            "the cursor must overlay the first placeholder character"
+        );
+    }
+
+    #[test]
+    fn typed_input_replaces_the_placeholder_at_the_same_cursor_origin() {
+        let mut app = app();
+        app.input.insert_str("hello");
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        let input = ui_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app).input;
+
+        assert!(screen.contains("› hello"));
+        assert!(!screen.contains("Ask Zex..."));
+        terminal.backend_mut().assert_cursor_position((10, input.y));
+    }
+
+    #[test]
+    fn layout_remains_edge_aligned_across_terminal_sizes() {
+        for (width, height) in [(120, 32), (70, 18), (38, 12), (16, 6), (6, 3)] {
+            let mut app = app();
+            app.input
+                .insert_str("first line\nsecond line that wraps on narrow terminals");
+            app.refresh_completion();
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let area = ratatui::layout::Rect::new(0, 0, width, height);
+            let regions = ui_regions(area, &app);
+            assert_regions_fill(area, regions);
+            assert!(regions.input.height >= 1);
+            assert!(regions.input.height <= height);
+            assert_ne!(style_at(&terminal, 0, 0).bg, Some(SURFACE));
+            assert_ne!(style_at(&terminal, 0, 0).bg, Some(SURFACE_RAISED));
+        }
+    }
+
+    #[test]
+    fn tool_and_code_surfaces_do_not_color_the_transcript_background() {
+        let mut app = app();
+        app.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::Assistant,
+            delta: "Answer\n```rust\nfn main() {}\n```".to_owned(),
+        });
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-surface".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"cargo check"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        app.apply_agent_event(AgentEvent::ToolEnd {
+            call_id: "call-surface".to_owned(),
+            name: "bash".to_owned(),
+            output: "Finished".to_owned(),
+            is_error: false,
+            elapsed: Duration::from_millis(24),
+        });
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut saw_surface = false;
+        let mut saw_native_background = false;
+        for cell in buffer.content() {
+            saw_surface |= cell.style().bg == Some(SURFACE);
+            saw_native_background |= !matches!(cell.style().bg, Some(SURFACE | SURFACE_RAISED));
+        }
+
+        assert!(saw_surface);
+        assert!(saw_native_background);
+        assert!(format!("{}", terminal.backend()).contains("fn main() {}"));
+        assert!(format!("{}", terminal.backend()).contains("$ cargo check"));
+    }
+
+    #[test]
+    fn narrow_status_truncates_without_wrapping_or_losing_core_fields() {
+        let mut app = app();
+        app.model = "provider/very-long-model-name-that-cannot-fit".to_owned();
+        app.working_dir =
+            PathBuf::from("D:/very/long/workspace/path/that/should/not/wrap/across/the/footer");
+        app.git_status = Some(super::GitStatus {
+            branch: "feature/very-long-branch-name".to_owned(),
+            commit: "deadbee".to_owned(),
+        });
+        app.thinking_level = Some(ThinkingLevel::Medium);
+        app.context_chars = 60_000;
+        let backend = TestBackend::new(38, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        let status_rows = screen
+            .lines()
+            .filter(|row| row.contains("ZEX") || row.contains("ready"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(status_rows.len(), 1);
+        assert!(status_rows[0].contains("ZEX"));
+        assert!(status_rows[0].contains("ready"));
+        assert!(status_rows[0].contains("50%"));
+        assert!(!screen.contains("feature/very-long-branch-name"));
+    }
+
+    #[test]
+    fn ready_thinking_and_running_states_are_clear_in_the_footer() {
+        let mut app = app();
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let ready = format!("{}", terminal.backend());
+        assert!(ready.contains("ready"));
+        assert!(ready.contains("Ask Zex..."));
+
+        app.start_turn();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let thinking = format!("{}", terminal.backend());
+        assert!(thinking.contains("thinking"));
+        assert!(thinking.contains("Agent is thinking"));
+        assert!(thinking.contains("Ctrl+C to stop"));
+
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-running".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let running = format!("{}", terminal.backend());
+        assert!(running.contains("working"));
+        assert!(running.contains("Agent is working"));
+        assert_eq!(running.matches("Agent is working").count(), 1);
+    }
+
+    #[test]
+    fn multiline_input_grows_upward_and_keeps_the_footer_rails() {
+        let mut app = app();
+        let area = ratatui::layout::Rect::new(0, 0, 72, 18);
+        let single = ui_regions(area, &app);
+        app.input
+            .insert_str("first line\nsecond line\nthird line\nfourth line");
+        let multiline = ui_regions(area, &app);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(multiline.input.height > single.input.height);
+        assert_eq!(multiline.input.bottom(), single.input.bottom());
+        assert!(multiline.input.y < single.input.y);
+        for y in multiline.input.y..multiline.input.bottom() {
+            assert_eq!(
+                style_at(&terminal, 1, y).fg,
+                Some(super::status_rail_color(Status::Idle))
+            );
+            assert_eq!(
+                style_at(&terminal, 70, y).fg,
+                Some(super::status_rail_color(Status::Idle))
+            );
+        }
+    }
+
+    #[test]
+    fn completion_panel_aligns_with_footer_and_highlights_selection() {
+        let mut app = app();
+        app.input.insert_str("/");
+        app.refresh_completion();
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 100, 28), &app);
+        let panel_x = 1;
+        let input_rail_x = 1;
+        assert_eq!(
+            style_at(&terminal, panel_x, regions.completion.y).fg,
+            Some(ACCENT)
+        );
+        assert_eq!(
+            style_at(&terminal, input_rail_x, regions.input.y).fg,
+            Some(super::status_rail_color(Status::Idle))
+        );
+        let selected_row = regions.completion.y + 1;
+        assert!((2..98).any(|x| style_at(&terminal, x, selected_row).bg == Some(ACCENT)));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.style().bg == Some(SURFACE_RAISED))
+        );
     }
 
     #[test]
@@ -2887,7 +3379,8 @@ mod tests {
         }
 
         let screen = format!("{}", terminal.backend());
-        assert_eq!(screen.matches("zex").count(), 1);
+        assert!(!screen.lines().any(|row| row.trim() == "you"));
+        assert!(!screen.lines().any(|row| row.trim() == "assistant"));
         assert!(screen.contains("Result"));
         assert!(screen.contains("first"));
         assert!(screen.contains("fn main() {}"));
@@ -2993,6 +3486,10 @@ mod tests {
         assert!(screen.contains("› /se"));
 
         let rows = screen.lines().collect::<Vec<_>>();
+        let completion_row = rows
+            .iter()
+            .position(|row| row.contains("/sessions"))
+            .expect("missing completion row");
         let status_row = rows
             .iter()
             .position(|row| row.contains("think high"))
@@ -3001,17 +3498,13 @@ mod tests {
             .iter()
             .position(|row| row.contains("↑↓ select"))
             .expect("missing keymap row");
-        let completion_row = rows
-            .iter()
-            .position(|row| row.contains("/sessions"))
-            .expect("missing completion row");
         let input_row = rows
             .iter()
             .rposition(|row| row.contains("› /se"))
             .expect("missing input row");
+        assert!(completion_row < status_row);
         assert!(status_row < keymap_row);
-        assert!(keymap_row < completion_row);
-        assert!(completion_row < input_row);
+        assert!(keymap_row < input_row);
     }
 
     #[test]
@@ -3221,7 +3714,7 @@ mod tests {
         assert!(screen.contains("gpt-test"));
         assert!(!screen.contains("YOU"));
         assert!(!screen.contains("ASSISTANT"));
-        assert!(screen.contains("zex"));
+        assert!(!screen.lines().any(|row| row.trim() == "you"));
         assert!(screen.contains("read"));
         assert!(screen.contains("done"));
         assert!(screen.contains("package zex"));

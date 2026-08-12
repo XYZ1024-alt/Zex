@@ -141,16 +141,16 @@ cargo run -- -p "读取 README 并总结成三句话"
 zex
 ```
 
-TUI 是单列时间流，不使用左侧对话、右侧工具的仪表盘分栏：
+TUI 占满 terminal 工作区，但不铺自定义整屏背景。它保持单列时间流，不使用左侧对话、右侧工具的仪表盘分栏：
 
 1. 主区：可滚动 feed，按发生顺序显示 user/assistant 文本和 tool 卡片。当前 core 未生产 planning/todo 事件，因此不会为不存在的数据预留面板；以后新增对应事件时仍进入同一 feed。
 2. 斜杠补全：输入 `/` 时浮在输入框上方，不占永久分区。
-3. 固定状态栏：运行状态、model、think 强度、context 占用、短工作目录和可用时的 git branch@commit；窄终端自动隐藏次要字段。
-4. 最底输入框：始终是屏幕最后一个区域，支持多行编辑，最多显示 6 行；快捷键提示保持在输入框上方的一行内。
+3. 固定状态栏：`ZEX` 标识、ready/thinking/working 状态、model、think 强度、context 占用、短工作目录和可用时的 git branch@commit；窄终端自动隐藏路径等次要字段。
+4. 最底输入框：状态与输入使用 Zex 青蓝 accent 的左右侧条夹住内容；输入框始终是屏幕最后一个区域，支持多行向上扩展，最多显示 6 行；快捷键提示保持在输入框上方的一行内。
 
-界面使用统一的近黑背景、暖灰正文、冷灰次要文本、单一青蓝 accent，以及柔和的 success/error 色。用户消息只用弱 `you ›` 前缀区分，不再铺深色标签背景；assistant 使用弱 `zex` 提示，不显示醒目的 `YOU` / `ASSISTANT` 标签。基础 Markdown 标题、列表、引用和代码围栏会形成清楚但克制的层级。
+根区域、空状态、用户消息和 assistant 正文都使用终端原生背景；近黑 surface 只用于 tool 卡片、代码块、斜杠补全面板和帮助面板。界面使用暖灰正文、冷灰次要文本、Zex 青蓝 accent，以及柔和的 success/error 色。用户消息只用轻量 `›` 标记；assistant 正文不带角色标签，也不显示醒目的 `YOU` / `ASSISTANT`。基础 Markdown 标题、列表、引用和代码围栏形成清楚但克制的层级。
 
-tool 卡片标题突出工具名；`bash` 显示 `$ command`。默认态只显示标题、running/done/failed/interrupted、耗时和一行结果摘要；无输出的成功命令显示 `Completed`。`exit_code`、stdout/stderr 全文、timeout 和参数只在展开后出现，`Ctrl-O` 展开或折叠当前卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 只在状态变化、输入、新事件或 toast 过期时按固定帧率差分重绘。
+tool 卡片使用近黑 surface 和细 accent rail，标题突出工具名；`bash` 显示 `$ command`。默认态只显示标题、running/done/failed/interrupted、耗时和一行结果摘要；无输出的成功命令显示 `Completed`。`exit_code`、stdout/stderr 全文、timeout 和参数只在展开后出现，`Ctrl-O` 展开或折叠当前卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 只在状态变化、输入、新事件或 toast 过期时按固定帧率差分重绘。
 
 | 快捷键 | idle 模式 | turn 运行中 |
 | --- | --- | --- |
@@ -378,7 +378,7 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 13. 验证本次 TUI 交互：
 
     1. 输入 `/se`，预期输入框上方只出现 `/sessions` 与说明；Up/Down 选择，Tab 补全，Esc 关闭。
-    2. 要求模型连续执行 `git status` 和 `git rev-parse --short HEAD`。预期同一 feed 内出现两个 `$ git …` 卡片，默认折叠 Output，卡片页脚分别显示耗时和 timeout，卡片之间有空行。
+    2. 要求模型连续执行 `git status` 和 `git rev-parse --short HEAD`。预期同一 feed 内出现两个 `$ git …` surface 卡片；默认折叠态只显示状态、耗时和短摘要，展开后才显示完整 output、参数和 timeout。
     3. 按 Tab 选中工具并按 Ctrl-O 展开/折叠。
     4. 输入 `/think high`，再连续按 Ctrl-T。预期状态栏 think 更新，项目 `.zex/config.toml` 写入最新偏好；每次只更新 toast，不向主 feed 追加消息。不支持推理强度的模型显示 `n/a`，不崩溃。
 
