@@ -9,8 +9,8 @@ use std::{
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-        KeyModifiers,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -36,12 +36,28 @@ use crate::{
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const TOAST_DURATION: Duration = Duration::from_secs(4);
 const MAX_ERRORS: usize = 3;
+const MAX_ERROR_DETAIL_CHARS: usize = 4_000;
 const MAX_TOOL_DETAIL_CHARS: usize = 4_000;
 const MAX_TOOL_ARGUMENT_CHARS: usize = 2_000;
+const MAX_INPUT_HISTORY: usize = 100;
 const MAX_INPUT_ROWS: u16 = 6;
 const MIN_TRANSCRIPT_HEIGHT: u16 = 3;
+const MAX_FEED_WIDTH: u16 = 120;
+const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
+
+const BACKGROUND: Color = Color::Rgb(13, 15, 18);
+const SURFACE: Color = Color::Rgb(20, 23, 28);
+const SURFACE_RAISED: Color = Color::Rgb(27, 31, 37);
+const TEXT: Color = Color::Rgb(207, 213, 220);
+const TEXT_STRONG: Color = Color::Rgb(235, 239, 243);
+const DIM: Color = Color::Rgb(111, 120, 131);
+const MUTED: Color = Color::Rgb(69, 77, 87);
+const ACCENT: Color = Color::Rgb(104, 165, 184);
+const SUCCESS: Color = Color::Rgb(116, 171, 136);
+const ERROR: Color = Color::Rgb(198, 111, 118);
 
 pub fn is_available() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
@@ -108,11 +124,14 @@ where
 
     loop {
         tokio::select! {
-            _ = redraw.tick(), if dirty => {
-                terminal
-                    .draw(|frame| render(frame, &mut app))
-                    .context("failed to draw TUI")?;
-                dirty = false;
+            _ = redraw.tick() => {
+                dirty |= app.expire_toast(Instant::now());
+                if dirty {
+                    terminal
+                        .draw(|frame| render(frame, &mut app))
+                        .context("failed to draw TUI")?;
+                    dirty = false;
+                }
             }
             event = event_receiver.recv() => {
                 match event {
@@ -137,6 +156,7 @@ where
                         InputAction::Quit => return Ok(()),
                         InputAction::Interrupt => {}
                         InputAction::Submit(prompt) => {
+                            app.remember_submission(&prompt);
                             match parse(&prompt) {
                                 Ok(Some(command)) => {
                                     match execute(
@@ -157,8 +177,9 @@ where
                                                     app.replace_transcript(agent.messages());
                                                 }
                                             }
-                                            app.push_command_output(result.output);
-                                            app.scroll_to_bottom();
+                                            if app.push_command_output(result.output) {
+                                                app.scroll_to_bottom();
+                                            }
                                         }
                                         Err(error) => app.record_error(format!("{error:#}")),
                                     }
@@ -212,11 +233,14 @@ where
 
     loop {
         tokio::select! {
-            _ = redraw.tick(), if dirty => {
-                terminal
-                    .draw(|frame| render(frame, app))
-                    .context("failed to draw TUI")?;
-                dirty = false;
+            _ = redraw.tick() => {
+                dirty |= app.expire_toast(Instant::now());
+                if dirty {
+                    terminal
+                        .draw(|frame| render(frame, app))
+                        .context("failed to draw TUI")?;
+                    dirty = false;
+                }
             }
             result = &mut prompt_future => {
                 drain_agent_events(event_receiver, app);
@@ -336,8 +360,17 @@ fn handle_terminal_event(
     match event {
         Event::Paste(content) if !turn_active => {
             burst.reset();
+            app.prepare_input_edit();
             app.input.insert_str(&content);
             app.refresh_completion();
+            InputAction::None
+        }
+        Event::Mouse(mouse) if !app.completion_open() => {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.scroll_lines_up(SCROLL_STEP),
+                MouseEventKind::ScrollDown => app.scroll_lines_down(SCROLL_STEP),
+                _ => {}
+            }
             InputAction::None
         }
         Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
@@ -364,6 +397,11 @@ fn handle_key_event(
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
         app.toggle_selected_tool();
+        return InputAction::None;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+        app.toggle_latest_error();
         return InputAction::None;
     }
 
@@ -420,11 +458,15 @@ fn handle_key_event(
             return InputAction::None;
         }
         KeyCode::Tab => {
-            app.select_tool(false);
+            if app.input.is_empty() {
+                app.select_tool(false);
+            }
             return InputAction::None;
         }
         KeyCode::BackTab => {
-            app.select_tool(true);
+            if app.input.is_empty() {
+                app.select_tool(true);
+            }
             return InputAction::None;
         }
         KeyCode::Esc => {
@@ -434,20 +476,23 @@ fn handle_key_event(
                 InputAction::Quit
             };
         }
-        KeyCode::Char('e')
-            if app.input.is_empty()
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            app.toggle_selected_tool();
-            return InputAction::None;
-        }
         _ => {}
     }
 
     if turn_active {
         return InputAction::None;
+    }
+
+    match key.code {
+        KeyCode::Up => {
+            app.navigate_history(true);
+            return InputAction::None;
+        }
+        KeyCode::Down => {
+            app.navigate_history(false);
+            return InputAction::None;
+        }
+        _ => {}
     }
 
     match key {
@@ -456,6 +501,7 @@ fn handle_key_event(
             modifiers,
             ..
         } if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) || in_paste_burst => {
+            app.prepare_input_edit();
             app.input.insert_char('\n');
             app.refresh_completion();
         }
@@ -463,7 +509,7 @@ fn handle_key_event(
             code: KeyCode::Enter,
             ..
         } => {
-            let prompt = app.input.take_trimmed();
+            let prompt = app.take_input();
             if !prompt.is_empty() {
                 return InputAction::Submit(prompt);
             }
@@ -472,6 +518,7 @@ fn handle_key_event(
             code: KeyCode::Backspace,
             ..
         } => {
+            app.prepare_input_edit();
             app.input.backspace();
             app.refresh_completion();
         }
@@ -479,6 +526,7 @@ fn handle_key_event(
             code: KeyCode::Delete,
             ..
         } => {
+            app.prepare_input_edit();
             app.input.delete();
             app.refresh_completion();
         }
@@ -495,6 +543,7 @@ fn handle_key_event(
             modifiers,
             ..
         } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            app.prepare_input_edit();
             app.input.insert_char(character);
             app.refresh_completion();
         }
@@ -516,21 +565,28 @@ enum Status {
 impl Status {
     fn label(self) -> &'static str {
         match self {
-            Self::Idle => "IDLE",
-            Self::Thinking => "THINKING",
-            Self::RunningTool => "TOOL",
-            Self::Cancelling => "INTERRUPTING",
-            Self::Error => "ERROR",
+            Self::Idle => "ready",
+            Self::Thinking => "thinking",
+            Self::RunningTool => "working",
+            Self::Cancelling => "stopping",
+            Self::Error => "error",
         }
     }
 
     fn color(self) -> Color {
         match self {
-            Self::Idle => Color::Green,
-            Self::Thinking => Color::Yellow,
-            Self::RunningTool => Color::Cyan,
-            Self::Cancelling => Color::Yellow,
-            Self::Error => Color::Red,
+            Self::Idle => SUCCESS,
+            Self::Thinking | Self::RunningTool | Self::Cancelling => ACCENT,
+            Self::Error => ERROR,
+        }
+    }
+
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Idle => "●",
+            Self::Thinking | Self::RunningTool => "◌",
+            Self::Cancelling => "◍",
+            Self::Error => "×",
         }
     }
 }
@@ -555,10 +611,18 @@ impl ToolStatus {
 
     fn color(self) -> Color {
         match self {
-            Self::Running => Color::Yellow,
-            Self::Done => Color::Green,
-            Self::Failed => Color::Red,
-            Self::Cancelled => Color::Yellow,
+            Self::Running | Self::Cancelled => ACCENT,
+            Self::Done => SUCCESS,
+            Self::Failed => ERROR,
+        }
+    }
+
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Running => "◌",
+            Self::Done => "✓",
+            Self::Failed => "×",
+            Self::Cancelled => "−",
         }
     }
 }
@@ -578,12 +642,48 @@ struct ToolEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TranscriptEntry {
-    Message { role: MessageRole, content: String },
+    Message {
+        role: MessageRole,
+        content: String,
+    },
     Tool(ToolEntry),
-    Error(String),
-    Notice(String),
+    Error {
+        summary: String,
+        detail: String,
+        expanded: bool,
+    },
     Help,
     Sessions(Vec<crate::session::SessionSummary>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToastTone {
+    Neutral,
+    Success,
+}
+
+#[derive(Debug)]
+struct Toast {
+    message: String,
+    tone: ToastTone,
+    expires_at: Instant,
+}
+
+impl Toast {
+    fn new(message: String, tone: ToastTone) -> Self {
+        Self {
+            message,
+            tone,
+            expires_at: Instant::now() + TOAST_DURATION,
+        }
+    }
+
+    fn color(&self) -> Color {
+        match self.tone {
+            ToastTone::Neutral => ACCENT,
+            ToastTone::Success => SUCCESS,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -697,6 +797,10 @@ struct App {
     max_context_chars: usize,
     default_tool_timeout: Duration,
     completion: CompletionState,
+    input_history: VecDeque<String>,
+    history_cursor: Option<usize>,
+    history_draft: String,
+    toast: Option<Toast>,
 }
 
 impl App {
@@ -726,6 +830,10 @@ impl App {
                 selected: 0,
                 dismissed: false,
             },
+            input_history: VecDeque::new(),
+            history_cursor: None,
+            history_draft: String::new(),
+            toast: None,
         };
 
         for message in messages {
@@ -858,10 +966,13 @@ impl App {
                 self.status = Status::Error;
             }
             AgentEvent::ContextCompacted { stats } => {
-                self.transcript.push(TranscriptEntry::Notice(format!(
-                    "Auto-compacted context: freed approximately {} chars; kept {} recent turn(s).",
-                    stats.freed_chars, stats.kept_turns
-                )));
+                self.show_toast(
+                    format!(
+                        "Context compacted · −{} chars · {} recent turns kept",
+                        stats.freed_chars, stats.kept_turns
+                    ),
+                    ToastTone::Neutral,
+                );
             }
             AgentEvent::TurnCancelled => {
                 for entry in &mut self.transcript {
@@ -873,10 +984,8 @@ impl App {
                         tool.started_at = None;
                     }
                 }
-                self.transcript.push(TranscriptEntry::Notice(
-                    "Turn interrupted. You can edit the next prompt and continue.".to_owned(),
-                ));
                 self.finish_turn(Status::Idle);
+                self.show_toast("Turn interrupted".to_owned(), ToastTone::Neutral);
             }
             AgentEvent::TurnEnd => self.finish_turn(Status::Idle),
         }
@@ -905,6 +1014,7 @@ impl App {
         self.errors.clear();
         self.selected_tool = None;
         self.status = Status::Idle;
+        self.toast = None;
         self.scroll_to_bottom();
     }
 
@@ -937,7 +1047,12 @@ impl App {
         if !self.remember_error(&message) {
             return;
         }
-        self.transcript.push(TranscriptEntry::Error(message));
+        let detail = truncate_chars(&message, MAX_ERROR_DETAIL_CHARS);
+        self.transcript.push(TranscriptEntry::Error {
+            summary: error_summary(&detail),
+            detail,
+            expanded: false,
+        });
     }
 
     fn remember_error(&mut self, message: &str) -> bool {
@@ -955,25 +1070,35 @@ impl App {
         self.record_error(message);
     }
 
-    fn push_command_output(&mut self, output: CommandOutput) {
-        self.transcript.push(match output {
-            CommandOutput::Help => TranscriptEntry::Help,
-            CommandOutput::Sessions(sessions) => TranscriptEntry::Sessions(sessions),
-            CommandOutput::Text(message) => TranscriptEntry::Notice(message),
-        });
+    fn push_command_output(&mut self, output: CommandOutput) -> bool {
+        match output {
+            CommandOutput::Help => self.transcript.push(TranscriptEntry::Help),
+            CommandOutput::Sessions(sessions) => {
+                self.transcript.push(TranscriptEntry::Sessions(sessions));
+            }
+            CommandOutput::Status(message) => {
+                self.show_toast(message, ToastTone::Success);
+                return false;
+            }
+        }
+        true
     }
 
     fn scroll_page_up(&mut self) {
-        self.follow_output = false;
-        self.scroll_top = self
-            .scroll_top
-            .saturating_sub(self.transcript_page_height.max(1));
+        self.scroll_lines_up(self.transcript_page_height.saturating_sub(1).max(1));
     }
 
     fn scroll_page_down(&mut self) {
-        let next = self
-            .scroll_top
-            .saturating_add(self.transcript_page_height.max(1));
+        self.scroll_lines_down(self.transcript_page_height.saturating_sub(1).max(1));
+    }
+
+    fn scroll_lines_up(&mut self, lines: usize) {
+        self.follow_output = false;
+        self.scroll_top = self.scroll_top.saturating_sub(lines.max(1));
+    }
+
+    fn scroll_lines_down(&mut self, lines: usize) {
+        let next = self.scroll_top.saturating_add(lines.max(1));
         if next >= self.max_scroll {
             self.scroll_to_bottom();
         } else {
@@ -1034,6 +1159,17 @@ impl App {
         }
     }
 
+    fn toggle_latest_error(&mut self) {
+        if let Some(TranscriptEntry::Error { expanded, .. }) = self
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|entry| matches!(entry, TranscriptEntry::Error { .. }))
+        {
+            *expanded = !*expanded;
+        }
+    }
+
     fn cancel_ui_layer(&mut self) -> bool {
         if self.completion_open() {
             self.dismiss_completion();
@@ -1049,8 +1185,19 @@ impl App {
             self.selected_tool = None;
             return true;
         }
+        if let Some(TranscriptEntry::Error { expanded, .. }) = self
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|entry| matches!(entry, TranscriptEntry::Error { .. }))
+            && *expanded
+        {
+            *expanded = false;
+            return true;
+        }
         if !self.input.is_empty() {
             self.input.clear();
+            self.reset_history_navigation();
             return true;
         }
         if !self.follow_output {
@@ -1131,6 +1278,7 @@ impl App {
             if command.accepts_arguments { " " } else { "" }
         );
         self.input.replace(&completed);
+        self.reset_history_navigation();
         self.completion.dismissed = true;
     }
 
@@ -1148,6 +1296,85 @@ impl App {
 
     fn dismiss_completion(&mut self) {
         self.completion.dismissed = true;
+    }
+
+    fn remember_submission(&mut self, prompt: &str) {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return;
+        }
+        if self.input_history.back().map(String::as_str) != Some(prompt) {
+            if self.input_history.len() == MAX_INPUT_HISTORY {
+                self.input_history.pop_front();
+            }
+            self.input_history.push_back(prompt.to_owned());
+        }
+        self.reset_history_navigation();
+    }
+
+    fn navigate_history(&mut self, older: bool) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        if older {
+            let index = match self.history_cursor {
+                Some(0) => 0,
+                Some(index) => index - 1,
+                None => {
+                    self.history_draft = self.input.content.clone();
+                    self.input_history.len() - 1
+                }
+            };
+            self.history_cursor = Some(index);
+            if let Some(value) = self.input_history.get(index) {
+                self.input.replace(value);
+            }
+        } else {
+            let Some(index) = self.history_cursor else {
+                return;
+            };
+            if index + 1 < self.input_history.len() {
+                self.history_cursor = Some(index + 1);
+                if let Some(value) = self.input_history.get(index + 1) {
+                    self.input.replace(value);
+                }
+            } else {
+                let draft = std::mem::take(&mut self.history_draft);
+                self.history_cursor = None;
+                self.input.replace(&draft);
+            }
+        }
+        self.refresh_completion();
+    }
+
+    fn prepare_input_edit(&mut self) {
+        self.reset_history_navigation();
+    }
+
+    fn reset_history_navigation(&mut self) {
+        self.history_cursor = None;
+        self.history_draft.clear();
+    }
+
+    fn take_input(&mut self) -> String {
+        self.reset_history_navigation();
+        self.input.take_trimmed()
+    }
+
+    fn show_toast(&mut self, message: String, tone: ToastTone) {
+        self.toast = Some(Toast::new(single_line(&message, 160), tone));
+    }
+
+    fn expire_toast(&mut self, now: Instant) -> bool {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| now >= toast.expires_at)
+        {
+            self.toast = None;
+            return true;
+        }
+        false
     }
 }
 
@@ -1175,111 +1402,122 @@ fn git_output(working_dir: &Path, arguments: &[&str]) -> Option<String> {
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
+    frame.render_widget(
+        Block::default().style(Style::default().bg(BACKGROUND)),
+        frame.area(),
+    );
     let input_height = input_height(&app.input, frame.area().width);
     let completion_height = completion_height(app);
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(MIN_TRANSCRIPT_HEIGHT),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(completion_height),
-            Constraint::Length(1),
             Constraint::Length(input_height),
-            Constraint::Length(1),
         ])
         .split(frame.area());
 
     render_transcript(frame, areas[0], app);
-    render_completion(frame, areas[1], app);
-    render_status(frame, areas[2], app);
-    render_input(frame, areas[3], app);
-    render_help(frame, areas[4], app);
+    render_status(frame, areas[1], app);
+    render_keymap(frame, areas[2], app);
+    render_completion(frame, areas[3], app);
+    render_input(frame, areas[4], app);
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let content = centered_feed_area(area);
+    let context_percent = app
+        .context_chars
+        .saturating_mul(100)
+        .checked_div(app.max_context_chars.max(1))
+        .unwrap_or(0)
+        .min(999);
+    let thinking = app.thinking_level.map_or_else(
+        || format!("n/a ({})", app.thinking_preference),
+        |level| level.to_string(),
+    );
+    let location = match &app.git_status {
+        Some(git) => format!(
+            "{} · {}@{}",
+            short_path(&app.working_dir, 24),
+            single_line(&git.branch, 16),
+            git.commit
+        ),
+        None => short_path(&app.working_dir, 36),
+    };
     let mut spans = vec![
-        Span::styled(" model ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" ", Style::default()),
+        Span::styled(app.status.symbol(), Style::default().fg(app.status.color())),
         Span::styled(
-            single_line(&app.model, 48),
+            format!(" {} ", app.status.label()),
+            Style::default().fg(app.status.color()),
+        ),
+        Span::styled("· ", Style::default().fg(MUTED)),
+        Span::styled(
+            single_line(&app.model, 34),
             Style::default()
-                .fg(Color::White)
+                .fg(TEXT_STRONG)
                 .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  think ", Style::default().fg(DIM)),
+        Span::styled(thinking, Style::default().fg(TEXT)),
+        Span::styled("  ctx ", Style::default().fg(DIM)),
+        Span::styled(format!("{context_percent}%"), Style::default().fg(TEXT)),
+        Span::styled("  ", Style::default()),
+        Span::styled(location, Style::default().fg(DIM)),
+    ];
+    if !app.active_tools.is_empty() {
+        spans.push(Span::styled("  ·  ", Style::default().fg(MUTED)));
+        spans.push(Span::styled(
+            single_line(&app.active_tool_summary(), 20),
+            Style::default().fg(ACCENT),
+        ));
+    }
+
+    let compact_spans = vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(app.status.symbol(), Style::default().fg(app.status.color())),
+        Span::styled(
+            format!(" {} ", app.status.label()),
+            Style::default().fg(app.status.color()),
+        ),
+        Span::styled("· ", Style::default().fg(MUTED)),
+        Span::styled(
+            single_line(&app.model, 22),
+            Style::default()
+                .fg(TEXT_STRONG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  think ", Style::default().fg(DIM)),
+        Span::styled(
+            app.thinking_level
+                .map_or_else(|| "n/a".to_owned(), |level| level.to_string()),
+            Style::default().fg(TEXT),
         ),
         Span::styled("  ", Style::default()),
-        Span::styled(
-            app.status.label(),
-            Style::default()
-                .fg(app.status.color())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  cwd ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            short_path(&app.working_dir, 28),
-            Style::default().fg(Color::Gray),
-        ),
+        Span::styled(short_path(&app.working_dir, 20), Style::default().fg(DIM)),
     ];
-
-    if let Some(git) = &app.git_status {
-        spans.push(Span::styled("  git ", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(
-            format!("{}@{}", single_line(&git.branch, 18), git.commit),
-            Style::default().fg(Color::Cyan),
-        ));
-    }
-
-    spans.push(Span::styled(
-        "  think ",
-        Style::default().fg(Color::DarkGray),
-    ));
-    spans.push(Span::styled(
-        app.thinking_level
-            .map_or_else(|| "n/a".to_owned(), |level| level.to_string()),
-        Style::default().fg(if app.thinking_level.is_some() {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        }),
-    ));
-    if app.thinking_level.is_none() {
-        spans.push(Span::styled(
-            format!("({})", app.thinking_preference),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-
-    spans.push(Span::styled("  ctx ", Style::default().fg(Color::DarkGray)));
-    spans.push(Span::styled(
-        format!(
-            "{}%",
-            app.context_chars
-                .saturating_mul(100)
-                .checked_div(app.max_context_chars.max(1))
-                .unwrap_or(0)
-                .min(999)
-        ),
-        Style::default().fg(Color::Gray),
-    ));
-
-    if !app.active_tools.is_empty() {
-        spans.push(Span::styled(
-            "  tool ",
-            Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::styled(
-            single_line(&app.active_tool_summary(), 22),
-            Style::default().fg(Color::Cyan),
-        ));
-    }
-
+    let line = Line::from(spans);
+    let line = if line.width() <= content.width as usize {
+        line
+    } else {
+        Line::from(compact_spans)
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(18, 21, 25))),
-        area,
+        Paragraph::new(line).style(Style::default().bg(SURFACE)),
+        content,
     );
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let area = centered_feed_area(area);
     let text = transcript_text(app);
-    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
-    let line_count = paragraph.line_count(area.width);
+    let paragraph = Paragraph::new(text)
+        .style(Style::default().fg(TEXT).bg(BACKGROUND))
+        .wrap(Wrap { trim: false });
+    let line_count = paragraph.line_count(area.width.max(1));
     app.transcript_page_height = area.height as usize;
     app.max_scroll = line_count.saturating_sub(area.height as usize);
     if app.follow_output {
@@ -1293,7 +1531,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     if !app.follow_output && app.max_scroll > 0 {
         let indicator = format!(
-            " lines {}–{} / {} ",
+            " {}–{} / {} ",
             app.scroll_top.saturating_add(1),
             app.scroll_top
                 .saturating_add(app.transcript_page_height)
@@ -1303,7 +1541,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let width = indicator.chars().count().min(area.width as usize) as u16;
         let x = area.right().saturating_sub(width);
         frame.render_widget(
-            Paragraph::new(indicator).style(Style::default().fg(Color::Yellow)),
+            Paragraph::new(indicator).style(Style::default().fg(DIM).bg(BACKGROUND)),
             Rect::new(x, area.y, width, 1),
         );
     }
@@ -1311,7 +1549,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
 fn completion_height(app: &App) -> u16 {
     if app.completion_open() {
-        app.completion_matches().len() as u16 + 2
+        app.completion_matches().len() as u16 + 1
     } else {
         0
     }
@@ -1321,15 +1559,16 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.height == 0 {
         return;
     }
+    let area = centered_feed_area(area);
     let matches = app.completion_matches();
     let lines = matches
         .iter()
-        .take(area.height.saturating_sub(2) as usize)
+        .take(area.height.saturating_sub(1) as usize)
         .enumerate()
         .map(|(index, command)| {
             let selected = index == app.completion.selected;
-            let marker = if selected { " › " } else { "   " };
-            let inner_width = area.width.saturating_sub(2) as usize;
+            let marker = if selected { "› " } else { "  " };
+            let inner_width = area.width.saturating_sub(4) as usize;
             let available = inner_width.saturating_sub(marker.len());
             let usage_width = matches
                 .iter()
@@ -1338,7 +1577,7 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .unwrap_or(0);
             let wide = available >= usage_width + 2 + 18;
             let command_style = Style::default()
-                .fg(if selected { Color::White } else { Color::Gray })
+                .fg(if selected { TEXT_STRONG } else { TEXT })
                 .add_modifier(if selected {
                     Modifier::BOLD
                 } else {
@@ -1346,17 +1585,17 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 });
             if wide {
                 Line::from(vec![
-                    Span::styled(marker, Style::default().fg(Color::Cyan)),
+                    Span::styled(marker, Style::default().fg(ACCENT)),
                     Span::styled(format!("{:<usage_width$}", command.usage), command_style),
                     Span::raw("  "),
-                    Span::styled(command.description, Style::default().fg(Color::DarkGray)),
+                    Span::styled(command.description, Style::default().fg(DIM)),
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled(marker, Style::default().fg(Color::Cyan)),
+                    Span::styled(marker, Style::default().fg(ACCENT)),
                     Span::styled(command.usage, command_style),
-                    Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(command.description, Style::default().fg(Color::DarkGray)),
+                    Span::styled(" · ", Style::default().fg(MUTED)),
+                    Span::styled(command.description, Style::default().fg(DIM)),
                 ])
             }
         })
@@ -1365,10 +1604,11 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(MUTED))
+                    .padding(ratatui::widgets::Padding::horizontal(2)),
             )
-            .style(Style::default().bg(Color::Rgb(24, 28, 33)))
+            .style(Style::default().bg(SURFACE_RAISED))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -1377,9 +1617,16 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn transcript_text(app: &App) -> Text<'static> {
     let mut lines = Vec::new();
     if app.transcript.is_empty() {
+        lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            "Zex is ready. Type a task or / for commands.",
-            Style::default().fg(Color::DarkGray),
+            "  What would you like to build?",
+            Style::default()
+                .fg(TEXT_STRONG)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Type a task, or / to browse commands.",
+            Style::default().fg(DIM),
         )));
         return Text::from(lines);
     }
@@ -1387,17 +1634,17 @@ fn transcript_text(app: &App) -> Text<'static> {
     for entry in &app.transcript {
         match entry {
             TranscriptEntry::Message { role, content } => {
-                let (label, color) = match role {
-                    MessageRole::User => ("you", Color::Blue),
-                    MessageRole::Assistant => ("assistant", Color::Green),
-                };
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(
-                        label,
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
+                match role {
+                    MessageRole::User => {
+                        lines.push(Line::from(Span::styled(
+                            "  ›",
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                    MessageRole::Assistant => {
+                        lines.push(Line::from(Span::styled("  zex", Style::default().fg(DIM))));
+                    }
+                }
                 append_markdown_lines(&mut lines, content, *role);
                 lines.push(Line::default());
             }
@@ -1406,27 +1653,36 @@ fn transcript_text(app: &App) -> Text<'static> {
                 tool,
                 app.selected_tool.as_deref() == Some(tool.call_id.as_str()),
             ),
-            TranscriptEntry::Error(message) => {
-                append_labeled_text(
-                    &mut lines,
-                    " ERROR ",
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
-                    message,
-                    Style::default().fg(Color::Red),
-                );
-                lines.push(Line::default());
-            }
-            TranscriptEntry::Notice(message) => {
-                append_labeled_text(
-                    &mut lines,
-                    "  info · ",
-                    Style::default().fg(Color::Yellow),
-                    message,
-                    Style::default().fg(Color::Gray),
-                );
+            TranscriptEntry::Error {
+                summary,
+                detail,
+                expanded,
+            } => {
+                lines.push(Line::from(vec![
+                    Span::styled("  × ", Style::default().fg(ERROR)),
+                    Span::styled(
+                        summary.clone(),
+                        Style::default()
+                            .fg(TEXT_STRONG)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if *expanded {
+                            "  Ctrl+E hide"
+                        } else {
+                            "  Ctrl+E details"
+                        },
+                        Style::default().fg(DIM),
+                    ),
+                ]));
+                if *expanded {
+                    for source_line in detail.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled("    │ ", Style::default().fg(MUTED)),
+                            Span::styled(source_line.to_owned(), Style::default().fg(DIM)),
+                        ]));
+                    }
+                }
                 lines.push(Line::default());
             }
             TranscriptEntry::Help => {
@@ -1443,31 +1699,6 @@ fn transcript_text(app: &App) -> Text<'static> {
     Text::from(lines)
 }
 
-fn append_labeled_text(
-    lines: &mut Vec<Line<'static>>,
-    label: &'static str,
-    label_style: Style,
-    content: &str,
-    content_style: Style,
-) {
-    for (index, source_line) in content.lines().enumerate() {
-        if index == 0 {
-            lines.push(Line::from(vec![
-                Span::styled(label, label_style),
-                Span::styled(source_line.to_owned(), content_style),
-            ]));
-        } else {
-            lines.push(Line::from(Span::styled(
-                format!("{}{}", " ".repeat(label.chars().count()), source_line),
-                content_style,
-            )));
-        }
-    }
-    if content.is_empty() {
-        lines.push(Line::from(Span::styled(label, label_style)));
-    }
-}
-
 fn append_help_lines(lines: &mut Vec<Line<'static>>) {
     let usage_width = command_specs()
         .iter()
@@ -1475,9 +1706,9 @@ fn append_help_lines(lines: &mut Vec<Line<'static>>) {
         .max()
         .unwrap_or(0);
     lines.push(Line::from(Span::styled(
-        "  Slash commands",
+        "  Commands",
         Style::default()
-            .fg(Color::Yellow)
+            .fg(TEXT_STRONG)
             .add_modifier(Modifier::BOLD),
     )));
     for command in command_specs() {
@@ -1485,12 +1716,10 @@ fn append_help_lines(lines: &mut Vec<Line<'static>>) {
             Span::styled("  ", Style::default()),
             Span::styled(
                 format!("{:<usage_width$}", command.usage),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(command.description, Style::default().fg(Color::Gray)),
+            Span::styled(command.description, Style::default().fg(DIM)),
         ]));
     }
 }
@@ -1501,8 +1730,8 @@ fn append_session_lines(
 ) {
     if sessions.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("  info · ", Style::default().fg(Color::Yellow)),
-            Span::styled("No saved sessions.", Style::default().fg(Color::Gray)),
+            Span::styled("  · ", Style::default().fg(ACCENT)),
+            Span::styled("No saved sessions.", Style::default().fg(DIM)),
         ]));
         return;
     }
@@ -1510,15 +1739,13 @@ fn append_session_lines(
     lines.push(Line::from(Span::styled(
         format!("  Saved sessions ({})", sessions.len()),
         Style::default()
-            .fg(Color::Yellow)
+            .fg(TEXT_STRONG)
             .add_modifier(Modifier::BOLD),
     )));
     for session in sessions {
         lines.push(Line::from(Span::styled(
             format!("  {}", session.id),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
             format!(
@@ -1527,15 +1754,15 @@ fn append_session_lines(
                 if session.message_count == 1 { "" } else { "s" },
                 session.preview
             ),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(DIM),
         )));
     }
 }
 
 fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: MessageRole) {
     let base_color = match role {
-        MessageRole::User => Color::White,
-        MessageRole::Assistant => Color::Gray,
+        MessageRole::User => TEXT_STRONG,
+        MessageRole::Assistant => TEXT,
     };
     let mut in_code_block = false;
 
@@ -1544,33 +1771,41 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
             let language = trimmed.trim_start_matches('`').trim();
-            let label = if in_code_block {
-                if language.is_empty() {
-                    "  code".to_owned()
-                } else {
-                    format!("  code · {language}")
-                }
+            if in_code_block {
+                lines.push(Line::from(vec![
+                    Span::styled("    ┌", Style::default().fg(MUTED)),
+                    Span::styled(
+                        if language.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {language}")
+                        },
+                        Style::default().fg(DIM),
+                    ),
+                ]));
             } else {
-                "  end code".to_owned()
-            };
-            lines.push(Line::from(Span::styled(
-                label,
-                Style::default().fg(Color::DarkGray),
-            )));
+                lines.push(Line::from(Span::styled(
+                    "    └",
+                    Style::default().fg(MUTED),
+                )));
+            }
             continue;
         }
         if in_code_block {
-            lines.push(Line::from(Span::styled(
-                format!("  {source_line}"),
-                Style::default().fg(Color::Yellow),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled("    │ ", Style::default().fg(MUTED)),
+                Span::styled(
+                    source_line.to_owned(),
+                    Style::default().fg(TEXT_STRONG).bg(SURFACE),
+                ),
+            ]));
             continue;
         }
         if let Some(heading) = trimmed.strip_prefix("### ") {
             lines.push(Line::from(Span::styled(
-                heading.to_owned(),
+                format!("  {heading}"),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(TEXT_STRONG)
                     .add_modifier(Modifier::BOLD),
             )));
         } else if let Some(heading) = trimmed
@@ -1578,28 +1813,44 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
             .or_else(|| trimmed.strip_prefix("# "))
         {
             lines.push(Line::from(Span::styled(
-                heading.to_owned(),
+                format!("  {heading}"),
                 Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                    .fg(TEXT_STRONG)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             )));
         } else if let Some(item) = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
         {
             lines.push(Line::from(vec![
-                Span::styled("  • ", Style::default().fg(Color::Cyan)),
+                Span::styled("    • ", Style::default().fg(ACCENT)),
+                Span::styled(item.to_owned(), Style::default().fg(base_color)),
+            ]));
+        } else if let Some((number, item)) = numbered_list_item(trimmed) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {number}. "), Style::default().fg(ACCENT)),
                 Span::styled(item.to_owned(), Style::default().fg(base_color)),
             ]));
         } else if let Some(quote) = trimmed.strip_prefix("> ") {
             lines.push(Line::from(vec![
-                Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
-                Span::styled(quote.to_owned(), Style::default().fg(Color::DarkGray)),
+                Span::styled("    │ ", Style::default().fg(MUTED)),
+                Span::styled(quote.to_owned(), Style::default().fg(DIM)),
             ]));
         } else {
+            let prefix = if role == MessageRole::User {
+                "    "
+            } else {
+                "  "
+            };
             lines.push(Line::from(Span::styled(
-                source_line.to_owned(),
-                Style::default().fg(base_color),
+                format!("{prefix}{source_line}"),
+                Style::default()
+                    .fg(base_color)
+                    .bg(if role == MessageRole::User {
+                        SURFACE
+                    } else {
+                        BACKGROUND
+                    }),
             )));
         }
     }
@@ -1614,75 +1865,68 @@ fn append_tool_lines(lines: &mut Vec<Line<'static>>, tool: &ToolEntry, selected:
     };
     let title = tool_title(tool);
     let elapsed = tool_elapsed(tool);
-    let card_color = if selected {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
+    let card_color = if selected { ACCENT } else { MUTED };
     lines.push(Line::from(vec![
-        Span::styled(format!("  {marker} ┌ "), Style::default().fg(card_color)),
+        Span::styled(format!("  {marker}╭─ "), Style::default().fg(card_color)),
         Span::styled(
             title,
             Style::default()
-                .fg(Color::White)
+                .fg(TEXT_STRONG)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
-            tool.status.label(),
-            Style::default()
-                .fg(tool.status.color())
-                .add_modifier(Modifier::BOLD),
+            format!("{} {}", tool.status.symbol(), tool.status.label()),
+            Style::default().fg(tool.status.color()),
         ),
     ]));
 
     if !tool.expanded {
         lines.push(Line::from(vec![
             Span::styled("    │ ", Style::default().fg(card_color)),
-            Span::styled("Output · ", Style::default().fg(Color::DarkGray)),
-            Span::styled(tool_summary(tool), Style::default().fg(Color::Gray)),
-            Span::styled(format!("  [{fold}]"), Style::default().fg(Color::DarkGray)),
+            Span::styled(tool_summary(tool), Style::default().fg(TEXT)),
+            Span::styled(format!("  {fold}"), Style::default().fg(DIM)),
         ]));
     }
 
     if tool.expanded {
         lines.push(Line::from(Span::styled(
-            "    │ Arguments",
-            Style::default().fg(Color::DarkGray),
+            "    │ input",
+            Style::default().fg(DIM),
         )));
         for line in tool.arguments.split('\n') {
             lines.push(Line::from(Span::styled(
                 format!("    │   {line}"),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(TEXT),
             )));
         }
         lines.push(Line::from(Span::styled(
-            "    │ Output",
-            Style::default().fg(Color::DarkGray),
+            "    │ output",
+            Style::default().fg(DIM),
         )));
         if tool.output.is_empty() {
             lines.push(Line::from(Span::styled(
                 "    │   waiting for result…",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(DIM),
             )));
         } else {
             for line in tool.output.split('\n') {
                 lines.push(Line::from(Span::styled(
                     format!("    │   {line}"),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(TEXT),
                 )));
             }
         }
     }
     lines.push(Line::from(vec![
-        Span::styled("    └ ", Style::default().fg(card_color)),
+        Span::styled("    ╰─ ", Style::default().fg(card_color)),
         Span::styled(
             format!(
-                "Wall {} · Timeout {}",
+                "{} · timeout {}",
                 format_duration(elapsed),
                 format_duration(tool.timeout)
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(DIM),
         ),
     ]));
     lines.push(Line::default());
@@ -1735,21 +1979,24 @@ fn tool_summary(tool: &ToolEntry) -> String {
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let area = centered_feed_area(area);
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(if app.busy {
-            Color::DarkGray
-        } else {
-            Color::Cyan
-        }));
+        .border_style(Style::default().fg(if app.busy { MUTED } else { ACCENT }))
+        .padding(ratatui::widgets::Padding::horizontal(1));
     let inner_width = area.width.saturating_sub(2).max(1) as usize;
     let visible_rows = area.height.saturating_sub(1).max(1) as usize;
 
     if app.busy {
         frame.render_widget(
-            Paragraph::new("› Turn in progress — Ctrl+C interrupts it.")
-                .block(block)
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled("◌ ", Style::default().fg(ACCENT)),
+                Span::styled("Agent is working", Style::default().fg(TEXT)),
+                Span::styled(" · Ctrl+C to stop", Style::default().fg(DIM)),
+            ]))
+            .block(block)
+            .style(Style::default().bg(SURFACE)),
             area,
         );
         return;
@@ -1759,18 +2006,19 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let vertical_scroll = metrics.cursor_row.saturating_sub(visible_rows - 1);
     let content = if app.input.is_empty() {
         Text::from(Line::from(vec![
-            Span::styled("› ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                "Type a message or / for commands…",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("› ", Style::default().fg(ACCENT)),
+            Span::styled("Ask Zex…", Style::default().fg(DIM)),
         ]))
     } else {
-        Text::from(format!("› {}", app.input.content))
+        Text::from(Line::from(vec![
+            Span::styled("› ", Style::default().fg(ACCENT)),
+            Span::styled(app.input.content.clone(), Style::default().fg(TEXT_STRONG)),
+        ]))
     };
     frame.render_widget(
         Paragraph::new(content)
             .block(block)
+            .style(Style::default().bg(SURFACE))
             .wrap(Wrap { trim: false })
             .scroll((vertical_scroll.min(u16::MAX as usize) as u16, 0)),
         area,
@@ -1779,28 +2027,43 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cursor_y = metrics.cursor_row.saturating_sub(vertical_scroll) as u16;
     frame.set_cursor_position((
         area.x
+            + 1
             + if metrics.cursor_row == 0 { 2 } else { 0 }
             + metrics.cursor_column.min(inner_width - 1) as u16,
         area.y + 1 + cursor_y.min(area.height.saturating_sub(2)),
     ));
 }
 
-fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let help = if app.completion_open() {
-        " ↑/↓ choose · Tab complete · Enter complete/run · Esc close "
+fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let area = centered_feed_area(area);
+    let hint = if let Some(toast) = &app.toast {
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("● ", Style::default().fg(toast.color())),
+            Span::styled(toast.message.clone(), Style::default().fg(TEXT)),
+        ])
+    } else if app.completion_open() {
+        Line::from(Span::styled(
+            "  ↑↓ select · Tab complete · Enter run · Esc close",
+            Style::default().fg(DIM),
+        ))
     } else if app.busy {
-        if area.width >= 92 {
-            " Ctrl+C interrupt  ·  PgUp/PgDn scroll  ·  Tab tool  ·  Ctrl+O expand  ·  Esc close "
+        let text = if area.width >= 92 {
+            "  Ctrl+C stop · PgUp/PgDn scroll · Tab tool · Ctrl+O details"
         } else {
-            " Ctrl+C interrupt · PgUp/PgDn scroll · Ctrl+O expand "
-        }
-    } else if area.width >= 110 {
-        " Enter send · Shift/Alt+Enter newline · Ctrl+T think · Ctrl+O tool · PgUp/PgDn scroll · Ctrl+C exit "
+            "  Ctrl+C stop · PgUp/PgDn scroll · Ctrl+O details"
+        };
+        Line::from(Span::styled(text, Style::default().fg(DIM)))
     } else {
-        " Enter send · Ctrl+T think · Ctrl+O tool · PgUp/PgDn scroll "
+        let text = if area.width >= 110 {
+            "  Enter send · Shift/Alt+Enter newline · ↑↓ history · / commands · Ctrl+T think · Ctrl+O tool"
+        } else {
+            "  Enter send · ↑↓ history · / commands · Ctrl+T think · Ctrl+O tool"
+        };
+        Line::from(Span::styled(text, Style::default().fg(DIM)))
     };
     frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(hint).style(Style::default().bg(BACKGROUND)),
         area,
     );
 }
@@ -1848,7 +2111,8 @@ fn wrapped_position(input: &str, width: usize) -> (usize, usize) {
 }
 
 fn input_height(input: &InputBuffer, terminal_width: u16) -> u16 {
-    let inner_width = terminal_width.saturating_sub(2).max(1) as usize;
+    let feed_width = terminal_width.min(MAX_FEED_WIDTH);
+    let inner_width = feed_width.saturating_sub(2).max(1) as usize;
     let rows = input_metrics(&input.content, input.cursor, inner_width)
         .total_rows
         .min(MAX_INPUT_ROWS as usize) as u16;
@@ -1893,6 +2157,34 @@ fn short_path(path: &Path, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
+fn centered_feed_area(area: Rect) -> Rect {
+    if area.width <= MAX_FEED_WIDTH {
+        return area;
+    }
+    let width = MAX_FEED_WIDTH;
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y,
+        width,
+        area.height,
+    )
+}
+
+fn numbered_list_item(line: &str) -> Option<(&str, &str)> {
+    let (number, item) = line.split_once(". ")?;
+    (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some((number, item))
+}
+
+fn error_summary(message: &str) -> String {
+    let first = message
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("Unknown error")
+        .trim();
+    single_line(first, 120)
+}
+
 struct TerminalSession {
     terminal: DefaultTerminal,
     restored: bool,
@@ -1902,7 +2194,12 @@ impl TerminalSession {
     fn start() -> Result<Self> {
         enable_raw_mode().context("failed to enable terminal raw mode")?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        ) {
             let _ = disable_raw_mode();
             return Err(error).context("failed to enter alternate screen");
         }
@@ -1934,6 +2231,7 @@ impl TerminalSession {
         disable_raw_mode().context("failed to disable terminal raw mode")?;
         execute!(
             self.terminal.backend_mut(),
+            DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen
         )
@@ -1952,6 +2250,7 @@ impl Drop for TerminalSession {
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
+            DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen
         );
@@ -1967,9 +2266,9 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
-        App, AppContext, CommandOutput, InputAction, InputBuffer, KeyBurst, Status, ToolStatus,
-        TranscriptEntry, command_specs, handle_key_event, handle_terminal_event, input_metrics,
-        render, truncate_chars,
+        App, AppContext, CommandOutput, InputAction, InputBuffer, KeyBurst, SCROLL_STEP, Status,
+        ToolStatus, TranscriptEntry, command_specs, handle_key_event, handle_terminal_event,
+        input_metrics, render, truncate_chars,
     };
     use crate::agent::{AgentEvent, MessageRole};
     use crate::provider::ThinkingLevel;
@@ -2063,10 +2362,11 @@ mod tests {
             panic!("expected tool entry");
         };
         assert_eq!(tool.status, ToolStatus::Cancelled);
-        assert!(matches!(
-            app.transcript.last(),
-            Some(TranscriptEntry::Notice(message)) if message.contains("interrupted")
-        ));
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.message.contains("interrupted"))
+        );
     }
 
     #[test]
@@ -2081,7 +2381,7 @@ mod tests {
         assert_eq!(
             app.transcript
                 .iter()
-                .filter(|entry| matches!(entry, TranscriptEntry::Error(_)))
+                .filter(|entry| matches!(entry, TranscriptEntry::Error { .. }))
                 .count(),
             1
         );
@@ -2111,7 +2411,7 @@ mod tests {
         assert!(
             !app.transcript
                 .iter()
-                .any(|entry| matches!(entry, TranscriptEntry::Error(_)))
+                .any(|entry| matches!(entry, TranscriptEntry::Error { .. }))
         );
     }
 
@@ -2320,6 +2620,253 @@ mod tests {
     }
 
     #[test]
+    fn history_navigation_restores_the_unsent_draft() {
+        let mut app = app();
+        app.remember_submission("first task");
+        app.remember_submission("second task");
+        app.input.insert_str("draft");
+
+        assert_eq!(
+            handle_key_event(
+                key(
+                    crossterm::event::KeyCode::Up,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                &mut app,
+                false,
+                false,
+            ),
+            InputAction::None
+        );
+        assert_eq!(app.input.content, "second task");
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Up,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        );
+        assert_eq!(app.input.content, "first task");
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        );
+        assert_eq!(app.input.content, "second task");
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        );
+        assert_eq!(app.input.content, "draft");
+    }
+
+    #[test]
+    fn completion_arrows_do_not_browse_input_history() {
+        let mut app = app();
+        app.remember_submission("older task");
+        app.input.insert_str("/");
+        app.refresh_completion();
+
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        );
+
+        assert_eq!(app.input.content, "/");
+        assert!(app.history_cursor.is_none());
+        assert_eq!(app.completion.selected, 1);
+    }
+
+    #[test]
+    fn transient_command_status_does_not_enter_the_feed() {
+        let mut app = app();
+        let before = app.transcript.len();
+
+        assert!(!app.push_command_output(CommandOutput::Status("Thinking · high".to_owned())));
+        assert!(!app.push_command_output(CommandOutput::Status(
+            "Compacted context: freed approximately 4000 chars".to_owned(),
+        )));
+
+        assert_eq!(app.transcript.len(), before);
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.message.as_str()),
+            Some("Compacted context: freed approximately 4000 chars")
+        );
+    }
+
+    #[test]
+    fn auto_compaction_and_interruption_use_toasts_not_feed_rows() {
+        let mut app = app();
+        app.apply_agent_event(AgentEvent::ContextCompacted {
+            stats: crate::agent::CompactStats {
+                before_chars: 10_000,
+                after_chars: 6_000,
+                freed_chars: 4_000,
+                kept_turns: 6,
+                summarized_turns: 2,
+                summarized_tool_outputs: 3,
+            },
+        });
+
+        assert!(app.transcript.is_empty());
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.message.contains("Context compacted"))
+        );
+
+        app.apply_agent_event(AgentEvent::TurnCancelled);
+        assert!(app.transcript.is_empty());
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.message == "Turn interrupted")
+        );
+    }
+
+    #[test]
+    fn errors_are_short_until_explicitly_expanded() {
+        let mut app = app();
+        app.record_error("provider failed\ncaused by: socket closed\nstack frame".to_owned());
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let folded = format!("{}", terminal.backend());
+        assert!(folded.contains("provider failed"));
+        assert!(folded.contains("Ctrl+E details"));
+        assert!(!folded.contains("socket closed"));
+
+        app.toggle_latest_error();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let expanded = format!("{}", terminal.backend());
+        assert!(expanded.contains("socket closed"));
+        assert!(expanded.contains("Ctrl+E hide"));
+    }
+
+    #[test]
+    fn mouse_scroll_moves_in_small_steps_and_returns_to_follow_mode() {
+        let mut app = app();
+        app.max_scroll = 40;
+        app.scroll_top = 40;
+        app.follow_output = true;
+
+        app.scroll_lines_up(SCROLL_STEP);
+        assert_eq!(app.scroll_top, 37);
+        assert!(!app.follow_output);
+
+        app.scroll_lines_down(SCROLL_STEP);
+        assert_eq!(app.scroll_top, 40);
+        assert!(app.follow_output);
+    }
+
+    #[test]
+    fn long_feed_scrolls_without_moving_the_fixed_input() {
+        let mut app = app();
+        for index in 0..80 {
+            app.transcript.push(TranscriptEntry::Message {
+                role: if index % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                content: format!("feed entry {index}\nsecond line"),
+            });
+        }
+        app.input.insert_str("fixed draft");
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.max_scroll > 0);
+        assert_eq!(app.scroll_top, app.max_scroll);
+        let bottom = format!("{}", terminal.backend());
+        assert!(bottom.contains("feed entry 79"));
+        assert!(bottom.contains("fixed draft"));
+
+        app.scroll_page_up();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let scrolled = format!("{}", terminal.backend());
+        assert!(!app.follow_output);
+        assert!(app.scroll_top < app.max_scroll);
+        assert!(scrolled.contains("fixed draft"));
+        assert!(scrolled.contains(" / "));
+    }
+
+    #[test]
+    fn streamed_render_keeps_one_assistant_block_and_follows_output() {
+        let mut app = app();
+        let backend = TestBackend::new(90, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        app.start_turn();
+        for delta in [
+            "# Result\n",
+            "- first\n",
+            "- second\n",
+            "```rust\n",
+            "fn main() {}\n",
+            "```",
+        ] {
+            app.apply_agent_event(AgentEvent::MessageDelta {
+                role: MessageRole::Assistant,
+                delta: delta.to_owned(),
+            });
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert!(app.follow_output);
+            assert_eq!(
+                app.transcript
+                    .iter()
+                    .filter(|entry| matches!(
+                        entry,
+                        TranscriptEntry::Message {
+                            role: MessageRole::Assistant,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
+            );
+        }
+
+        let screen = format!("{}", terminal.backend());
+        assert_eq!(screen.matches("zex").count(), 1);
+        assert!(screen.contains("Result"));
+        assert!(screen.contains("first"));
+        assert!(screen.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn repeated_setting_toasts_replace_each_other_without_feed_noise() {
+        let mut app = app();
+        for level in ["low", "medium", "high", "off"] {
+            assert!(!app.push_command_output(CommandOutput::Status(format!("Thinking · {level}"))));
+        }
+
+        assert!(app.transcript.is_empty());
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.message.as_str()),
+            Some("Thinking · off")
+        );
+    }
+
+    #[test]
     fn think_shortcut_submits_shared_slash_command() {
         let mut app = app();
 
@@ -2364,7 +2911,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_multiple_shell_cards_and_completion_above_status_input() {
+    fn renders_multiple_shell_cards_and_completion_between_status_and_input() {
         let mut app = app();
         app.thinking_level = Some(ThinkingLevel::High);
         for (index, command) in ["git status", "git rev-parse --short HEAD"]
@@ -2396,11 +2943,32 @@ mod tests {
 
         assert!(screen.contains("$ git status"));
         assert!(screen.contains("$ git rev-parse --short HEAD"));
-        assert!(screen.contains("Wall 20ms · Timeout 30.0s"));
+        assert!(screen.contains("20ms · timeout 30.0s"));
         assert!(screen.contains("/sessions"));
         assert!(screen.contains("List saved sessions"));
         assert!(screen.contains("think high"));
         assert!(screen.contains("› /se"));
+
+        let rows = screen.lines().collect::<Vec<_>>();
+        let status_row = rows
+            .iter()
+            .position(|row| row.contains("think high"))
+            .expect("missing status row");
+        let keymap_row = rows
+            .iter()
+            .position(|row| row.contains("↑↓ select"))
+            .expect("missing keymap row");
+        let completion_row = rows
+            .iter()
+            .position(|row| row.contains("/sessions"))
+            .expect("missing completion row");
+        let input_row = rows
+            .iter()
+            .rposition(|row| row.contains("› /se"))
+            .expect("missing input row");
+        assert!(status_row < keymap_row);
+        assert!(keymap_row < completion_row);
+        assert!(completion_row < input_row);
     }
 
     #[test]
@@ -2523,10 +3091,8 @@ mod tests {
                 preview: "second task with a narrow layout".to_owned(),
             },
         ]));
-        app.transcript.push(TranscriptEntry::Notice(
-            "First status line\nSecond status line".to_owned(),
-        ));
         app.record_error("First error line\nSecond error line".to_owned());
+        app.toggle_latest_error();
         let backend = TestBackend::new(38, 28);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -2539,8 +3105,6 @@ mod tests {
             "20260812-121500-cafebabe",
             "first task",
             "second task",
-            "First status line",
-            "Second status line",
             "First error line",
             "Second error line",
         ] {
@@ -2552,8 +3116,7 @@ mod tests {
             }),
             "session records merged"
         );
-        assert_eq!(screen.matches("info ·").count(), 1);
-        assert_eq!(screen.matches("ERROR").count(), 1);
+        assert_eq!(screen.matches("Ctrl+E hide").count(), 1);
     }
 
     #[test]
@@ -2599,12 +3162,13 @@ mod tests {
         let screen = format!("{}", terminal.backend());
 
         assert!(screen.contains("gpt-test"));
-        assert!(screen.contains("you"));
-        assert!(screen.contains("assistant"));
+        assert!(!screen.contains("YOU"));
+        assert!(!screen.contains("ASSISTANT"));
+        assert!(screen.contains("zex"));
         assert!(screen.contains("read"));
         assert!(screen.contains("done"));
         assert!(screen.contains("Ctrl+O expand"));
-        assert!(screen.contains("Wall 14ms · Timeout 60.0s"));
+        assert!(screen.contains("14ms · timeout 60.0s"));
         assert!(!screen.contains("\"path\": \"Cargo.toml\""));
         assert!(screen.contains("next prompt"));
         assert!(screen.contains("Enter send"));

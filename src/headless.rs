@@ -104,7 +104,7 @@ fn print_command_output(output: &CommandOutput) -> Result<()> {
             }
         }
         CommandOutput::Sessions(sessions) => println!("{}", format_session_summaries(sessions)?),
-        CommandOutput::Text(message) => println!("{message}"),
+        CommandOutput::Status(message) => println!("{message}"),
     }
     Ok(())
 }

@@ -95,7 +95,7 @@ pub enum CommandEffect {
 pub enum CommandOutput {
     Help,
     Sessions(Vec<SessionSummary>),
-    Text(String),
+    Status(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +150,7 @@ where
             effect: CommandEffect::None,
         }),
         SlashCommand::Model(None) => Ok(CommandResult {
-            output: CommandOutput::Text(format!("Model: {}", agent.model())),
+            output: CommandOutput::Status(format!("Model · {}", agent.model())),
             effect: CommandEffect::None,
         }),
         SlashCommand::Model(Some(model)) => {
@@ -160,7 +160,7 @@ where
             }
             agent.set_model(model.to_owned());
             Ok(CommandResult {
-                output: CommandOutput::Text(format!("Model: {model}")),
+                output: CommandOutput::Status(format!("Model · {model}")),
                 effect: CommandEffect::None,
             })
         }
@@ -177,7 +177,7 @@ where
             agent.clear();
             *session_id = None;
             Ok(CommandResult {
-                output: CommandOutput::Text(match saved_id {
+                output: CommandOutput::Status(match saved_id {
                     Some(id) => format!("New session started. Saved previous session {id}."),
                     None => "New session started.".to_owned(),
                 }),
@@ -210,7 +210,7 @@ where
             agent.replace_messages(loaded.messages);
             *session_id = Some(resumed_id.clone());
             Ok(CommandResult {
-                output: CommandOutput::Text(format!(
+                output: CommandOutput::Status(format!(
                     "Resumed {resumed_id} · {} messages · model {}",
                     agent
                         .messages()
@@ -225,7 +225,7 @@ where
         SlashCommand::Compact => {
             let stats = agent.compact();
             Ok(CommandResult {
-                output: CommandOutput::Text(compact_feedback(&stats)),
+                output: CommandOutput::Status(compact_feedback(&stats)),
                 effect: CommandEffect::ReplaceView,
             })
         }
@@ -234,14 +234,14 @@ where
             agent.set_thinking_level(thinking_level);
             persist_thinking_level(working_dir, thinking_level).await?;
             let message = match agent.thinking_level() {
-                Some(level) => format!("Thinking: {level}"),
+                Some(level) => format!("Thinking · {level}"),
                 None => format!(
-                    "Thinking: n/a for {} · preference {thinking_level}",
+                    "Thinking · n/a for {} · preference {thinking_level}",
                     agent.model()
                 ),
             };
             Ok(CommandResult {
-                output: CommandOutput::Text(message),
+                output: CommandOutput::Status(message),
                 effect: CommandEffect::None,
             })
         }
@@ -352,7 +352,7 @@ mod execution_tests {
         );
         assert!(matches!(
             result.output,
-            CommandOutput::Text(message) if message.contains(&saved[0].id)
+            CommandOutput::Status(message) if message.contains(&saved[0].id)
         ));
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
@@ -442,8 +442,8 @@ mod execution_tests {
         .unwrap();
 
         assert_eq!(result.effect, CommandEffect::ReplaceView);
-        let CommandOutput::Text(message) = result.output else {
-            panic!("expected compact text");
+        let CommandOutput::Status(message) = result.output else {
+            panic!("expected compact status");
         };
         assert!(message.contains("freed approximately"));
         assert!(message.contains(&before.to_string()));
@@ -473,7 +473,7 @@ mod execution_tests {
         assert_eq!(agent.thinking_preference(), ThinkingLevel::High);
         assert!(matches!(
             result.output,
-            CommandOutput::Text(message) if message == "Thinking: n/a for model-a · preference high"
+            CommandOutput::Status(message) if message == "Thinking · n/a for model-a · preference high"
         ));
         let config = tokio::fs::read_to_string(directory.join(".zex/config.toml"))
             .await

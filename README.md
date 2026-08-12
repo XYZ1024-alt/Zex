@@ -145,10 +145,12 @@ TUI 是单列时间流，不使用左侧对话、右侧工具的仪表盘分栏�
 
 1. 主区：可滚动 feed，按发生顺序显示 user/assistant 文本和 tool 卡片。当前 core 未生产 planning/todo 事件，因此不会为不存在的数据预留面板；以后新增对应事件时仍进入同一 feed。
 2. 斜杠补全：输入 `/` 时浮在输入框上方，不占永久分区。
-3. 固定状态栏：model、turn 状态、短工作目录、可用时的 git branch@commit、think 强度和 context 占用。
-4. 最底输入框：始终固定，支持多行编辑，最多显示 6 行；下方仅保留一行当前快捷键提示。
+3. 固定状态栏：运行状态、model、think 强度、context 占用、短工作目录和可用时的 git branch@commit；窄终端自动隐藏次要字段。
+4. 最底输入框：始终是屏幕最后一个区域，支持多行编辑，最多显示 6 行；快捷键提示保持在输入框上方的一行内。
 
-tool 卡片标题突出工具名；`bash` 显示 `$ command`。Output 默认折叠为单行摘要，并标注 `Ctrl+O expand`；页脚显示 Wall 与 Timeout。running、done、failed、interrupted 使用独立状态颜色，连续卡片之间保留空行。展开后显示格式化参数与结果预览；参数和结果过长时明确截断。Assistant 流式增量合并到当前消息，TUI 只在状态变化、输入或新事件到达时按固定帧率差分重绘。
+界面使用统一的近黑背景、低对比 surface、暖灰正文、冷灰次要文本、单一青蓝 accent，以及柔和的 success/error 色。用户消息只用轻 surface 和 `›` 区分；assistant 使用弱 `zex` 提示，不显示醒目的 `YOU` / `ASSISTANT` 标签。基础 Markdown 标题、列表、引用和代码围栏会形成清楚但克制的层级。
+
+tool 卡片标题突出工具名；`bash` 显示 `$ command`。Output 默认折叠为单行摘要，并标注 `Ctrl+O expand`；页脚只显示耗时与 timeout。running、done、failed、interrupted 使用克制状态色，连续卡片之间保留空行。展开后显示格式化参数与结果预览；参数和结果过长时明确截断。错误默认只显示首行摘要，`Ctrl+E` 展开或收起详情。Assistant 流式增量合并到当前消息，TUI 只在状态变化、输入、新事件或 toast 过期时按固定帧率差分重绘。
 
 | 快捷键 | idle 模式 | turn 运行中 |
 | --- | --- | --- |
@@ -156,19 +158,20 @@ tool 卡片标题突出工具名；`bash` 显示 `$ command`。Output 默认折�
 | Shift-Enter / Alt-Enter | 插入换行 | — |
 | Ctrl-C | 退出 TUI | 中断当前 turn，返回 idle |
 | Esc | 关闭补全、tool 详情、取消选择、清空草稿或回到底部；无可取消状态时退出 | 关闭当前 UI 选择，不中断 turn |
+| 鼠标滚轮 | 平滑滚动时间流 | 平滑滚动时间流 |
 | PageUp / PageDown | 对话历史翻页 | 对话历史翻页 |
 | Home / End | 跳到历史顶部 / 底部 | 跳到历史顶部 / 底部 |
-| Tab / Shift-Tab | 补全打开时接受当前命令；否则选择下一个 / 上一个 tool | 选择下一个 / 上一个 tool |
-| Up / Down | 补全打开时选择上一项 / 下一项 | — |
+| Tab / Shift-Tab | 补全打开时接受当前命令；输入为空时选择下一个 / 上一个 tool | 选择下一个 / 上一个 tool |
+| Up / Down | 补全打开时选择上一项 / 下一项；否则浏览已发送输入并恢复草稿 | — |
 | Ctrl-O | 展开 / 折叠当前 tool；未选择时作用于最近一条 | 同左 |
-| `e` | 输入框为空时展开 / 折叠当前 tool | 同左 |
+| Ctrl-E | 展开 / 折叠最近一条错误详情 | 同左 |
 | Ctrl-T | 循环切换 `off → low → medium → high` 并持久化 | — |
 
 粘贴使用终端 bracketed paste，允许直接粘贴多行内容。当前 turn 运行时输入区锁定，避免草稿与执行中状态混淆；Ctrl-C 中断后，已输入的用户消息保留，未完成的 assistant/tool 状态不会进入后续 Provider 上下文。
 
 ### 斜杠命令
 
-TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册表、解析与执行模块；`/help` 和补全列表因此不会漂移。输入 `/` 后按前缀过滤，例如 `/se` 只显示 `/sessions`。Up/Down 选择，Tab 补全，Enter 在前缀未完整时先补全、命令完整时执行，Esc 关闭。命中的斜杠命令不会作为普通用户消息发给模型；未知命令返回可读错误。
+TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册表、解析与执行模块；`/help` 和补全列表因此不会漂移。输入 `/` 后按前缀过滤，例如 `/se` 只显示 `/sessions`。Up/Down 选择，Tab 补全，Enter 在前缀未完整时先补全、命令完整时执行，Esc 关闭。命中的斜杠命令不会作为普通用户消息发给模型；未知命令返回可读错误。`/model`、`/think`、`/compact`、新建与恢复会话等短暂状态反馈只更新底栏或显示约 4 秒 toast，不写入主 feed；`/help`、`/sessions` 等需要阅读的结果仍留在时间流。
 
 | 命令 | 行为 |
 | --- | --- |
@@ -330,9 +333,9 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
    cargo run --
    ```
 
-   预期进入 TUI。先输入 `记住数字 37`，再输入 `必须使用 read 读取 Cargo.toml，然后告诉我刚才的数字`。主区应显示两轮对话与默认折叠的 `read` running/done 卡片；状态栏应在 `IDLE`、`THINKING`、`TOOL` 间切换并显示 model、cwd、git、think 和 context。按 Tab 选择 tool、按 Ctrl-O 展开参数和结果，再用 PageUp/PageDown 滚动历史。第二轮回答应保留上下文。
+   预期进入 TUI。先输入 `记住数字 37`，再输入 `必须使用 read 读取 Cargo.toml，然后告诉我刚才的数字`。主区应显示两轮对话与默认折叠的 `read` running/done 卡片；状态栏应在 `ready`、`thinking`、`working` 间切换并显示 model、短路径或 branch、think 和 context。按 Tab 选择 tool、按 Ctrl-O 展开参数和结果，再用鼠标滚轮或 PageUp/PageDown 滚动历史。第二轮回答应保留上下文。
 
-6. 验证多行输入与中断：用 Shift-Enter 或 Alt-Enter 输入两行后按 Enter 发送。再提交一个会运行较久的请求，并在 `THINKING` 或 `TOOL` 状态按 Ctrl-C。预期出现单条 interrupted 提示，运行中的 tool 标记为 interrupted，状态恢复 `IDLE`，可立即发送下一条消息。
+6. 验证多行输入与中断：用 Shift-Enter 或 Alt-Enter 输入两行后按 Enter 发送。再提交一个会运行较久的请求，并在 `thinking` 或 `working` 状态按 Ctrl-C。预期底部短暂显示 interrupted toast，运行中的 tool 标记为 interrupted，状态恢复 `ready`，可立即发送下一条消息。
 
 7. 验证错误摘要：使用错误 API Key 启动 TUI 并提交一句话。预期主区只出现一条可读错误，不重复刷屏；Esc 或 Ctrl-C 可正常退出并恢复终端。
 
@@ -363,21 +366,21 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 
 10. 验证内置搜索：在 TUI 或非 TTY REPL 中要求模型“必须用 `grep` 搜索 `Cargo.toml` 中的 `name`，再用 `glob` 查找 `src/**/*.rs`”。预期出现两个内置 tool 事件，不调用 `rg`/`fd`，并且 `.gitignore` 中排除的路径不出现在结果里。
 
-11. 验证斜杠命令：在 TUI 中依次输入 `/help`、`/model`、`/model <另一个可用模型>`、`/sessions`。预期均只出现 INFO 行，不出现 YOU 消息；状态栏 model 在切换后更新。输入 `/resume <id>` 后视图替换成保存的会话，省略 ID 时恢复最近的非当前会话。输入 `/clear` 后对话区只保留清空反馈，磁盘会话文件仍存在。
+11. 验证斜杠命令：在 TUI 中依次输入 `/help`、`/model`、`/model <另一个可用模型>`、`/sessions`。预期 `/help` 与 `/sessions` 进入 feed；model 查询和切换只显示短暂 toast，不出现用户消息；状态栏 model 在切换后更新。输入 `/resume <id>` 后视图替换成保存的会话，省略 ID 时恢复最近的非当前会话。输入 `/clear` 后对话区清空，仅在底部显示短暂反馈，磁盘会话文件仍存在。
 
 12. 验证 `/compact` 前后上下文变化：
 
     1. 临时设置 `compact_keep_turns = 2`，进行至少 4 轮对话，其中早期一轮让模型读取一个较长文件。
-    2. 输入 `/compact`。预期 INFO 行显示类似 `freed approximately N chars (before → after); kept 2 recent turn(s)`，其中有足够旧内容时 `N > 0`。
+    2. 输入 `/compact`。预期底部 toast 显示类似 `freed approximately N chars (before → after); kept 2 recent turn(s)`，主 feed 不新增配置行；其中有足够旧内容时 `N > 0`。
     3. 再询问最近两轮的信息，预期能完整回答；询问早期任务时应基于 compact 摘要回答。退出后检查会话 JSONL，可看到一条以 `[Compacted earlier conversation:` 开头的 system 消息，旧的大段 tool 输出不再完整保存。
     4. 临时把 `max_context_chars` 调低后重复长输出，预期无需输入 `/compact` 即出现自动 compact 反馈；TUI 与非 TTY REPL 行为一致。
 
 13. 验证本次 TUI 交互：
 
     1. 输入 `/se`，预期输入框上方只出现 `/sessions` 与说明；Up/Down 选择，Tab 补全，Esc 关闭。
-    2. 要求模型连续执行 `git status` 和 `git rev-parse --short HEAD`。预期同一 feed 内出现两个 `$ git …` 卡片，默认折叠 Output，卡片页脚分别显示 Wall 和 Timeout，卡片之间有空行。
+    2. 要求模型连续执行 `git status` 和 `git rev-parse --short HEAD`。预期同一 feed 内出现两个 `$ git …` 卡片，默认折叠 Output，卡片页脚分别显示耗时和 timeout，卡片之间有空行。
     3. 按 Tab 选中工具并按 Ctrl-O 展开/折叠。
-    4. 输入 `/think high`，再按 Ctrl-T。预期状态栏 think 更新，项目 `.zex/config.toml` 写入最新偏好；不支持推理强度的模型显示 `n/a`，不崩溃。
+    4. 输入 `/think high`，再连续按 Ctrl-T。预期状态栏 think 更新，项目 `.zex/config.toml` 写入最新偏好；每次只更新 toast，不向主 feed 追加消息。不支持推理强度的模型显示 `n/a`，不崩溃。
 
 ## 模块
 
