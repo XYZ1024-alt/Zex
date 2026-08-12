@@ -32,7 +32,7 @@ use crate::{
     agent::{Agent, AgentEvent, Message, MessageRole, PromptOutcome},
     command::{CommandEffect, CommandOutput, CommandSpec, command_specs, execute, parse},
     provider::{Provider, ThinkingLevel},
-    session::SessionStore,
+    session::{SessionStore, SessionSummary},
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -108,6 +108,7 @@ where
     let mut app = App::new(
         agent.messages(),
         agent.model().to_owned(),
+        session_id.clone(),
         AppContext {
             working_dir: working_dir.to_path_buf(),
             thinking_level: agent.thinking_level(),
@@ -155,6 +156,32 @@ where
                         InputAction::None => {}
                         InputAction::Quit => return Ok(()),
                         InputAction::Interrupt => {}
+                        InputAction::Resume(requested_id) => {
+                            match execute(
+                                crate::command::SlashCommand::Resume(Some(requested_id)),
+                                agent,
+                                session_store,
+                                session_id,
+                                working_dir,
+                            )
+                            .await
+                            {
+                                Ok(result) => {
+                                    app.sync_agent_status(agent, session_id.as_deref());
+                                    match result.effect {
+                                        CommandEffect::None => {}
+                                        CommandEffect::ClearView => app.reset_transcript(),
+                                        CommandEffect::ReplaceView => {
+                                            app.replace_transcript(agent.messages());
+                                        }
+                                    }
+                                    if app.push_command_output(result.output) {
+                                        app.scroll_to_bottom();
+                                    }
+                                }
+                                Err(error) => app.record_error(format!("{error:#}")),
+                            }
+                        }
                         InputAction::Submit(prompt) => {
                             app.remember_submission(&prompt);
                             match parse(&prompt) {
@@ -169,7 +196,7 @@ where
                                     .await
                                     {
                                         Ok(result) => {
-                                            app.sync_agent_status(agent);
+                                            app.sync_agent_status(agent, session_id.as_deref());
                                             match result.effect {
                                                 CommandEffect::None => {}
                                                 CommandEffect::ClearView => app.reset_transcript(),
@@ -194,7 +221,7 @@ where
                                         prompt,
                                     )
                                     .await?;
-                                    app.sync_agent_status(agent);
+                                    app.sync_agent_status(agent, session_id.as_deref());
                                 }
                                 Err(error) => app.record_error(format!("{error:#}")),
                             }
@@ -290,7 +317,7 @@ where
                             let _ = cancel_sender.send(true);
                         }
                         InputAction::None | InputAction::Interrupt => {}
-                        InputAction::Quit | InputAction::Submit(_) => {}
+                        InputAction::Quit | InputAction::Resume(_) | InputAction::Submit(_) => {}
                     },
                     Some(Err(error)) => {
                         return Err(error).context("failed to read terminal event");
@@ -314,6 +341,7 @@ enum InputAction {
     None,
     Quit,
     Interrupt,
+    Resume(String),
     Submit(String),
 }
 
@@ -365,7 +393,7 @@ fn handle_terminal_event(
             app.refresh_completion();
             InputAction::None
         }
-        Event::Mouse(mouse) if !app.completion_open() => {
+        Event::Mouse(mouse) if !app.completion_open() && !app.session_picker_open() => {
             match mouse.kind {
                 MouseEventKind::ScrollUp => app.scroll_lines_up(SCROLL_STEP),
                 MouseEventKind::ScrollDown => app.scroll_lines_down(SCROLL_STEP),
@@ -411,6 +439,21 @@ fn handle_key_event(
         } else {
             InputAction::Submit("/think".to_owned())
         };
+    }
+
+    if app.session_picker_open() && !turn_active {
+        match key.code {
+            KeyCode::Up => app.select_session(true),
+            KeyCode::Down => app.select_session(false),
+            KeyCode::Enter => {
+                if let Some(session_id) = app.take_selected_session() {
+                    return InputAction::Resume(session_id);
+                }
+            }
+            KeyCode::Esc => app.dismiss_session_picker(),
+            _ => {}
+        }
+        return InputAction::None;
     }
 
     if app.completion_open() && !turn_active {
@@ -764,6 +807,12 @@ struct CompletionState {
     dismissed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionPicker {
+    sessions: Vec<SessionSummary>,
+    selected: usize,
+}
+
 #[derive(Debug, Clone)]
 struct AppContext {
     working_dir: PathBuf,
@@ -777,6 +826,7 @@ struct AppContext {
 #[derive(Debug)]
 struct App {
     model: String,
+    session_id: Option<String>,
     transcript: Vec<TranscriptEntry>,
     input: InputBuffer,
     active_tools: BTreeMap<String, String>,
@@ -801,13 +851,20 @@ struct App {
     history_draft: String,
     toast: Option<Toast>,
     help_open: bool,
+    session_picker: Option<SessionPicker>,
 }
 
 impl App {
-    fn new(messages: &[Message], model: String, context: AppContext) -> Self {
+    fn new(
+        messages: &[Message],
+        model: String,
+        session_id: Option<String>,
+        context: AppContext,
+    ) -> Self {
         let git_status = load_git_status(&context.working_dir);
         let mut app = Self {
             model,
+            session_id,
             transcript: Vec::new(),
             input: InputBuffer::default(),
             active_tools: BTreeMap::new(),
@@ -835,6 +892,7 @@ impl App {
             history_draft: String::new(),
             toast: None,
             help_open: false,
+            session_picker: None,
         };
 
         for message in messages {
@@ -1018,6 +1076,7 @@ impl App {
         self.status = Status::Idle;
         self.toast = None;
         self.help_open = false;
+        self.session_picker = None;
         self.scroll_to_bottom();
     }
 
@@ -1026,6 +1085,7 @@ impl App {
         *self = Self::new(
             messages,
             model,
+            self.session_id.clone(),
             AppContext {
                 working_dir: self.working_dir.clone(),
                 thinking_level: self.thinking_level,
@@ -1081,6 +1141,12 @@ impl App {
             }
             CommandOutput::Sessions(sessions) => {
                 self.transcript.push(TranscriptEntry::Sessions(sessions));
+            }
+            CommandOutput::ResumePicker(sessions) => {
+                self.input.clear();
+                self.reset_history_navigation();
+                self.open_session_picker(sessions);
+                return false;
             }
             CommandOutput::Status(message) => {
                 self.show_toast(message, ToastTone::Success);
@@ -1177,6 +1243,10 @@ impl App {
     }
 
     fn cancel_ui_layer(&mut self) -> bool {
+        if self.session_picker_open() {
+            self.dismiss_session_picker();
+            return true;
+        }
         if self.completion_open() {
             self.dismiss_completion();
             return true;
@@ -1217,15 +1287,59 @@ impl App {
         false
     }
 
-    fn sync_agent_status<P>(&mut self, agent: &Agent<P>)
+    fn sync_agent_status<P>(&mut self, agent: &Agent<P>, session_id: Option<&str>)
     where
         P: Provider,
     {
         self.model = agent.model().to_owned();
+        self.session_id = session_id.map(str::to_owned);
         self.thinking_level = agent.thinking_level();
         self.thinking_preference = agent.thinking_preference();
         self.context_chars = agent.context_chars();
         self.max_context_chars = agent.max_context_chars();
+    }
+
+    fn open_session_picker(&mut self, sessions: Vec<SessionSummary>) {
+        self.help_open = false;
+        self.completion.dismissed = true;
+        self.session_picker = Some(SessionPicker {
+            selected: sessions
+                .iter()
+                .position(|session| Some(session.id.as_str()) == self.session_id.as_deref())
+                .unwrap_or(0),
+            sessions,
+        });
+    }
+
+    fn session_picker_open(&self) -> bool {
+        self.session_picker.is_some()
+    }
+
+    fn select_session(&mut self, reverse: bool) {
+        let Some(picker) = &mut self.session_picker else {
+            return;
+        };
+        let count = picker.sessions.len();
+        if count == 0 {
+            return;
+        }
+        picker.selected = if reverse {
+            picker.selected.checked_sub(1).unwrap_or(count - 1)
+        } else {
+            (picker.selected + 1) % count
+        };
+    }
+
+    fn take_selected_session(&mut self) -> Option<String> {
+        let picker = self.session_picker.take()?;
+        picker
+            .sessions
+            .get(picker.selected)
+            .map(|session| session.id.clone())
+    }
+
+    fn dismiss_session_picker(&mut self) {
+        self.session_picker = None;
     }
 
     fn completion_matches(&self) -> Vec<&'static CommandSpec> {
@@ -1286,6 +1400,9 @@ impl App {
             return false;
         };
         if self.input.content.trim() == command.name {
+            if command.accepts_arguments {
+                self.completion.dismissed = true;
+            }
             return false;
         }
         self.accept_completion();
@@ -1410,6 +1527,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_keymap(frame, regions.keymap, app);
     render_input(frame, regions.input, app);
     render_help_overlay(frame, regions.transcript, app);
+    render_session_picker(frame, regions.transcript, app);
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1446,6 +1564,11 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         None => short_path(&app.working_dir, 48),
     };
+    let session = app
+        .session_id
+        .as_deref()
+        .map(short_session_id)
+        .unwrap_or("new");
 
     let right_text = if content.width >= 18 {
         format!("ctx {context_percent}%")
@@ -1496,6 +1619,12 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(thinking, Style::default().fg(TEXT)),
         ]);
     }
+    if left_width >= 62 && app.session_id.is_some() {
+        spans.extend([
+            Span::styled("  ·  session ", Style::default().fg(DIM)),
+            Span::styled(session, Style::default().fg(TEXT)),
+        ]);
+    }
     if left_width >= 76 {
         spans.extend([
             Span::styled("  ·  ", Style::default().fg(MUTED)),
@@ -1530,6 +1659,126 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             content,
         );
     }
+}
+
+fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &App) {
+    let Some(picker) = &app.session_picker else {
+        return;
+    };
+    if viewport.is_empty() {
+        return;
+    }
+
+    let viewport = content_area(viewport);
+    let width = viewport.width.clamp(1, 88);
+    let max_visible = viewport.height.saturating_sub(4).max(1) as usize;
+    let visible_count = picker.sessions.len().clamp(1, max_visible);
+    let height = viewport
+        .height
+        .min((visible_count as u16).saturating_mul(2).saturating_add(4))
+        .max(1);
+    let area = Rect::new(
+        viewport.x + viewport.width.saturating_sub(width) / 2,
+        viewport.y + viewport.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let inner_width = area.width.saturating_sub(4) as usize;
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "Resume session",
+            Style::default()
+                .fg(TEXT_STRONG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if picker.sessions.is_empty() {
+                "  Esc close"
+            } else {
+                "  ↑↓ select · Enter resume · Esc cancel"
+            },
+            Style::default().fg(DIM),
+        ),
+    ])];
+
+    if picker.sessions.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "No saved sessions",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        let start = picker
+            .selected
+            .saturating_sub(visible_count.saturating_sub(1));
+        for (index, session) in picker
+            .sessions
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible_count)
+        {
+            let selected = index == picker.selected;
+            let background = if selected { ACCENT } else { SURFACE_RAISED };
+            let foreground = if selected { Color::Black } else { TEXT_STRONG };
+            let secondary = if selected { Color::Black } else { DIM };
+            let marker = if selected { "›" } else { " " };
+            let timestamp = format_session_time(session.updated_at);
+            let metadata = format!(
+                "{} · {} message{}",
+                timestamp,
+                session.message_count,
+                if session.message_count == 1 { "" } else { "s" }
+            );
+            let id = short_session_id(&session.id);
+            let id_width = UnicodeWidthStr::width(id);
+            let metadata_limit = inner_width
+                .saturating_sub(id_width.saturating_add(4))
+                .max(1);
+            let preview_limit = inner_width.saturating_sub(2).max(1);
+
+            lines.push(
+                Line::from(vec![
+                    Span::styled(format!("{marker} "), Style::default().fg(secondary)),
+                    Span::styled(
+                        id.to_owned(),
+                        Style::default().fg(foreground).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  ", Style::default().fg(secondary)),
+                    Span::styled(
+                        single_line(&metadata, metadata_limit),
+                        Style::default().fg(secondary),
+                    ),
+                ])
+                .style(Style::default().bg(background)),
+            );
+            lines.push(
+                Line::from(vec![
+                    Span::styled("  ", Style::default().fg(secondary)),
+                    Span::styled(
+                        single_line(&session.preview, preview_limit),
+                        Style::default().fg(secondary),
+                    ),
+                ])
+                .style(Style::default().bg(background)),
+            );
+        }
+    }
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT))
+                    .style(Style::default().bg(SURFACE_RAISED))
+                    .padding(ratatui::widgets::Padding::horizontal(1)),
+            )
+            .style(Style::default().bg(SURFACE_RAISED))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2305,7 +2554,12 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
-    let hint = if let Some(toast) = &app.toast {
+    let hint = if app.session_picker_open() {
+        Line::from(Span::styled(
+            "↑↓ select · Enter resume · Esc cancel",
+            Style::default().fg(DIM),
+        ))
+    } else if let Some(toast) = &app.toast {
         Line::from(vec![
             Span::styled("● ", Style::default().fg(toast.color())),
             Span::styled(toast.message.clone(), Style::default().fg(TEXT)),
@@ -2403,6 +2657,20 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 fn single_line(value: &str, max_chars: usize) -> String {
     truncate_chars(&value.replace(['\r', '\n'], " "), max_chars).replace("\n… truncated", " …")
+}
+
+fn short_session_id(id: &str) -> &str {
+    id.rsplit('-').next().unwrap_or(id)
+}
+
+fn format_session_time(timestamp: time::OffsetDateTime) -> String {
+    let local_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    timestamp
+        .to_offset(local_offset)
+        .format(time::macros::format_description!(
+            "[year]-[month]-[day] [hour]:[minute]"
+        ))
+        .unwrap_or_else(|_| timestamp.unix_timestamp().to_string())
 }
 
 fn short_path(path: &Path, max_chars: usize) -> String {
@@ -2540,13 +2808,14 @@ mod tests {
         SURFACE, SURFACE_RAISED, Status, ToolStatus, TranscriptEntry, UiRegions, command_specs,
         handle_key_event, handle_terminal_event, input_metrics, render, truncate_chars, ui_regions,
     };
-    use crate::agent::{AgentEvent, MessageRole};
+    use crate::agent::{AgentEvent, Message, MessageRole};
     use crate::provider::ThinkingLevel;
 
     fn app() -> App {
         App::new(
             &[],
             "test-model".to_owned(),
+            None,
             AppContext {
                 working_dir: PathBuf::from("."),
                 thinking_level: None,
@@ -3153,6 +3422,218 @@ mod tests {
     }
 
     #[test]
+    fn exact_resume_completion_executes_instead_of_inserting_argument_space() {
+        let mut app = app();
+        app.input.insert_str("/resume");
+        app.refresh_completion();
+
+        assert_eq!(
+            handle_key_event(
+                key(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                &mut app,
+                false,
+                false,
+            ),
+            InputAction::Submit("/resume".to_owned())
+        );
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn resume_picker_selects_with_arrows_and_returns_the_chosen_session() {
+        let mut app = app();
+        app.push_command_output(CommandOutput::ResumePicker(vec![
+            crate::session::SessionSummary {
+                id: "20260812-121500-cafebabe".to_owned(),
+                updated_at: time::OffsetDateTime::UNIX_EPOCH + Duration::from_secs(60),
+                message_count: 3,
+                preview: "newer task".to_owned(),
+            },
+            crate::session::SessionSummary {
+                id: "20260812-120000-deadbeef".to_owned(),
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                message_count: 2,
+                preview: "older task".to_owned(),
+            },
+        ]));
+
+        assert!(app.session_picker_open());
+        assert_eq!(
+            handle_key_event(
+                key(
+                    crossterm::event::KeyCode::Down,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                &mut app,
+                false,
+                false,
+            ),
+            InputAction::None
+        );
+        assert_eq!(
+            handle_key_event(
+                key(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                &mut app,
+                false,
+                false,
+            ),
+            InputAction::Resume("20260812-120000-deadbeef".to_owned())
+        );
+        assert!(!app.session_picker_open());
+        assert_eq!(app.input.content, "");
+    }
+
+    #[test]
+    fn resume_picker_enter_returns_the_first_recent_session_by_default() {
+        let mut app = app();
+        app.push_command_output(CommandOutput::ResumePicker(vec![
+            crate::session::SessionSummary {
+                id: "20260812-121500-cafebabe".to_owned(),
+                updated_at: time::OffsetDateTime::UNIX_EPOCH + Duration::from_secs(60),
+                message_count: 3,
+                preview: "newer task".to_owned(),
+            },
+            crate::session::SessionSummary {
+                id: "20260812-120000-deadbeef".to_owned(),
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                message_count: 2,
+                preview: "older task".to_owned(),
+            },
+        ]));
+
+        assert_eq!(
+            handle_key_event(
+                key(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                &mut app,
+                false,
+                false,
+            ),
+            InputAction::Resume("20260812-121500-cafebabe".to_owned())
+        );
+    }
+
+    #[test]
+    fn resume_picker_escape_cancels_without_touching_the_transcript() {
+        let mut app = app();
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Keep this conversation visible.".to_owned(),
+        });
+        let transcript_before = app.transcript.clone();
+        app.push_command_output(CommandOutput::ResumePicker(vec![
+            crate::session::SessionSummary {
+                id: "20260812-121500-cafebabe".to_owned(),
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                message_count: 1,
+                preview: "saved task".to_owned(),
+            },
+        ]));
+
+        assert_eq!(
+            handle_key_event(
+                key(
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                &mut app,
+                false,
+                false,
+            ),
+            InputAction::None
+        );
+        assert!(!app.session_picker_open());
+        assert_eq!(app.transcript, transcript_before);
+    }
+
+    #[test]
+    fn resume_picker_renders_short_id_time_preview_count_and_empty_state() {
+        let mut app = app();
+        app.push_command_output(CommandOutput::ResumePicker(vec![
+            crate::session::SessionSummary {
+                id: "20260812-121500-cafebabe".to_owned(),
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                message_count: 2,
+                preview: "first saved task".to_owned(),
+            },
+        ]));
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let populated = format!("{}", terminal.backend());
+        assert!(populated.contains("Resume session"));
+        assert!(populated.contains("cafebabe"));
+        assert!(!populated.contains("20260812-121500-cafebabe"));
+        assert!(populated.contains("1970-01-01"));
+        assert!(populated.contains("2 messages"));
+        assert!(populated.contains("first saved task"));
+        assert!(populated.contains("Enter resume"));
+
+        app.push_command_output(CommandOutput::ResumePicker(Vec::new()));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let empty = format!("{}", terminal.backend());
+        assert!(empty.contains("No saved sessions"));
+        assert!(empty.contains("Esc close"));
+    }
+
+    #[test]
+    fn resumed_session_id_is_visible_in_the_footer() {
+        let mut app = app();
+        app.session_id = Some("20260812-121500-cafebabe".to_owned());
+        let backend = TestBackend::new(120, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+
+        assert!(screen.contains("session cafebabe"));
+    }
+
+    #[test]
+    fn replacing_transcript_after_resume_loads_saved_messages_and_session_status() {
+        let mut app = app();
+        app.model = "saved-model".to_owned();
+        app.session_id = Some("20260812-121500-cafebabe".to_owned());
+
+        app.replace_transcript(&[
+            Message::User {
+                content: "saved context".to_owned(),
+            },
+            Message::Assistant {
+                content: "saved answer".to_owned(),
+                tool_calls: Vec::new(),
+                provider_state: None,
+            },
+        ]);
+
+        assert!(app.transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Message {
+                role: MessageRole::User,
+                content,
+            } if content == "saved context"
+        )));
+        assert!(app.transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Message {
+                role: MessageRole::Assistant,
+                content,
+            } if content == "saved answer"
+        )));
+        assert_eq!(app.session_id.as_deref(), Some("20260812-121500-cafebabe"));
+        assert_eq!(app.model, "saved-model");
+    }
+
+    #[test]
     fn history_navigation_restores_the_unsent_draft() {
         let mut app = app();
         app.remember_submission("first task");
@@ -3481,7 +3962,7 @@ mod tests {
         assert!(!screen.contains("timeout 30.0s"));
         assert!(!screen.contains("Ctrl+O"));
         assert!(screen.contains("/sessions"));
-        assert!(screen.contains("List saved sessions"));
+        assert!(screen.contains("View saved sessions"));
         assert!(screen.contains("think high"));
         assert!(screen.contains("› /se"));
 
@@ -3517,6 +3998,7 @@ mod tests {
         let mut app = App::new(
             &[],
             "gpt-test".to_owned(),
+            None,
             AppContext {
                 working_dir: PathBuf::from("."),
                 thinking_level: None,
@@ -3674,6 +4156,7 @@ mod tests {
         let mut app = App::new(
             &[],
             "gpt-test".to_owned(),
+            None,
             AppContext {
                 working_dir: PathBuf::from("."),
                 thinking_level: None,

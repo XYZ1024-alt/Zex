@@ -136,28 +136,6 @@ impl SessionStore {
         }
     }
 
-    pub async fn load_excluding(
-        &self,
-        session_id: Option<&str>,
-        excluded_id: Option<&str>,
-    ) -> Result<Option<LoadedSession>> {
-        match session_id {
-            Some(id) => self.load(Some(id)).await,
-            None => {
-                let id = self
-                    .list()
-                    .await?
-                    .into_iter()
-                    .find(|session| Some(session.id.as_str()) != excluded_id)
-                    .map(|session| session.id);
-                match id {
-                    Some(id) => self.load(Some(&id)).await,
-                    None => Ok(None),
-                }
-            }
-        }
-    }
-
     pub async fn list(&self) -> Result<Vec<SessionSummary>> {
         let mut entries = match tokio::fs::read_dir(&self.directory).await {
             Ok(entries) => entries,
@@ -450,13 +428,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_resume_can_exclude_the_current_session() {
-        let directory = temp_directory("exclude-current");
+    async fn list_orders_sessions_by_most_recent_update() {
+        let directory = temp_directory("recent-first");
         let store = SessionStore::new(directory.clone());
         let older = store
             .save(
                 None,
-                "older-model",
+                "model",
                 &[Message::User {
                     content: "older".to_owned(),
                 }],
@@ -464,24 +442,27 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        let current = store
+        let newer = store
             .save(
                 None,
-                "current-model",
+                "model",
                 &[Message::User {
-                    content: "current".to_owned(),
+                    content: "newer".to_owned(),
                 }],
             )
             .await
             .unwrap();
 
-        let loaded = store
-            .load_excluding(None, Some(&current))
-            .await
-            .unwrap()
-            .unwrap();
+        let sessions = store.list().await.unwrap();
 
-        assert_eq!(loaded.id, older);
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![newer.as_str(), older.as_str()]
+        );
+        assert!(sessions[0].updated_at >= sessions[1].updated_at);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

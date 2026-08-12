@@ -104,6 +104,9 @@ fn print_command_output(output: &CommandOutput) -> Result<()> {
             }
         }
         CommandOutput::Sessions(sessions) => println!("{}", format_session_summaries(sessions)?),
+        CommandOutput::ResumePicker(sessions) => {
+            println!("{}", format_session_summaries(sessions)?)
+        }
         CommandOutput::Status(message) => println!("{message}"),
     }
     Ok(())

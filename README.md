@@ -179,8 +179,8 @@ TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册�
 | `/model` | 显示当前会话正在使用的 model |
 | `/model <name>` | 立即切换后续 Provider 请求使用的 model；保存会话时一并记录 |
 | `/clear` | 清空当前 TUI/REPL 上下文；TUI 同时清空对话视图。不删除磁盘会话，下一条普通消息创建新会话 |
-| `/sessions` | 复用 `SessionStore::list` 列出 ID、更新时间、消息数和预览 |
-| `/resume [id]` | 恢复指定会话；省略 ID 时恢复最近的非当前会话。恢复消息及该会话保存的 model |
+| `/sessions` | 查看保存的会话；复用 `SessionStore::list` 列出 ID、更新时间、消息数和预览 |
+| `/resume [id]` | 无参数时打开历史会话选择列表；有参数时直接恢复指定会话。恢复消息及该会话保存的 model |
 | `/compact` | 立即压缩旧上下文，显示压缩前后字符数、约释放字符数、保留轮次和摘要数量 |
 | `/think [off\|low\|medium\|high]` | 无参数时循环切换；有参数时直接设置。写入项目 `.zex/config.toml`；模型不支持时显示 `n/a` 并保留偏好 |
 
@@ -366,7 +366,7 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 
 10. 验证内置搜索：在 TUI 或非 TTY REPL 中要求模型“必须用 `grep` 搜索 `Cargo.toml` 中的 `name`，再用 `glob` 查找 `src/**/*.rs`”。预期出现两个内置 tool 事件，不调用 `rg`/`fd`，并且 `.gitignore` 中排除的路径不出现在结果里。
 
-11. 验证斜杠命令：在 TUI 中依次输入 `/help`、`/model`、`/model <另一个可用模型>`、`/sessions`。预期 `/help` 与 `/sessions` 进入 feed；model 查询和切换只显示短暂 toast，不出现用户消息；状态栏 model 在切换后更新。输入 `/resume <id>` 后视图替换成保存的会话，省略 ID 时恢复最近的非当前会话。输入 `/clear` 后对话区清空，仅在底部显示短暂反馈，磁盘会话文件仍存在。
+11. 验证斜杠命令：在 TUI 中依次输入 `/help`、`/model`、`/model <另一个可用模型>`、`/sessions`。预期 `/help` 与 `/sessions` 进入 feed；model 查询和切换只显示短暂 toast，不出现用户消息；状态栏 model 在切换后更新。输入 `/resume` 后出现按最近更新排序的历史会话选择列表，Up/Down 选择、Enter 恢复、Esc 取消；输入 `/resume <id>` 后直接恢复指定会话并替换视图。输入 `/clear` 后对话区清空，仅在底部显示短暂反馈，磁盘会话文件仍存在。
 
 12. 验证 `/compact` 前后上下文变化：
 

@@ -46,13 +46,13 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/sessions",
         usage: "/sessions",
-        description: "List saved sessions",
+        description: "View saved sessions",
         accepts_arguments: false,
     },
     CommandSpec {
         name: "/resume",
         usage: "/resume [id]",
-        description: "Resume a saved session",
+        description: "Choose a saved session, or resume ID directly",
         accepts_arguments: true,
     },
     CommandSpec {
@@ -95,6 +95,7 @@ pub enum CommandEffect {
 pub enum CommandOutput {
     Help,
     Sessions(Vec<SessionSummary>),
+    ResumePicker(Vec<SessionSummary>),
     Status(String),
 }
 
@@ -192,16 +193,17 @@ where
             })
         }
         SlashCommand::Resume(requested_id) => {
+            let Some(requested_id) = requested_id else {
+                return Ok(CommandResult {
+                    output: CommandOutput::ResumePicker(session_store.list().await?),
+                    effect: CommandEffect::None,
+                });
+            };
             let loaded = session_store
-                .load_excluding(requested_id.as_deref(), session_id.as_deref())
+                .load(Some(&requested_id))
                 .await?
-                .with_context(|| match requested_id {
-                    Some(id) => {
-                        format!("Session {id:?} not found. Use /sessions to list saved sessions.")
-                    }
-                    None => {
-                        "No other saved sessions. Use /sessions to list saved sessions.".to_owned()
-                    }
+                .with_context(|| {
+                    format!("Session {requested_id:?} not found. Use /resume to choose a session.")
                 })?;
             let resumed_id = loaded.id;
             if let Some(model) = loaded.model {
@@ -358,7 +360,7 @@ mod execution_tests {
     }
 
     #[tokio::test]
-    async fn model_and_resume_update_agent_session_state() {
+    async fn model_and_resume_update_agent_session_state_and_visible_timeline() {
         let directory = temporary_directory();
         let store = SessionStore::new(directory.clone());
         let resumed_id = store
@@ -400,6 +402,197 @@ mod execution_tests {
         assert!(agent.messages().iter().any(
             |message| matches!(message, Message::User { content } if content == "saved context")
         ));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_without_id_returns_recent_session_choices_without_switching() {
+        let directory = temporary_directory();
+        let store = SessionStore::new(directory.clone());
+        let older_id = store
+            .save(
+                None,
+                "older-model",
+                &[Message::User {
+                    content: "older context".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let newer_id = store
+            .save(
+                None,
+                "newer-model",
+                &[Message::User {
+                    content: "newer context".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+        let original_messages = vec![Message::User {
+            content: "current context".to_owned(),
+        }];
+        let mut agent = agent(original_messages.clone());
+        let mut session_id = Some("current-session".to_owned());
+
+        let result = execute(
+            SlashCommand::Resume(None),
+            &mut agent,
+            &store,
+            &mut session_id,
+            &directory,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.effect, CommandEffect::None);
+        let CommandOutput::ResumePicker(sessions) = result.output else {
+            panic!("expected resume picker");
+        };
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![newer_id.as_str(), older_id.as_str()]
+        );
+        assert_eq!(session_id.as_deref(), Some("current-session"));
+        assert_eq!(
+            agent
+                .messages()
+                .iter()
+                .filter(|message| !matches!(message, Message::System { .. }))
+                .cloned()
+                .collect::<Vec<_>>(),
+            original_messages
+        );
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sessions_lists_without_switching_the_active_conversation() {
+        let directory = temporary_directory();
+        let store = SessionStore::new(directory.clone());
+        let saved_id = store
+            .save(
+                None,
+                "saved-model",
+                &[Message::User {
+                    content: "saved context".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+        let original_messages = vec![Message::User {
+            content: "current context".to_owned(),
+        }];
+        let mut agent = agent(original_messages.clone());
+        let mut session_id = Some("current-session".to_owned());
+
+        let result = execute(
+            SlashCommand::Sessions,
+            &mut agent,
+            &store,
+            &mut session_id,
+            &directory,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.effect, CommandEffect::None);
+        assert!(matches!(
+            result.output,
+            CommandOutput::Sessions(sessions)
+                if sessions.len() == 1 && sessions[0].id == saved_id
+        ));
+        assert_eq!(session_id.as_deref(), Some("current-session"));
+        assert_eq!(
+            agent
+                .messages()
+                .iter()
+                .filter(|message| !matches!(message, Message::System { .. }))
+                .cloned()
+                .collect::<Vec<_>>(),
+            original_messages
+        );
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_resume_id_returns_a_short_error_without_switching() {
+        let directory = temporary_directory();
+        let store = SessionStore::new(directory.clone());
+        let original_messages = vec![Message::User {
+            content: "keep this context".to_owned(),
+        }];
+        let mut agent = agent(original_messages.clone());
+        let mut session_id = Some("current-session".to_owned());
+
+        let error = execute(
+            SlashCommand::Resume(Some("missing-session".to_owned())),
+            &mut agent,
+            &store,
+            &mut session_id,
+            &directory,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Session \"missing-session\" not found. Use /resume to choose a session."
+        );
+        assert_eq!(session_id.as_deref(), Some("current-session"));
+        assert_eq!(
+            agent
+                .messages()
+                .iter()
+                .filter(|message| !matches!(message, Message::System { .. }))
+                .cloned()
+                .collect::<Vec<_>>(),
+            original_messages
+        );
+    }
+
+    #[tokio::test]
+    async fn continued_chat_saves_back_to_the_resumed_session() {
+        let directory = temporary_directory();
+        let store = SessionStore::new(directory.clone());
+        let resumed_id = store
+            .save(
+                None,
+                "saved-model",
+                &[Message::User {
+                    content: "saved context".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+        let mut agent = agent(Vec::new());
+        let mut session_id = None;
+
+        execute(
+            SlashCommand::Resume(Some(resumed_id.clone())),
+            &mut agent,
+            &store,
+            &mut session_id,
+            &directory,
+        )
+        .await
+        .unwrap();
+        agent.prompt("continued question").await.unwrap();
+        let saved_id = store
+            .save(session_id.as_deref(), agent.model(), agent.messages())
+            .await
+            .unwrap();
+        let reloaded = store.load(Some(&resumed_id)).await.unwrap().unwrap();
+
+        assert_eq!(saved_id, resumed_id);
+        assert!(reloaded.messages.iter().any(
+            |message| matches!(message, Message::User { content } if content == "continued question")
+        ));
+        assert_eq!(store.list().await.unwrap().len(), 1);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
@@ -540,6 +733,23 @@ mod tests {
                 .find(|command| command.name == "/new")
                 .map(|command| command.description),
             Some("Start a new session (alias of /clear)")
+        );
+        assert_eq!(
+            command_specs()
+                .iter()
+                .find(|command| command.name == "/sessions")
+                .map(|command| command.description),
+            Some("View saved sessions")
+        );
+        assert_eq!(
+            command_specs()
+                .iter()
+                .find(|command| command.name == "/resume")
+                .map(|command| (command.usage, command.description)),
+            Some((
+                "/resume [id]",
+                "Choose a saved session, or resume ID directly"
+            ))
         );
     }
 }
