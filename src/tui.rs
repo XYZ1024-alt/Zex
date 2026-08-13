@@ -53,7 +53,7 @@ const MAX_INPUT_HISTORY: usize = 100;
 const MIN_TRANSCRIPT_HEIGHT: u16 = 2;
 const HORIZONTAL_GUTTER: u16 = 2;
 const MAX_INPUT_ROWS: usize = 5;
-const INPUT_HORIZONTAL_PADDING: u16 = 4;
+const INPUT_HORIZONTAL_PADDING: u16 = 3;
 const INPUT_VERTICAL_PADDING: u16 = 1;
 const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
@@ -61,8 +61,8 @@ const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 const BACKGROUND: Color = Color::Rgb(20, 20, 20); // #141414
 const SURFACE: Color = Color::Rgb(27, 27, 27);
-const SURFACE_HOVER: Color = Color::Rgb(34, 34, 34);
-const SURFACE_RAISED: Color = Color::Rgb(41, 41, 41);
+const SURFACE_HOVER: Color = Color::Rgb(31, 31, 31);
+const SURFACE_RAISED: Color = Color::Rgb(34, 34, 34);
 const TEXT: Color = Color::Rgb(243, 243, 243); // #F3F3F3
 const TEXT_STRONG: Color = TEXT;
 const TEXT_DIM: Color = Color::Rgb(160, 160, 160); // #A0A0A0
@@ -71,12 +71,13 @@ const ACCENT_PRIMARY: Color = Color::Rgb(122, 162, 247); // #7AA2F7
 const ACCENT_SECONDARY: Color = Color::Rgb(187, 154, 247); // #BB9AF7
 const OK: Color = Color::Rgb(158, 206, 106); // #9ECE6A
 const BAD: Color = Color::Rgb(219, 75, 75); // #DB4B4B
-const LANDING_LOGO_ROWS: [&str; 3] = [
-    "██████    ██████    ██  ██",
-    "   ██     ████       ████ ",
-    "██████    ██████    ██  ██",
+const LANDING_LOGO_ROWS: [&str; 5] = [
+    "███████  ███████  ██   ██",
+    "     ██  ██        ██ ██ ",
+    "   ███   █████      ███  ",
+    " ██      ██        ██ ██ ",
+    "███████  ███████  ██   ██",
 ];
-const LANDING_LOGO_DARK: Color = Color::Rgb(82, 82, 82);
 
 pub fn is_available() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()

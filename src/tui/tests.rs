@@ -5,10 +5,10 @@ use ratatui::{Terminal, backend::TestBackend, style::Color};
 
 use super::{
     ACCENT_PRIMARY, ACCENT_SECONDARY, App, AppContext, BACKGROUND, BAD, CommandOutput, HitTarget,
-    InputAction, InputBuffer, KeyBurst, LANDING_LOGO_DARK, LANDING_LOGO_ROWS, OK, ProviderPane,
-    SCROLL_STEP, SURFACE, SURFACE_RAISED, Status, TEXT_DIM, ThinkingEntry, ToolStatus,
-    TranscriptEntry, command_specs, handle_key_event, handle_mouse_event, handle_terminal_event,
-    input_metrics, landing_regions, render, sanitize_terminal_text, truncate_chars, ui_regions,
+    InputAction, InputBuffer, KeyBurst, LANDING_LOGO_ROWS, OK, ProviderPane, SCROLL_STEP, SURFACE,
+    SURFACE_RAISED, Status, TEXT_DIM, ThinkingEntry, ToolStatus, TranscriptEntry, command_specs,
+    handle_key_event, handle_mouse_event, handle_terminal_event, input_metrics, landing_regions,
+    render, sanitize_terminal_text, truncate_chars, ui_regions,
 };
 use crate::agent::{AgentEvent, Message, MessageRole};
 use crate::config::{ModelConfig, ModelRef, ProviderCatalog, ProviderConfig, SecretValue};
@@ -243,14 +243,14 @@ fn statusline_prefers_model_think_and_context_as_width_shrinks() {
     assert!(wide.contains("Zex"));
     assert!(wide.contains("*3"));
     assert!(wide.contains("42.7 tok/s"));
-    assert!(wide.contains("49.1%/120Kc"));
+    assert!(wide.contains("ctx 49.1%"));
 
     let backend = TestBackend::new(42, 12);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let narrow = format!("{}", terminal.backend());
     assert!(narrow.contains("high"));
-    assert!(narrow.contains("49.1%/120K"));
+    assert!(narrow.contains("ctx 49.1%"));
     assert!(!narrow.contains("feature/statusline-polish"));
     assert!(!narrow.contains("cafebabe"));
 }
@@ -669,7 +669,7 @@ async fn provider_save_remaps_the_active_target_when_ids_are_renamed() {
 }
 
 #[test]
-fn empty_state_centers_the_zex_card_and_keeps_status_quiet() {
+fn empty_state_centers_a_large_zex_wordmark_and_focused_prompt_surface() {
     let mut app = configured_app();
     app.working_dir = PathBuf::from("D:/workspaces/zex");
     app.git_status = Some(super::GitStatus {
@@ -687,72 +687,56 @@ fn empty_state_centers_the_zex_card_and_keeps_status_quiet() {
     let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 100, 24), &app);
 
     assert!(screen.contains(LANDING_LOGO_ROWS[0]));
-    assert!(!screen.contains("Z  E  X"));
+    assert!(!screen.contains("precision, without noise"));
     assert!(screen.contains("Ask anything…"));
     assert!(screen.contains("Enter send"));
     assert!(screen.contains("/ actions"));
     assert!(screen.contains("gpt-5"));
-    assert!(screen.contains("ZEX · high"));
+    assert!(screen.contains("think high"));
     assert!(!screen.contains("25.0%/120Kc"));
     assert!(screen.contains("D:/workspaces/zex"));
     assert!(screen.contains(env!("CARGO_PKG_VERSION")));
     assert!(!screen.contains("● idle"));
     assert!(!screen.contains("ctx "));
     assert!(!screen.contains("tok/s"));
-    assert!(!screen.contains("Zex v"));
+    assert!(!screen.contains("━━"));
     assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
-    assert!(regions.card.y > 4);
+    assert_eq!(regions.brand.height, 5);
     assert!(regions.card.bottom() < regions.status.y);
-    assert_eq!(regions.card.width, 65);
-    assert_eq!(regions.card.height, 8);
+    assert_eq!(regions.card.width, 62);
+    assert_eq!(regions.card.height, 5);
     assert_eq!(
         terminal.backend().buffer()[(regions.card.x, regions.card.y)].symbol(),
-        " "
+        "▎"
     );
     assert_eq!(
         style_at(&terminal, regions.card.x + 1, regions.card.y).bg,
         Some(SURFACE)
     );
     assert_eq!(
-        terminal.backend().buffer()[(regions.card.x + 3, regions.card.y + 1)].symbol(),
-        "━"
+        style_at(&terminal, regions.card.x, regions.card.y).fg,
+        Some(ACCENT_PRIMARY)
     );
     assert_eq!(
-        terminal.backend().buffer()[(regions.card.x + 4, regions.card.y + 1)].symbol(),
-        "━"
-    );
-    assert_eq!(
-        style_at(&terminal, regions.card.x + 4, regions.card.bottom() - 2).fg,
+        style_at(&terminal, regions.card.x + 3, regions.card.bottom() - 2).fg,
         Some(super::TEXT_STRONG)
     );
-    let logo_x = regions.brand.x
-        + regions
-            .brand
-            .width
-            .saturating_sub(LANDING_LOGO_ROWS[0].chars().count() as u16)
-            / 2;
-    assert_eq!(
-        style_at(&terminal, logo_x, regions.brand.y).fg,
-        Some(LANDING_LOGO_DARK)
+    let group_center_twice = regions.brand.y + regions.hint.bottom();
+    let stage_center_twice = regions.status.y;
+    assert!(
+        group_center_twice.abs_diff(stage_center_twice) <= 1,
+        "landing group is not vertically centered: group={group_center_twice}, stage={stage_center_twice}"
     );
-    let logo_end = style_at(
-        &terminal,
-        logo_x + LANDING_LOGO_ROWS[0].chars().count() as u16 - 1,
-        regions.brand.y,
-    )
-    .fg;
-    assert_ne!(logo_end, Some(super::TEXT_STRONG));
-    assert_ne!(logo_end, Some(LANDING_LOGO_DARK));
-    let version = format!("ZEX {}", env!("CARGO_PKG_VERSION"));
+    let version = env!("CARGO_PKG_VERSION");
     let version_x = 100 - version.chars().count() as u16 - super::HORIZONTAL_GUTTER;
     assert_eq!(
         terminal.backend().buffer()[(version_x, regions.status.y)].symbol(),
-        "Z"
+        "0"
     );
 }
 
 #[test]
-fn empty_input_keeps_the_cursor_cell_clear_for_ime_preedit() {
+fn empty_input_places_the_placeholder_under_the_ime_preedit_cursor() {
     let mut app = app();
     let backend = TestBackend::new(80, 16);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -760,15 +744,15 @@ fn empty_input_keeps_the_cursor_cell_clear_for_ime_preedit() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
     let editor_x = regions.card.x + 3;
-    let editor_y = regions.card.y + 3;
+    let editor_y = regions.card.y + 1;
 
     terminal
         .backend_mut()
         .assert_cursor_position((editor_x, editor_y));
     assert_eq!(
         terminal.backend().buffer()[(editor_x, editor_y)].symbol(),
-        " ",
-        "the IME preedit must not overlap application-rendered text"
+        "A",
+        "the IME preedit cursor should replace the placeholder instead of appearing before it"
     );
 }
 
@@ -783,7 +767,7 @@ fn typed_input_starts_at_the_empty_editor_cursor_origin() {
     let screen = format!("{}", terminal.backend());
     let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
     let editor_x = regions.card.x + 3;
-    let editor_y = regions.card.y + 3;
+    let editor_y = regions.card.y + 1;
 
     assert!(screen.contains("hello"));
     assert!(!screen.contains("Ask anything..."));
@@ -883,13 +867,13 @@ fn footer_is_a_full_input_band_in_idle_and_busy_states() {
     let idle_regions = ui_regions(area, &app);
     for y in idle_regions.footer.y + 1..idle_regions.footer.bottom() {
         for x in super::HORIZONTAL_GUTTER..area.width - super::HORIZONTAL_GUTTER {
-            assert_eq!(style_at(&terminal, x, y).bg, Some(SURFACE_RAISED));
+            assert_eq!(style_at(&terminal, x, y).bg, Some(SURFACE));
         }
     }
     let idle = format!("{}", terminal.backend());
     assert!(idle.contains("ZEX"));
     assert!(idle.contains("test-model"));
-    assert!(idle.contains("Ctrl+P commands"));
+    assert!(idle.contains("Shift+Enter newline"));
 
     app.start_turn();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -897,11 +881,61 @@ fn footer_is_a_full_input_band_in_idle_and_busy_states() {
     let busy_regions = ui_regions(area, &app);
     for y in busy_regions.footer.y + 1..busy_regions.footer.bottom() {
         for x in super::HORIZONTAL_GUTTER..area.width - super::HORIZONTAL_GUTTER {
-            assert_eq!(style_at(&terminal, x, y).bg, Some(SURFACE_RAISED));
+            assert_eq!(style_at(&terminal, x, y).bg, Some(SURFACE));
         }
     }
     assert!(busy.contains("Esc interrupt"));
     assert!(busy.contains("Working"));
+}
+
+#[test]
+fn busy_input_band_preserves_metadata_and_editor_context() {
+    let mut app = app();
+    app.transcript.push(TranscriptEntry::Message {
+        role: MessageRole::User,
+        content: "Inspect the project".to_owned(),
+    });
+    app.start_turn();
+    let area = ratatui::layout::Rect::new(0, 0, 90, 18);
+    let backend = TestBackend::new(area.width, area.height);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let screen = format!("{}", terminal.backend());
+
+    assert!(screen.contains("ZEX"));
+    assert!(screen.contains("test-model"));
+    assert!(screen.contains("working…"));
+    assert!(screen.contains("Esc interrupt"));
+}
+
+#[test]
+fn browse_mode_uses_the_complete_navigation_footer() {
+    let mut app = app();
+    app.transcript.push(TranscriptEntry::Tool(super::ToolEntry {
+        call_id: "tool-1".to_owned(),
+        name: "read".to_owned(),
+        arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+        output: "manifest".to_owned(),
+        status: ToolStatus::Done,
+        expanded: false,
+        show_full_output: false,
+        started_at: None,
+        elapsed: Some(Duration::from_millis(10)),
+        timeout: Duration::from_secs(30),
+    }));
+    app.selected_entry = Some(0);
+    app.input_focused = false;
+    let backend = TestBackend::new(100, 18);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let screen = format!("{}", terminal.backend());
+
+    assert!(screen.contains("Tab browse"));
+    assert!(screen.contains("Enter open/toggle"));
+    assert!(screen.contains("Space compose"));
+    assert!(screen.contains("Esc clear"));
 }
 
 #[test]
@@ -943,11 +977,14 @@ fn every_draw_paints_the_full_terminal_background() {
 }
 
 #[test]
-fn grok_night_palette_matches_the_ui_plan() {
+fn zex_night_palette_matches_the_ui_plan() {
     assert_eq!(BACKGROUND, Color::Rgb(20, 20, 20));
     assert_eq!(super::TEXT, Color::Rgb(243, 243, 243));
     assert_eq!(TEXT_DIM, Color::Rgb(160, 160, 160));
     assert_eq!(super::TEXT_FAINT, Color::Rgb(120, 120, 120));
+    assert_eq!(SURFACE, Color::Rgb(27, 27, 27));
+    assert_eq!(super::SURFACE_HOVER, Color::Rgb(31, 31, 31));
+    assert_eq!(SURFACE_RAISED, Color::Rgb(34, 34, 34));
     assert_eq!(ACCENT_PRIMARY, Color::Rgb(122, 162, 247));
     assert_eq!(ACCENT_SECONDARY, Color::Rgb(187, 154, 247));
     assert_eq!(OK, Color::Rgb(158, 206, 106));
@@ -978,7 +1015,7 @@ fn first_turn_switches_to_a_top_anchored_work_timeline() {
     assert!(!app.landing_visible());
     assert!(!screen.contains("Ask anything…"));
     assert!(screen.contains("Working"));
-    assert!(!screen.contains(LANDING_LOGO_ROWS[0]));
+    assert!(!screen.contains("precision, without noise"));
     assert_eq!(message_row, regions.transcript.y + 1);
 }
 
@@ -999,7 +1036,7 @@ fn clearing_the_timeline_restores_the_landing_layout() {
 
     assert!(app.landing_visible());
     assert!(screen.contains(LANDING_LOGO_ROWS[0]));
-    assert!(!screen.contains("Z  E  X"));
+    assert!(!screen.contains("precision, without noise"));
     assert!(screen.contains("Ask anything…"));
     assert!(!screen.contains("Inspect the project"));
 }
@@ -1071,7 +1108,7 @@ fn narrow_status_truncates_without_wrapping_or_losing_core_fields() {
     let screen = format!("{}", terminal.backend());
     assert!(screen.contains("ZEX"), "screen:\n{screen}");
     assert!(screen.contains("med"));
-    assert!(screen.contains("50.0%/120K"));
+    assert!(screen.contains("ctx 50.0%"));
     assert!(!screen.contains("feature/very-long-branch-name"));
 }
 
@@ -1442,6 +1479,37 @@ fn active_turn_renders_running_status_without_system_feed_rows() {
 }
 
 #[test]
+fn active_turn_status_surface_ends_after_its_content() {
+    let mut app = app();
+    app.start_turn();
+    app.apply_agent_event(AgentEvent::MessageDelta {
+        role: MessageRole::User,
+        delta: "Inspect".to_owned(),
+    });
+    let area = ratatui::layout::Rect::new(0, 0, 120, 32);
+    let backend = TestBackend::new(area.width, area.height);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let screen = format!("{}", terminal.backend());
+    let detail_row = screen
+        .lines()
+        .position(|row| row.contains("Preparing the next step"))
+        .expect("running detail should be visible") as u16;
+    let row_after_status = detail_row + 1;
+    let regions = ui_regions(area, &app);
+
+    assert!(row_after_status < regions.transcript.bottom());
+    for x in super::HORIZONTAL_GUTTER..super::HORIZONTAL_GUTTER + 48 {
+        assert_eq!(
+            style_at(&terminal, x, row_after_status).bg,
+            Some(BACKGROUND),
+            "running status surface leaked below its content at x={x}"
+        );
+    }
+}
+
+#[test]
 fn tool_cards_use_zex_subject_result_and_duration_summaries() {
     let mut app = app();
     app.apply_agent_event(AgentEvent::ToolStart {
@@ -1620,13 +1688,13 @@ fn long_tool_output_previews_then_expands_fully() {
     assert!(!preview.contains("\"path\""));
     assert!(preview.contains("line 12"));
     assert!(!preview.contains("line 13"));
-    assert!(preview.contains("20 lines · 8 more · click or Ctrl+O expand"));
+    assert!(preview.contains("20 lines · 8 more · Ctrl+O expand"));
 
     app.toggle_selected_tool_output();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let full = format!("{}", terminal.backend());
     assert!(full.contains("line 20"));
-    assert!(full.contains("20 lines · click or Ctrl+O collapse"));
+    assert!(full.contains("20 lines · Ctrl+O collapse"));
 }
 
 #[test]
@@ -1821,6 +1889,29 @@ fn visual_dump() {
     println!("=== BUSY 90x18 ===\n{}", dump(&mut busy, 90, 18));
 
     println!("=== NARROW 38x12 ===\n{}", dump(&mut work, 38, 12));
+
+    let mut sessions = configured_app();
+    sessions.open_session_picker(vec![
+        crate::session::SessionSummary {
+            id: "20260813-120000-cafebabe".to_owned(),
+            updated_at: time::OffsetDateTime::UNIX_EPOCH + Duration::from_secs(3_600),
+            message_count: 12,
+            preview: "Polish the TUI timeline and input band".to_owned(),
+        },
+        crate::session::SessionSummary {
+            id: "20260812-121500-deadbeef".to_owned(),
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            message_count: 4,
+            preview: "Review provider configuration".to_owned(),
+        },
+    ]);
+    println!("=== SESSIONS 100x24 ===\n{}", dump(&mut sessions, 100, 24));
+
+    sessions.open_session_picker(Vec::new());
+    println!(
+        "=== SESSIONS EMPTY 80x20 ===\n{}",
+        dump(&mut sessions, 80, 20)
+    );
 }
 
 #[test]
@@ -2692,6 +2783,56 @@ fn resume_picker_renders_short_id_time_preview_count_and_empty_state() {
     let empty = format!("{}", terminal.backend());
     assert!(empty.contains("No saved sessions"));
     assert!(empty.contains("Esc close"));
+}
+
+#[test]
+fn resume_picker_paints_complete_two_line_rows_with_a_selected_accent() {
+    let mut app = app();
+    app.push_command_output(CommandOutput::ResumePicker(vec![
+        crate::session::SessionSummary {
+            id: "20260812-121500-cafebabe".to_owned(),
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            message_count: 2,
+            preview: "first saved task".to_owned(),
+        },
+        crate::session::SessionSummary {
+            id: "20260812-120000-deadbeef".to_owned(),
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            message_count: 1,
+            preview: "second saved task".to_owned(),
+        },
+    ]));
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+    let selected = app
+        .hit_regions
+        .iter()
+        .find(|region| region.target == HitTarget::Session(0))
+        .expect("selected session row should be clickable")
+        .area;
+    assert_eq!(selected.height, 2);
+    for y in selected.y..selected.bottom() {
+        assert_eq!(terminal.backend().buffer()[(selected.x, y)].symbol(), "▎");
+        assert_eq!(style_at(&terminal, selected.x, y).fg, Some(ACCENT_PRIMARY));
+        for x in selected.x..selected.right() {
+            assert_eq!(style_at(&terminal, x, y).bg, Some(SURFACE_RAISED));
+        }
+    }
+
+    let unselected = app
+        .hit_regions
+        .iter()
+        .find(|region| region.target == HitTarget::Session(1))
+        .expect("unselected session row should be clickable")
+        .area;
+    for y in unselected.y..unselected.bottom() {
+        for x in unselected.x..unselected.right() {
+            assert_eq!(style_at(&terminal, x, y).bg, Some(SURFACE));
+        }
+    }
 }
 
 #[test]
@@ -3791,7 +3932,8 @@ fn git_status_tool_is_short_by_default_and_expands_in_place() {
     app.toggle_selected_tool();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let expanded = format!("{}", terminal.backend());
-    assert!(expanded.contains("$ git status --short --branch"));
+    assert!(expanded.contains("command"));
+    assert!(expanded.contains("git status --short --branch"));
     assert!(expanded.contains("M src/tui.rs"));
     assert!(expanded.contains("2 lines"));
     assert!(!expanded.contains("input"));

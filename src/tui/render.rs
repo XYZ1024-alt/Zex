@@ -35,15 +35,6 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-fn lerp_color(from: Color, to: Color, t: f32) -> Color {
-    let (Color::Rgb(fr, fg, fb), Color::Rgb(tr, tg, tb)) = (from, to) else {
-        return if t < 0.5 { from } else { to };
-    };
-    let t = t.clamp(0.0, 1.0);
-    let blend = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-    Color::Rgb(blend(fr, tr), blend(fg, tg), blend(fb, tb))
-}
-
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.is_empty() {
         return;
@@ -73,7 +64,6 @@ struct StatuslineInputs {
     git: Option<String>,
     speed: Option<String>,
     context: String,
-    short_context: String,
 }
 
 fn statusline_inputs(app: &App) -> StatuslineInputs {
@@ -94,11 +84,7 @@ fn statusline_inputs(app: &App) -> StatuslineInputs {
             .then_some(app.tokens_per_second)
             .flatten()
             .map(|rate| format!("{rate:.1} tok/s")),
-        context: format!(
-            "ctx {percent:.1}%/{}",
-            format_char_budget(app.max_context_chars)
-        ),
-        short_context: format!("{percent:.1}%"),
+        context: format!("ctx {percent:.1}%"),
     }
 }
 
@@ -140,10 +126,8 @@ fn statusline_line(app: &App, width: usize) -> Line<'static> {
         < width
     {
         full_right
-    } else if UnicodeWidthStr::width(inputs.context.as_str()) + 2 <= width {
-        inputs.context.clone()
     } else {
-        inputs.short_context.clone()
+        inputs.context.clone()
     };
     let right_width = UnicodeWidthStr::width(right.as_str());
     let available_left = width.saturating_sub(right_width + 1);
@@ -192,16 +176,6 @@ fn dirty_suffix(count: usize) -> String {
     }
 }
 
-fn format_char_budget(chars: usize) -> String {
-    if chars >= 1_000_000 {
-        format!("{:.1}Mc", chars as f64 / 1_000_000.0)
-    } else if chars >= 1_000 {
-        format!("{}Kc", (chars + 500) / 1_000)
-    } else {
-        format!("{chars}c")
-    }
-}
-
 fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
     let Some(picker) = app.session_picker.clone() else {
         return;
@@ -210,12 +184,23 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
         return;
     }
 
-    let area = horizontal_inset(viewport, HORIZONTAL_GUTTER);
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let max_visible = area.height.saturating_sub(3).max(1) as usize / 2;
+    let area = content_area(viewport);
+    if area.is_empty() {
+        return;
+    }
+    let header_height = if area.height >= 7 { 3 } else { 1 };
+    let header = Rect::new(area.x, area.y, area.width, header_height);
+    let list = Rect::new(
+        area.x,
+        header.bottom(),
+        area.width,
+        area.height.saturating_sub(header_height),
+    );
+    let inner_width = area.width.saturating_sub(6) as usize;
+    let max_visible = list.height.saturating_add(1).max(1) as usize / 3;
     let visible_count = picker.sessions.len().clamp(1, max_visible.max(1));
-    let mut lines = vec![
-        Line::from(vec![
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
             Span::styled(
                 "Session index",
                 Style::default()
@@ -230,25 +215,69 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
                 },
                 Style::default().fg(TEXT_DIM),
             ),
-        ]),
-        Line::default(),
-    ];
+        ])),
+        Rect::new(header.x, header.y, header.width, 1),
+    );
+    if header.height >= 3 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "Recent conversations, ordered by last activity.",
+                Style::default().fg(TEXT_FAINT),
+            )),
+            Rect::new(header.x, header.y + 1, header.width, 1),
+        );
+    }
 
     if picker.sessions.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No saved sessions",
-            Style::default().fg(TEXT_DIM),
-        )));
+        let empty_height = list.height.min(5);
+        let empty_y = list
+            .y
+            .saturating_add(list.height.saturating_sub(empty_height) / 3);
+        let empty = Rect::new(list.x, empty_y, list.width, empty_height);
+        frame.render_widget(Block::default().style(Style::default().bg(SURFACE)), empty);
+        render_accent(frame, empty, ACCENT_PRIMARY, SURFACE);
+        if empty.height >= 1 {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "No saved sessions",
+                    Style::default()
+                        .fg(TEXT_STRONG)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Rect::new(
+                    empty.x.saturating_add(3),
+                    empty.y.saturating_add(u16::from(empty.height >= 4)),
+                    empty.width.saturating_sub(6),
+                    1,
+                ),
+            );
+        }
+        if empty.height >= 3 {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "Start a conversation here; Zex will keep it ready to resume.",
+                    Style::default().fg(TEXT_DIM),
+                ))
+                .wrap(Wrap { trim: true }),
+                Rect::new(
+                    empty.x.saturating_add(3),
+                    empty.y.saturating_add(2),
+                    empty.width.saturating_sub(6),
+                    empty.height.saturating_sub(2),
+                ),
+            );
+        }
     } else {
         let start = picker
             .selected
             .saturating_sub(visible_count.saturating_sub(1));
-        for (index, session) in picker
+        for (offset, (index, session)) in picker
             .sessions
             .iter()
             .enumerate()
             .skip(start)
             .take(visible_count)
+            .enumerate()
         {
             let target = HitTarget::Session(index);
             let selected = index == picker.selected;
@@ -259,11 +288,26 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
             } else if hovered {
                 SURFACE_HOVER
             } else {
-                BACKGROUND
+                SURFACE
             };
-            let foreground = TEXT_STRONG;
+            let item = Rect::new(
+                list.x,
+                list.y.saturating_add(offset as u16 * 3),
+                list.width,
+                2.min(list.bottom().saturating_sub(list.y + offset as u16 * 3)),
+            );
+            if item.is_empty() {
+                continue;
+            }
+            frame.render_widget(
+                Block::default().style(Style::default().bg(background)),
+                item,
+            );
+            if selected || armed {
+                render_accent(frame, item, ACCENT_PRIMARY, background);
+            }
+            let foreground = if selected { TEXT_STRONG } else { TEXT };
             let secondary = if selected { TEXT } else { TEXT_DIM };
-            let marker = if selected { "▌" } else { " " };
             let timestamp = format_session_time(session.updated_at);
             let metadata = format!(
                 "{} · {} message{}",
@@ -272,57 +316,38 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
                 if session.message_count == 1 { "" } else { "s" }
             );
             let id = short_session_id(&session.id);
-            let id_width = UnicodeWidthStr::width(id);
-            let metadata_limit = inner_width
-                .saturating_sub(id_width.saturating_add(4))
-                .max(1);
-            let preview_limit = inner_width.saturating_sub(2).max(1);
-
-            lines.push(
-                Line::from(vec![
-                    Span::styled(format!("{marker} "), Style::default().fg(secondary)),
+            let id_width = UnicodeWidthStr::width(id).min(inner_width);
+            let metadata_limit = inner_width.saturating_sub(id_width + 2);
+            let metadata = truncate_display(&metadata, metadata_limit);
+            let metadata_width = UnicodeWidthStr::width(metadata.as_str());
+            let spacer = inner_width.saturating_sub(id_width + metadata_width);
+            let text_x = item.x.saturating_add(3);
+            let text_width = item.width.saturating_sub(6);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
                     Span::styled(
-                        id.to_owned(),
+                        truncate_display(id, id_width),
                         Style::default().fg(foreground).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("  ", Style::default().fg(secondary)),
-                    Span::styled(
-                        single_line(&metadata, metadata_limit),
-                        Style::default().fg(secondary),
-                    ),
-                ])
+                    Span::raw(" ".repeat(spacer)),
+                    Span::styled(metadata, Style::default().fg(secondary)),
+                ]))
                 .style(Style::default().bg(background)),
+                Rect::new(text_x, item.y, text_width, 1),
             );
-            lines.push(
-                Line::from(vec![
-                    Span::styled("  ", Style::default().fg(secondary)),
-                    Span::styled(
-                        single_line(&session.preview, preview_limit),
+            if item.height >= 2 {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        single_line(&session.preview, inner_width),
                         Style::default().fg(secondary),
-                    ),
-                ])
-                .style(Style::default().bg(background)),
-            );
+                    ))
+                    .style(Style::default().bg(background)),
+                    Rect::new(text_x, item.y + 1, text_width, 1),
+                );
+            }
+            app.register_hit(item, HitTarget::Session(index));
         }
     }
-
-    if !picker.sessions.is_empty() {
-        let start = picker
-            .selected
-            .saturating_sub(visible_count.saturating_sub(1));
-        for offset in 0..visible_count.min(picker.sessions.len().saturating_sub(start)) {
-            app.register_hit(
-                Rect::new(
-                    area.x,
-                    area.y.saturating_add(2 + offset as u16 * 2),
-                    area.width,
-                    2,
-                ),
-                HitTarget::Session(start + offset),
-            );
-        }
-    }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -798,9 +823,13 @@ pub(super) fn ui_regions(area: Rect, app: &App) -> UiRegions {
         .total_rows
         .clamp(1, MAX_INPUT_ROWS)
     };
-    let preferred_footer_height = (requested_input_rows as u16)
-        .saturating_add(2)
-        .saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2));
+    let preferred_footer_height = if app.page_open() {
+        3
+    } else {
+        (requested_input_rows as u16)
+            .saturating_add(2)
+            .saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2))
+    };
     let footer_height = if area.height
         >= keymap_height
             .saturating_add(MIN_TRANSCRIPT_HEIGHT)
@@ -1164,13 +1193,20 @@ fn render_transcript_panel_accent(
     if let Some(accent) = panel.accent
         && panel_area.width > 0
     {
-        frame.buffer_mut().set_style(
-            Rect::new(panel_area.x, panel_area.y, 1, panel_area.height),
-            Style::default().fg(accent).bg(panel.background),
-        );
-        for row in panel_area.y..panel_area.bottom() {
-            frame.buffer_mut()[(panel_area.x, row)].set_symbol("▎");
-        }
+        render_accent(frame, panel_area, accent, panel.background);
+    }
+}
+
+fn render_accent(frame: &mut Frame<'_>, area: Rect, accent: Color, background: Color) {
+    if area.is_empty() {
+        return;
+    }
+    frame.buffer_mut().set_style(
+        Rect::new(area.x, area.y, 1, area.height),
+        Style::default().fg(accent).bg(background),
+    );
+    for row in area.y..area.bottom() {
+        frame.buffer_mut()[(area.x, row)].set_symbol("▎");
     }
 }
 
@@ -1192,7 +1228,7 @@ pub(super) fn landing_regions(area: Rect, app: &App) -> LandingRegions {
         };
     }
 
-    let status_height = u16::from(area.height >= 4);
+    let status_height = u16::from(area.height >= 2);
     let status = Rect::new(
         area.x,
         area.bottom().saturating_sub(status_height),
@@ -1209,34 +1245,39 @@ pub(super) fn landing_regions(area: Rect, app: &App) -> LandingRegions {
     let input_rows = input_metrics(
         &app.input.content,
         app.input.cursor,
-        card_width.saturating_sub(7).max(1) as usize,
+        card_width.saturating_sub(6).max(1) as usize,
     )
     .total_rows
     .clamp(1, MAX_INPUT_ROWS) as u16;
     let card_height = match stage.height {
-        11.. => input_rows.saturating_add(7).max(8),
-        5..=10 => 3,
+        12.. => input_rows.saturating_add(4).max(5),
+        6..=11 => 4,
         1..=4 => 1,
+        5 => 3,
         _ => 0,
     };
-    let brand_height = if stage.height >= 15 {
+    let full_logo = stage.height >= 16 && card_width >= 29;
+    let brand_height = if full_logo {
         LANDING_LOGO_ROWS.len() as u16
-    } else {
-        0
-    };
-    let brand_gap = if brand_height == 0 {
-        0
-    } else if stage.height >= 14 {
-        2
-    } else {
+    } else if stage.height >= 7 {
         1
+    } else {
+        0
     };
-    let hint_height = 0;
-    let hint_gap = 0;
-    let group_height = brand_height + brand_gap + card_height;
-    let group_y = stage.y + stage.height.saturating_sub(group_height) / 2;
+    let brand_gap = u16::from(brand_height > 0);
+    let hint_height = if stage.height >= 14 {
+        2
+    } else if stage.height >= 10 {
+        1
+    } else {
+        0
+    };
+    let hint_gap = u16::from(hint_height > 0);
+    let group_height = brand_height + brand_gap + card_height + hint_gap + hint_height;
+    let free_height = stage.height.saturating_sub(group_height);
+    let group_y = stage.y + free_height / 2;
     let card_x = area.x + area.width.saturating_sub(card_width) / 2;
-    let brand = Rect::new(area.x, group_y, area.width, brand_height);
+    let brand = Rect::new(card_x, group_y, card_width, brand_height);
     let card_y = brand.bottom().saturating_add(brand_gap);
     let card = Rect::new(card_x, card_y, card_width, card_height);
     let hint = Rect::new(
@@ -1261,20 +1302,70 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let regions = landing_regions(area, app);
 
     if !regions.brand.is_empty() {
-        for (row, logo_row) in LANDING_LOGO_ROWS.iter().enumerate() {
+        if regions.brand.height >= LANDING_LOGO_ROWS.len() as u16 {
+            for (row, logo_row) in LANDING_LOGO_ROWS.iter().enumerate() {
+                frame.render_widget(
+                    Paragraph::new(landing_logo_line(logo_row)).alignment(Alignment::Center),
+                    Rect::new(
+                        regions.brand.x,
+                        regions.brand.y.saturating_add(row as u16),
+                        regions.brand.width,
+                        1,
+                    ),
+                );
+            }
+        } else {
             frame.render_widget(
-                Paragraph::new(landing_logo_line(logo_row)).alignment(Alignment::Center),
-                Rect::new(
-                    regions.brand.x,
-                    regions.brand.y + row as u16,
-                    regions.brand.width,
-                    1,
-                ),
+                Paragraph::new(Span::styled(
+                    "ZEX",
+                    Style::default()
+                        .fg(TEXT_STRONG)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+                Rect::new(regions.brand.x, regions.brand.y, regions.brand.width, 1),
             );
         }
     }
 
     render_landing_card(frame, regions.card, app);
+    if !regions.hint.is_empty() {
+        let hint_width = regions.hint.width.saturating_sub(6) as usize;
+        let actions = if hint_width >= 52 {
+            "Enter send  ·  Shift+Enter newline  ·  / actions"
+        } else if hint_width >= 24 {
+            "Enter send  ·  / actions"
+        } else {
+            "Enter send"
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(actions, Style::default().fg(TEXT_DIM))),
+            Rect::new(
+                regions.hint.x.saturating_add(3),
+                regions.hint.y,
+                regions.hint.width.saturating_sub(6),
+                1,
+            ),
+        );
+        if regions.hint.height >= 2 {
+            let hint = if regions.hint.width >= 70 {
+                "Point to a file, describe an outcome, or ask a question."
+            } else if regions.hint.width >= 48 {
+                "Point to a file, describe an outcome, or ask."
+            } else {
+                "Point to a file, task, or question."
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(hint, Style::default().fg(TEXT_FAINT))),
+                Rect::new(
+                    regions.hint.x.saturating_add(3),
+                    regions.hint.y + 1,
+                    regions.hint.width.saturating_sub(6),
+                    1,
+                ),
+            );
+        }
+    }
 
     render_landing_status(frame, regions.status, app);
 
@@ -1293,17 +1384,16 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn landing_logo_line(row: &str) -> Line<'static> {
-    let width = UnicodeWidthStr::width(row).saturating_sub(1).max(1);
     Line::from(
-        row.char_indices()
+        row.chars()
+            .enumerate()
             .map(|(column, character)| {
-                let position = UnicodeWidthStr::width(&row[..column]) as f32 / width as f32;
-                let color = if position < 0.34 {
-                    lerp_color(LANDING_LOGO_DARK, TEXT_DIM, position / 0.34)
-                } else if position < 0.72 {
-                    lerp_color(TEXT_DIM, TEXT_STRONG, (position - 0.34) / 0.38)
+                let color = if column < 9 {
+                    TEXT_FAINT
+                } else if column < 18 {
+                    TEXT_DIM
                 } else {
-                    lerp_color(TEXT_STRONG, TEXT_DIM, (position - 0.72) / 0.28)
+                    TEXT_STRONG
                 };
                 Span::styled(character.to_string(), Style::default().fg(color))
             })
@@ -1316,8 +1406,8 @@ fn landing_card_width(width: u16) -> u16 {
         return 0;
     }
     let max_width = width.saturating_sub(2).max(1);
-    let target = (u32::from(width) * 13 / 20) as u16;
-    target.clamp(max_width.min(36), max_width.min(74))
+    let target = (u32::from(width) * 31 / 50) as u16;
+    target.clamp(max_width.min(40), max_width.min(76))
 }
 
 fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -1331,32 +1421,31 @@ fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .style(Style::default().bg(SURFACE)),
         area,
     );
-    if area.width <= 8 || area.height == 0 {
+    render_accent(frame, area, ACCENT_PRIMARY, SURFACE);
+    if area.width <= 7 || area.height == 0 {
         return;
     }
-    if area.height >= 2 {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                "━━ ZEX",
-                Style::default()
-                    .fg(ACCENT_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Rect::new(area.x + 3, area.y + 1, area.width.saturating_sub(6), 1),
-        );
-    }
-    let compact = area.height < 6;
-    let editor_y = area.y.saturating_add(if compact { 1 } else { 3 });
-    let metadata_y = area.bottom().saturating_sub(if compact { 1 } else { 2 });
+    let compact = area.height < 5;
+    let editor_y = area.y.saturating_add(u16::from(area.height >= 3));
+    let metadata_y = area.bottom().saturating_sub(2);
     let editor_area = Rect::new(
         area.x.saturating_add(3),
         editor_y,
         area.width.saturating_sub(6),
-        metadata_y.saturating_sub(editor_y),
+        metadata_y
+            .saturating_sub(editor_y)
+            .max(u16::from(editor_y < area.bottom())),
     );
-    if metadata_y < area.bottom() && area.width > 8 {
+    if !compact && metadata_y < area.bottom() {
         let model = model_short_name(&app.model);
         let thinking = thinking_short_name(app.thinking_level.unwrap_or(app.thinking_preference));
+        let right = format!("think {thinking}");
+        let right_width = UnicodeWidthStr::width(right.as_str());
+        let model_width = editor_area.width as usize;
+        let model = truncate_display(&model, model_width.saturating_sub(right_width + 2));
+        let spacer = model_width.saturating_sub(
+            UnicodeWidthStr::width(model.as_str()) + UnicodeWidthStr::width(right.as_str()),
+        );
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
@@ -1365,44 +1454,16 @@ fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         .fg(TEXT_STRONG)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("    ", Style::default().fg(TEXT_FAINT)),
-                Span::styled(format!("ZEX · {thinking}"), Style::default().fg(TEXT_FAINT)),
+                Span::raw(" ".repeat(spacer)),
+                Span::styled(right, Style::default().fg(TEXT_FAINT)),
             ]))
             .style(Style::default().bg(SURFACE)),
             Rect::new(editor_area.x, metadata_y, editor_area.width, 1),
         );
     }
     if !editor_area.is_empty() {
-        let placeholder = if editor_area.width >= 40 {
-            Line::from(vec![
-                Span::styled("Ask anything…", Style::default().fg(TEXT_DIM)),
-                Span::styled(
-                    "   start with a file, question, or task",
-                    Style::default().fg(TEXT_FAINT),
-                ),
-            ])
-        } else {
-            Line::from(Span::styled("Ask anything…", Style::default().fg(TEXT_DIM)))
-        };
+        let placeholder = Line::from(Span::styled("Ask anything…", Style::default().fg(TEXT_DIM)));
         render_input_buffer(frame, editor_area, app, "", Some(placeholder), SURFACE);
-    }
-    if !compact {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("Enter send", Style::default().fg(TEXT_DIM)),
-                Span::styled(
-                    "  ·  Shift+Enter newline  ·  / actions",
-                    Style::default().fg(TEXT_FAINT),
-                ),
-            ]))
-            .style(Style::default().bg(SURFACE)),
-            Rect::new(
-                area.x + 3,
-                area.bottom().saturating_sub(1),
-                area.width.saturating_sub(6),
-                1,
-            ),
-        );
     }
 }
 
@@ -1414,7 +1475,7 @@ fn render_landing_status(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.is_empty() {
         return;
     }
-    let version = format!("ZEX {}", env!("CARGO_PKG_VERSION"));
+    let version = env!("CARGO_PKG_VERSION").to_owned();
     let version_width = UnicodeWidthStr::width(version.as_str()).min(area.width as usize) as u16;
     let version_area = Rect::new(
         area.right().saturating_sub(version_width),
@@ -1607,6 +1668,8 @@ struct TranscriptPanel {
 }
 
 fn transcript_text(app: &App, width: usize) -> TranscriptRender {
+    const PANEL_RIGHT_PADDING: usize = 3;
+    let content_width = width.saturating_sub(PANEL_RIGHT_PADDING).max(1);
     let mut lines = Vec::new();
     let mut panels = Vec::new();
     let mut card_lines = Vec::new();
@@ -1619,7 +1682,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                 let final_answer = app.is_final_answer(index);
                 let start_line = lines.len();
                 lines.push(Line::default());
-                append_markdown_lines(&mut lines, content, *role, final_answer, width);
+                append_markdown_lines(&mut lines, content, *role, final_answer, content_width);
                 lines.push(Line::default());
                 let selected = app.selected_entry == Some(index);
                 let hovered = final_answer && app.hovered(&HitTarget::Response(index));
@@ -1631,8 +1694,6 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                         SURFACE_RAISED
                     } else if hovered {
                         SURFACE_HOVER
-                    } else if *role == MessageRole::User {
-                        SURFACE_RAISED
                     } else {
                         SURFACE
                     },
@@ -1668,7 +1729,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                         level,
                         app.selected_entry == Some(index),
                         app.hovered(&HitTarget::Card(index)),
-                        width,
+                        content_width,
                     );
                     panels.push(TranscriptPanel {
                         start_line,
@@ -1693,7 +1754,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                     tool,
                     app.selected_entry == Some(index),
                     app.hovered(&HitTarget::Card(index)),
-                    width,
+                    content_width,
                 );
                 panels.push(TranscriptPanel {
                     start_line,
@@ -1706,7 +1767,13 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                     } else {
                         SURFACE
                     },
-                    accent: None,
+                    accent: if app.selected_entry == Some(index)
+                        || matches!(tool.status, ToolStatus::Running)
+                    {
+                        Some(ACCENT_PRIMARY)
+                    } else {
+                        None
+                    },
                 });
                 if tool.expanded && tool_output_body(tool).len() > TOOL_OUTPUT_PREVIEW_LINES {
                     output_lines.push((index, lines.len().saturating_sub(2)));
@@ -1754,7 +1821,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
             }
             TranscriptEntry::Turn(turn) => {
                 let start_line = lines.len();
-                append_turn_line(&mut lines, turn, width);
+                append_turn_line(&mut lines, turn, content_width);
                 panels.push(TranscriptPanel {
                     start_line,
                     end_line: lines.len(),
@@ -1778,7 +1845,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
             lines.push(Line::default());
         }
         let start_line = lines.len();
-        append_running_turn_line(&mut lines, app, width);
+        append_running_turn_line(&mut lines, app, content_width);
         panels.push(TranscriptPanel {
             start_line,
             end_line: lines.len(),
@@ -1991,6 +2058,17 @@ fn append_running_turn_line(lines: &mut Vec<Line<'static>>, app: &App, width: us
             Style::default().fg(TEXT_FAINT),
         ),
     ]));
+    let detail = match app.status {
+        Status::Thinking => "Preparing the next step",
+        Status::RunningTool => "Waiting for tool output",
+        Status::Cancelling => "Stopping the active turn",
+        Status::Error => "The turn needs attention",
+        Status::Idle => "Ready",
+    };
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(detail, Style::default().fg(TEXT_FAINT)),
+    ]));
 }
 
 fn format_turn_duration(duration: Duration) -> String {
@@ -2037,7 +2115,10 @@ fn append_markdown_lines(
             if in_code_block {
                 let rail = message_rail(role, final_answer, &mut first_visual_line);
                 lines.push(Line::from(vec![
-                    Span::styled(rail, Style::default().fg(message_rail_color(role))),
+                    Span::styled(
+                        rail,
+                        Style::default().fg(message_rail_color(role, final_answer)),
+                    ),
                     Span::styled("▌ ", Style::default().fg(TEXT_DIM)),
                     Span::styled(
                         if language.is_empty() {
@@ -2051,7 +2132,10 @@ fn append_markdown_lines(
             } else {
                 let rail = message_rail(role, final_answer, &mut first_visual_line);
                 lines.push(Line::from(vec![
-                    Span::styled(rail, Style::default().fg(message_rail_color(role))),
+                    Span::styled(
+                        rail,
+                        Style::default().fg(message_rail_color(role, final_answer)),
+                    ),
                     Span::styled("▌", Style::default().fg(TEXT_FAINT)),
                 ]));
             }
@@ -2062,7 +2146,10 @@ fn append_markdown_lines(
             for segment in wrap_display_hard(source_line, content_width) {
                 let rail = message_rail(role, final_answer, &mut first_visual_line);
                 lines.push(Line::from(vec![
-                    Span::styled(rail, Style::default().fg(message_rail_color(role))),
+                    Span::styled(
+                        rail,
+                        Style::default().fg(message_rail_color(role, final_answer)),
+                    ),
                     Span::styled("▌ ", Style::default().fg(TEXT_DIM)),
                     Span::styled(segment, Style::default().fg(TEXT_STRONG)),
                 ]));
@@ -2133,7 +2220,7 @@ fn append_markdown_lines(
             let rail = message_rail(role, final_answer, &mut first_visual_line);
             lines.push(Line::from(Span::styled(
                 rail,
-                Style::default().fg(message_rail_color(role)),
+                Style::default().fg(message_rail_color(role, final_answer)),
             )));
         } else {
             append_wrapped_message_lines(
@@ -2165,10 +2252,11 @@ fn message_rail(
     rail
 }
 
-fn message_rail_color(role: MessageRole) -> Color {
-    match role {
-        MessageRole::User => ACCENT_PRIMARY,
-        MessageRole::Assistant => TEXT_FAINT,
+fn message_rail_color(role: MessageRole, final_answer: bool) -> Color {
+    match (role, final_answer) {
+        (MessageRole::User, _) => ACCENT_PRIMARY,
+        (MessageRole::Assistant, true) => ACCENT_SECONDARY,
+        (MessageRole::Assistant, false) => TEXT_FAINT,
     }
 }
 
@@ -2188,7 +2276,10 @@ fn append_wrapped_message_lines(
     for segment in wrap_display_words(content, width.saturating_sub(rail_width).max(1)) {
         let rail = message_rail(role, final_answer, first_visual_line);
         lines.push(Line::from(vec![
-            Span::styled(rail, Style::default().fg(message_rail_color(role))),
+            Span::styled(
+                rail,
+                Style::default().fg(message_rail_color(role, final_answer)),
+            ),
             Span::styled(segment, content_style),
         ]));
     }
@@ -2213,9 +2304,13 @@ fn append_output_block_lines(
         .into_iter()
         .enumerate()
     {
-        let rail = message_rail(role, false, first_visual_line);
+        let final_answer = false;
+        let rail = message_rail(role, final_answer, first_visual_line);
         lines.push(Line::from(vec![
-            Span::styled(rail, Style::default().fg(message_rail_color(role))),
+            Span::styled(
+                rail,
+                Style::default().fg(message_rail_color(role, final_answer)),
+            ),
             Span::styled(
                 if index == 0 {
                     marker.to_owned()
@@ -2320,7 +2415,7 @@ fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(
         Block::default()
             .borders(Borders::NONE)
-            .style(Style::default().bg(SURFACE_RAISED)),
+            .style(Style::default().bg(SURFACE)),
         area,
     );
     if area.width > 0 {
@@ -2331,11 +2426,33 @@ fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         };
         frame.buffer_mut().set_style(
             Rect::new(area.x, area.y, 1, area.height),
-            Style::default().fg(accent).bg(SURFACE_RAISED),
+            Style::default().fg(accent).bg(SURFACE),
         );
         for row in area.y..area.bottom() {
             frame.buffer_mut()[(area.x, row)].set_symbol("▎");
         }
+    }
+    if app.page_open() {
+        let label = if app.model_picker_open() {
+            "model index"
+        } else if app.provider_editor_open() {
+            "provider config"
+        } else if app.session_picker_open() {
+            "session index"
+        } else {
+            "command index"
+        };
+        let y = area.y.saturating_add(area.height.saturating_sub(1) / 2);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("ZEX  ", Style::default().fg(ACCENT_PRIMARY)),
+                Span::styled(label, Style::default().fg(TEXT)),
+            ]))
+            .style(Style::default().bg(SURFACE))
+            .alignment(Alignment::Center),
+            Rect::new(area.x.saturating_add(1), y, area.width.saturating_sub(1), 1),
+        );
+        return;
     }
     if area.width <= INPUT_HORIZONTAL_PADDING.saturating_mul(2) || area.height == 0 {
         return;
@@ -2352,37 +2469,9 @@ fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
-    if app.page_open() {
-        let label = if app.model_picker_open() {
-            "model index"
-        } else if app.provider_editor_open() {
-            "provider config"
-        } else if app.session_picker_open() {
-            "session index"
-        } else {
-            "command index"
-        };
-        let y = area.y + area.height.saturating_sub(1) / 2;
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("ZEX  ", Style::default().fg(ACCENT_PRIMARY)),
-                Span::styled(label, Style::default().fg(TEXT)),
-            ]))
-            .style(Style::default().bg(SURFACE_RAISED))
-            .alignment(Alignment::Center),
-            Rect::new(
-                input_area.x,
-                y.clamp(input_area.y, input_area.bottom().saturating_sub(1)),
-                input_area.width,
-                1,
-            ),
-        );
-        return;
-    }
-
     let metadata = input_metadata_line(app, input_area.width as usize);
     frame.render_widget(
-        Paragraph::new(metadata).style(Style::default().bg(SURFACE_RAISED)),
+        Paragraph::new(metadata).style(Style::default().bg(SURFACE)),
         Rect::new(input_area.x, input_area.y, input_area.width, 1),
     );
     register_input_metadata_hits(app, input_area);
@@ -2397,6 +2486,20 @@ fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     if app.busy {
+        let busy_label = match app.status {
+            Status::RunningTool => "working · waiting for tool output",
+            Status::Cancelling => "stopping…",
+            Status::Error => "turn needs attention",
+            Status::Thinking | Status::Idle => "working…",
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("› ", Style::default().fg(ACCENT_PRIMARY)),
+                Span::styled(busy_label, Style::default().fg(TEXT_DIM)),
+            ]))
+            .style(Style::default().bg(SURFACE)),
+            editor_area,
+        );
         return;
     }
 
@@ -2409,7 +2512,7 @@ fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             "ask anything…",
             Style::default().fg(TEXT_DIM),
         ))),
-        SURFACE_RAISED,
+        SURFACE,
     );
 }
 
@@ -2534,18 +2637,13 @@ fn render_input_buffer(
     );
     if app.input.is_empty()
         && let Some(placeholder) = placeholder
-        && editor_area.width > 1
+        && editor_area.width > 0
     {
         frame.render_widget(
             Paragraph::new(placeholder)
                 .style(Style::default().bg(background))
                 .wrap(Wrap { trim: true }),
-            Rect::new(
-                editor_area.x + 1,
-                editor_area.y,
-                editor_area.width - 1,
-                editor_area.height,
-            ),
+            editor_area,
         );
     }
 
@@ -2581,10 +2679,16 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
         };
         Line::from(Span::styled(text, Style::default().fg(TEXT_DIM)))
     } else if app.session_picker_open() {
-        Line::from(Span::styled(
-            "↑↓/jk select · Enter/Space resume · click twice · Esc/q cancel",
-            Style::default().fg(TEXT_DIM),
-        ))
+        let text = if app
+            .session_picker
+            .as_ref()
+            .is_some_and(|picker| picker.sessions.is_empty())
+        {
+            "Esc/q return"
+        } else {
+            "↑↓/jk select · Enter/Space resume · click twice · Esc/q cancel"
+        };
+        Line::from(Span::styled(text, Style::default().fg(TEXT_DIM)))
     } else if app.help_open {
         Line::from(Span::styled(
             "↑↓/jk select · Enter/Space run · click twice · Esc/q return",
@@ -2601,33 +2705,47 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(TEXT_DIM),
         ))
     } else if app.busy {
-        if area.width >= 52 {
+        if area.width >= 72 {
             aligned_hint_line(
                 "Esc interrupt  ·  Working",
                 "Tab browse  ·  Ctrl+P commands  ·  / actions",
                 area.width as usize,
             )
-        } else {
+        } else if area.width >= 34 {
             Line::from(Span::styled(
                 "Esc interrupt  ·  Working",
                 Style::default().fg(TEXT_FAINT),
             ))
-        }
-    } else if !app.input_focused && app.selected_entry.is_some() {
-        Line::from(Span::styled(
-            "Tab browse · Enter open/toggle · Space compose · Esc clear",
-            Style::default().fg(TEXT_FAINT),
-        ))
-    } else {
-        if area.width >= 52 {
-            aligned_hint_line(
-                "Enter send",
-                "Tab browse  ·  Ctrl+P commands  ·  / actions",
-                area.width as usize,
-            )
         } else {
             Line::from(Span::styled(
+                "Esc interrupt",
+                Style::default().fg(TEXT_FAINT),
+            ))
+        }
+    } else if !app.input_focused && app.selected_entry.is_some() {
+        let text = if area.width >= 58 {
+            "Tab browse · Enter open/toggle · Space compose · Esc clear"
+        } else if area.width >= 36 {
+            "Enter open · Space compose · Esc clear"
+        } else {
+            "Space compose · Esc clear"
+        };
+        Line::from(Span::styled(text, Style::default().fg(TEXT_FAINT)))
+    } else {
+        if area.width >= 72 {
+            aligned_hint_line(
+                "Enter send  ·  Shift+Enter newline",
+                "Tab browse  ·  / actions",
+                area.width as usize,
+            )
+        } else if area.width >= 40 {
+            Line::from(Span::styled(
                 "Enter send  ·  Tab browse  ·  / actions",
+                Style::default().fg(TEXT_FAINT),
+            ))
+        } else {
+            Line::from(Span::styled(
+                "Enter send  ·  Tab browse",
                 Style::default().fg(TEXT_FAINT),
             ))
         }

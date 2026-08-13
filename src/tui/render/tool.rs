@@ -29,7 +29,6 @@ pub(super) fn append_tool_lines(
     ));
 
     if tool.expanded {
-        let rail_style = Style::default().fg(marker_color);
         let label_style = Style::default().fg(TEXT_DIM);
         let body_style = Style::default().fg(TEXT);
         let added_style = Style::default().fg(OK);
@@ -60,23 +59,27 @@ pub(super) fn append_tool_lines(
                 .min(TOOL_OUTPUT_PREVIEW_LINES)
         };
         let mut push = |spans: Vec<Span<'static>>| {
-            let mut row = vec![Span::styled("  │ ", rail_style)];
+            let mut row = vec![Span::raw("     ")];
             row.extend(spans);
             lines.push(Line::from(row));
         };
 
+        push(Vec::new());
         if edit_diff.is_some() {
             push(vec![
                 Span::styled("diff  ", label_style),
                 Span::styled(param.to_owned(), body_style),
             ]);
         } else if tool.name == "bash" && !failed {
-            for (index, line) in param.lines().enumerate() {
+            push(vec![Span::styled("command", label_style)]);
+            for line in param.lines() {
                 push(vec![
-                    Span::styled(if index == 0 { "$ " } else { "  " }, label_style),
+                    Span::raw("  "),
                     Span::styled(line.to_owned(), body_style),
                 ]);
             }
+            push(Vec::new());
+            push(vec![Span::styled("output", label_style)]);
         } else if param.is_empty() {
             push(vec![Span::styled(
                 single_line(&tool.arguments, 200),
@@ -85,7 +88,10 @@ pub(super) fn append_tool_lines(
         } else if tool.name == "bash" {
             push(vec![Span::styled("command", label_style)]);
             for line in param.lines() {
-                push(vec![Span::styled(line.to_owned(), body_style)]);
+                push(vec![
+                    Span::raw("  "),
+                    Span::styled(line.to_owned(), body_style),
+                ]);
             }
             push(vec![]);
             push(vec![Span::styled("stderr", label_style)]);
@@ -133,20 +139,17 @@ pub(super) fn append_tool_lines(
         let unit = if total == 1 { "line" } else { "lines" };
         let footer = if !tool.show_full_output && total > TOOL_OUTPUT_PREVIEW_LINES {
             format!(
-                "{total} {unit} · {} more · click or Ctrl+O expand",
+                "{total} {unit} · {} more · Ctrl+O expand",
                 total - TOOL_OUTPUT_PREVIEW_LINES
             )
         } else if tool.show_full_output && total > TOOL_OUTPUT_PREVIEW_LINES {
-            format!("{total} {unit} · click or Ctrl+O collapse")
+            format!("{total} {unit} · Ctrl+O collapse")
         } else if total > 0 {
             format!("{total} {unit}")
         } else {
             format!("timeout {}", format_duration(tool.timeout))
         };
-        lines.push(Line::from(vec![
-            Span::styled("  └ ", rail_style),
-            Span::styled(footer, label_style),
-        ]));
+        push(vec![Span::styled(footer, label_style)]);
     }
 }
 
@@ -164,7 +167,7 @@ fn tool_header_line(
     const NAME_WIDTH: usize = 8;
     const RESULT_WIDTH: usize = 12;
     const DURATION_WIDTH: usize = 7;
-    const MARKER_WIDTH: usize = 2;
+    const MARKER_WIDTH: usize = 4;
     const GAP_WIDTH: usize = 2;
 
     let wide_fixed_width =
@@ -172,7 +175,7 @@ fn tool_header_line(
     if width >= wide_fixed_width + 4 {
         let subject_width = width - wide_fixed_width;
         return Line::from(vec![
-            Span::styled(format!("{marker} "), Style::default().fg(marker_color)),
+            Span::styled(format!("  {marker} "), Style::default().fg(marker_color)),
             Span::styled(
                 pad_display(&truncate_display(name, NAME_WIDTH), NAME_WIDTH),
                 Style::default()
@@ -203,7 +206,7 @@ fn tool_header_line(
     let subject_width = width.saturating_sub(fixed_width);
     if subject_width > 0 {
         return Line::from(vec![
-            Span::styled(format!("{marker} "), Style::default().fg(marker_color)),
+            Span::styled(format!("  {marker} "), Style::default().fg(marker_color)),
             Span::styled(
                 pad_display(&truncate_display(name, NAME_WIDTH), NAME_WIDTH),
                 Style::default()
@@ -232,7 +235,7 @@ fn tool_header_line(
         width.saturating_sub(MARKER_WIDTH + GAP_WIDTH * 2 + result_width + duration_width);
     let name_width = available_name.clamp(1, NAME_WIDTH);
     Line::from(vec![
-        Span::styled(format!("{marker} "), Style::default().fg(marker_color)),
+        Span::styled(format!("  {marker} "), Style::default().fg(marker_color)),
         Span::styled(
             pad_display(&truncate_display(name, name_width), name_width),
             Style::default()
