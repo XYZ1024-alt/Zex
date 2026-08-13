@@ -52,20 +52,20 @@ const MAX_INPUT_HISTORY: usize = 100;
 const MIN_TRANSCRIPT_HEIGHT: u16 = 2;
 const HORIZONTAL_GUTTER: u16 = 1;
 const FOOTER_HEIGHT: u16 = 2;
-const TIMELINE_BOTTOM_GAP: u16 = 1;
 const INPUT_PROMPT: &str = "› ";
 const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-const SURFACE: Color = Color::Rgb(22, 26, 31);
-const SURFACE_RAISED: Color = Color::Rgb(29, 34, 40);
-const TEXT: Color = Color::Rgb(202, 209, 216);
-const TEXT_STRONG: Color = Color::Rgb(234, 238, 242);
-const DIM: Color = Color::Rgb(105, 116, 127);
-const MUTED: Color = Color::Rgb(61, 71, 81);
-const ACCENT: Color = Color::Rgb(101, 158, 178);
-const SUCCESS: Color = Color::Rgb(112, 160, 130);
+const BACKGROUND: Color = Color::Rgb(9, 12, 15);
+const SURFACE: Color = Color::Rgb(18, 22, 26);
+const SURFACE_RAISED: Color = Color::Rgb(25, 30, 35);
+const TEXT: Color = Color::Rgb(194, 202, 209);
+const TEXT_STRONG: Color = Color::Rgb(232, 236, 239);
+const DIM: Color = Color::Rgb(103, 114, 123);
+const MUTED: Color = Color::Rgb(55, 64, 72);
+const ACCENT: Color = Color::Rgb(98, 164, 178);
+const SUCCESS: Color = Color::Rgb(126, 139, 147);
 const ERROR: Color = Color::Rgb(187, 105, 113);
 
 pub fn is_available() -> bool {
@@ -1391,6 +1391,10 @@ impl App {
         self.scroll_to_bottom();
     }
 
+    fn landing_visible(&self) -> bool {
+        self.transcript.is_empty() && !self.busy && self.status == Status::Idle
+    }
+
     fn finish_turn(&mut self, status: Status) {
         self.busy = false;
         self.active_tools.clear();
@@ -2713,6 +2717,16 @@ fn git_output(working_dir: &Path, arguments: &[&str]) -> Option<String> {
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(Clear, frame.area());
+    frame.render_widget(
+        Block::default().style(Style::default().bg(BACKGROUND)),
+        frame.area(),
+    );
+
+    if app.landing_visible() && !app.page_open() {
+        render_landing(frame, frame.area(), app);
+        return;
+    }
+
     let regions = ui_regions(frame.area(), app);
 
     if app.model_picker_open() {
@@ -2736,16 +2750,15 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
+    frame.render_widget(Block::default().style(Style::default().bg(SURFACE)), area);
     let regions = footer_regions(area);
     render_footer_context(frame, regions.left, app);
-    render_footer_separator(frame, regions.input.x, area);
     render_footer_input(frame, regions.input, app);
-    render_footer_separator(frame, regions.right.x, area);
     render_footer_runtime(frame, regions.right, app);
 }
 
 fn render_footer_context(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let area = footer_segment_area(area, true, false);
+    let area = footer_segment_area(area, true, true);
     if area.is_empty() {
         return;
     }
@@ -2765,15 +2778,23 @@ fn render_footer_context(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let mut lines = vec![Line::from(vec![Span::styled(
         single_line(&title, area.width as usize),
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(TEXT_STRONG)
+            .bg(SURFACE)
+            .add_modifier(Modifier::BOLD),
     )])];
     if area.height > 1 {
         lines.push(Line::from(Span::styled(
             single_line(&location, area.width as usize),
-            Style::default().fg(DIM),
+            Style::default().fg(DIM).bg(SURFACE),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(SURFACE))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn render_footer_runtime(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2803,33 +2824,35 @@ fn render_footer_runtime(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let title = if area.height == 1 {
         format!("{context_percent}% · {}", app.status.label())
     } else {
-        format!("{model_label} · think {thinking}")
+        format!("{model_label}  ·  think {thinking}")
     };
     let mut lines = vec![Line::from(Span::styled(
         truncate_inline(&title, area.width as usize),
         Style::default()
             .fg(TEXT_STRONG)
+            .bg(SURFACE)
             .add_modifier(Modifier::BOLD),
     ))];
     if area.height > 1 {
         let detail = if area.width < 18 {
             Line::from(Span::styled(
                 single_line(&compact, area.width as usize),
-                Style::default().fg(app.status.color()),
+                Style::default().fg(app.status.color()).bg(SURFACE),
             ))
         } else {
             Line::from(vec![
                 Span::styled(
-                    format!("ctx {context_percent}% · "),
-                    Style::default().fg(DIM),
+                    format!("ctx {context_percent}%  ·  "),
+                    Style::default().fg(DIM).bg(SURFACE),
                 ),
-                Span::styled(runtime, Style::default().fg(app.status.color())),
+                Span::styled(runtime, Style::default().fg(app.status.color()).bg(SURFACE)),
             ])
         };
         lines.push(detail);
     }
     frame.render_widget(
         Paragraph::new(lines)
+            .style(Style::default().bg(SURFACE))
             .alignment(Alignment::Right)
             .wrap(Wrap { trim: false }),
         area,
@@ -3363,22 +3386,6 @@ fn align_with_footer_input(area: Rect, footer: Rect) -> Rect {
     Rect::new(input.x, area.y, input.width, area.height)
 }
 
-fn render_footer_separator(frame: &mut Frame<'_>, x: u16, area: Rect) {
-    if x == area.x || x >= area.right() || area.height == 0 {
-        return;
-    }
-    frame.render_widget(
-        Paragraph::new(
-            std::iter::repeat_n(
-                Line::from(Span::styled("│", Style::default().fg(MUTED))),
-                area.height as usize,
-            )
-            .collect::<Vec<_>>(),
-        ),
-        Rect::new(x, area.y, 1, area.height),
-    );
-}
-
 fn footer_segment_area(area: Rect, inset_left: bool, inset_right: bool) -> Rect {
     if area.is_empty() {
         return area;
@@ -3418,7 +3425,6 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         app.transcript_page_height = area.height as usize;
         app.max_scroll = 0;
         app.scroll_top = 0;
-        render_empty_state(frame, area);
         return;
     }
 
@@ -3435,19 +3441,8 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         app.scroll_top = app.scroll_top.min(app.max_scroll);
     }
 
-    let render_area = if line_count < area.height as usize {
-        let content_height = line_count.min(area.height as usize) as u16;
-        let y = area
-            .bottom()
-            .saturating_sub(TIMELINE_BOTTOM_GAP)
-            .saturating_sub(content_height)
-            .max(area.y);
-        Rect::new(area.x, y, area.width, content_height)
-    } else {
-        area
-    };
     let paragraph = paragraph.scroll((app.scroll_top.min(u16::MAX as usize) as u16, 0));
-    frame.render_widget(paragraph, render_area);
+    frame.render_widget(paragraph, area);
 
     if !app.follow_output && app.max_scroll > 0 {
         let indicator = format!(
@@ -3467,35 +3462,252 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
-fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LandingRegions {
+    brand: Rect,
+    card: Rect,
+    hint: Rect,
+    status: Rect,
+}
+
+fn landing_regions(area: Rect) -> LandingRegions {
+    if area.is_empty() {
+        return LandingRegions {
+            brand: area,
+            card: area,
+            hint: area,
+            status: area,
+        };
+    }
+
+    let status_height = u16::from(area.height >= 4);
+    let status = Rect::new(
+        area.x,
+        area.bottom().saturating_sub(status_height),
+        area.width,
+        status_height,
+    );
+    let stage = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        area.height.saturating_sub(status_height),
+    );
+    let card_height = match stage.height {
+        9.. => 5,
+        5..=8 => 3,
+        1..=4 => 1,
+        _ => 0,
+    };
+    let brand_height = u16::from(stage.height >= 7);
+    let brand_gap = if brand_height == 0 {
+        0
+    } else if stage.height >= 14 {
+        2
+    } else {
+        1
+    };
+    let hint_height = u16::from(stage.height >= 7);
+    let hint_gap = u16::from(hint_height > 0 && stage.height >= 10);
+    let group_height = brand_height + brand_gap + card_height + hint_gap + hint_height;
+    let group_y = stage.y + stage.height.saturating_sub(group_height) / 2;
+    let card_margin = if area.width >= 24 { 4 } else { 1 };
+    let card_width = area
+        .width
+        .saturating_sub(card_margin * 2)
+        .min(76)
+        .max(u16::from(area.width > 0));
+    let card_x = area.x + area.width.saturating_sub(card_width) / 2;
+    let brand = Rect::new(area.x, group_y, area.width, brand_height);
+    let card_y = brand.bottom().saturating_add(brand_gap);
+    let card = Rect::new(card_x, card_y, card_width, card_height);
+    let hint = Rect::new(
+        area.x,
+        card.bottom().saturating_add(hint_gap),
+        area.width,
+        hint_height,
+    );
+
+    LandingRegions {
+        brand,
+        card,
+        hint,
+        status,
+    }
+}
+
+fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
-    let height = area.height.min(3);
-    let y = area.y + area.height.saturating_sub(height) / 3;
-    let empty_area = Rect::new(area.x, y, area.width, height);
-    let mut lines = vec![Line::from(Span::styled(
-        "ZEX",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    ))];
-    if height > 1 {
-        lines.push(Line::from(Span::styled(
-            "Describe a task. Zex will keep the work in one timeline.",
-            Style::default().fg(DIM),
-        )));
+    let regions = landing_regions(area);
+
+    if !regions.brand.is_empty() {
+        let brand = if area.width >= 12 {
+            Line::from(vec![
+                Span::styled(
+                    "Z  E  ",
+                    Style::default()
+                        .fg(TEXT_STRONG)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "X",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ])
+        } else {
+            Line::from(Span::styled(
+                "ZEX",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ))
+        };
+        frame.render_widget(
+            Paragraph::new(brand).alignment(Alignment::Center),
+            regions.brand,
+        );
     }
-    if height > 2 {
-        lines.push(Line::from(Span::styled(
-            "/ commands · /model switch · /resume continue",
-            Style::default().fg(MUTED),
-        )));
+
+    render_landing_card(frame, regions.card, app);
+
+    if !regions.hint.is_empty() {
+        let hint = if regions.hint.width >= 72 {
+            "Enter send  ·  Shift+Enter newline  ·  / commands"
+        } else if regions.hint.width >= 42 {
+            "Enter send  ·  Shift+Enter newline  ·  /"
+        } else {
+            "Enter send  ·  /"
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(MUTED)))
+                .alignment(Alignment::Center),
+            regions.hint,
+        );
     }
+
+    render_landing_status(frame, regions.status, app);
+
+    if app.completion_open() && !regions.card.is_empty() {
+        let desired = completion_height(app, regions.card.width);
+        let available = regions.card.y.saturating_sub(area.y);
+        let height = desired.min(available);
+        let completion = Rect::new(
+            regions.card.x,
+            regions.card.y.saturating_sub(height),
+            regions.card.width,
+            height,
+        );
+        render_completion(frame, completion, app);
+    }
+}
+
+fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.is_empty() {
+        return;
+    }
+    frame.render_widget(Block::default().style(Style::default().bg(SURFACE)), area);
     frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true }),
-        empty_area,
+        Paragraph::new(
+            std::iter::repeat_n(
+                Line::from(Span::styled("▌", Style::default().fg(ACCENT).bg(SURFACE))),
+                area.height as usize,
+            )
+            .collect::<Vec<_>>(),
+        )
+        .style(Style::default().bg(SURFACE)),
+        Rect::new(area.x, area.y, 1, area.height),
     );
+
+    let content_x = area.x.saturating_add(if area.width >= 4 { 3 } else { 1 });
+    let content_width = area.right().saturating_sub(content_x).saturating_sub(1);
+    let input_height = if area.height >= 5 { 2 } else { 1 };
+    let input_y = area.y + u16::from(area.height >= 5);
+    let input_area = Rect::new(content_x, input_y, content_width, input_height);
+    render_input_buffer(
+        frame,
+        input_area,
+        app,
+        "",
+        Some(Line::from(vec![
+            Span::styled("Ask anything…", Style::default().fg(TEXT).bg(SURFACE)),
+            Span::styled(
+                "  “帮我看下这个项目的结构”",
+                Style::default().fg(DIM).bg(SURFACE),
+            ),
+        ])),
+        SURFACE,
+    );
+
+    if area.height >= 3 && content_width > 0 {
+        let metadata = landing_metadata(app);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                truncate_inline(&metadata, content_width as usize),
+                Style::default().fg(DIM).bg(SURFACE),
+            ))
+            .style(Style::default().bg(SURFACE)),
+            Rect::new(
+                content_x,
+                area.bottom()
+                    .saturating_sub(if area.height >= 5 { 2 } else { 1 }),
+                content_width,
+                1,
+            ),
+        );
+    }
+}
+
+fn landing_metadata(app: &App) -> String {
+    let Some(target) = ModelRef::from_key(&app.model) else {
+        return format!("Agent  ·  {}", app.model);
+    };
+    let provider = app
+        .providers
+        .provider(&target.provider_id)
+        .map(|provider| provider.display_name.as_str())
+        .unwrap_or(target.provider_id.as_str());
+    format!("Agent  ·  {}  ·  {provider}", target.model_id)
+}
+
+fn render_landing_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.is_empty() {
+        return;
+    }
+    let area = horizontal_inset(area, 2);
+    if area.is_empty() {
+        return;
+    }
+    let version = format!("zex {}", env!("CARGO_PKG_VERSION"));
+    let version_width = UnicodeWidthStr::width(version.as_str()).min(area.width as usize) as u16;
+    let left_width = area.width.saturating_sub(version_width.saturating_add(2));
+    if left_width > 0 {
+        let location = short_path(&app.working_dir, left_width as usize);
+        let context = app
+            .session_id
+            .as_deref()
+            .map(short_session_id)
+            .map(|session| format!("run {session}  ·  {location}"))
+            .unwrap_or(location);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                single_line(&context, left_width as usize),
+                Style::default().fg(MUTED),
+            )),
+            Rect::new(area.x, area.y, left_width, 1),
+        );
+    }
+    if version_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(version, Style::default().fg(MUTED)))
+                .alignment(Alignment::Right),
+            Rect::new(
+                area.right().saturating_sub(version_width),
+                area.y,
+                version_width,
+                1,
+            ),
+        );
+    }
 }
 
 fn completion_height(app: &App, width: u16) -> u16 {
@@ -3861,15 +4073,11 @@ fn append_thinking_lines(
     selected: bool,
 ) {
     let fold = if thinking.expanded { "▾" } else { "▸" };
-    let rail_color = if selected {
-        ACCENT
-    } else {
-        Color::Rgb(55, 65, 74)
-    };
+    let rail_color = if selected { ACCENT } else { MUTED };
     let header_style = if selected {
         Style::default().bg(SURFACE_RAISED)
     } else {
-        Style::default()
+        Style::default().bg(SURFACE)
     };
     let (state, state_color) = match status {
         ThinkingStatus::Active => ("active", ACCENT),
@@ -3927,15 +4135,11 @@ fn append_tool_lines(lines: &mut Vec<Line<'static>>, tool: &ToolEntry, selected:
     let fold = if tool.expanded { "▾" } else { "▸" };
     let subject = tool_subject(tool);
     let elapsed = tool_elapsed(tool);
-    let rail_color = if selected {
-        ACCENT
-    } else {
-        Color::Rgb(55, 65, 74)
-    };
+    let rail_color = if selected { ACCENT } else { MUTED };
     let header_style = if selected {
         Style::default().bg(SURFACE_RAISED)
     } else {
-        Style::default()
+        Style::default().bg(SURFACE)
     };
     let mut header = vec![
         Span::styled(
@@ -4124,7 +4328,23 @@ fn render_footer_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
-    let input_area = footer_segment_area(area, true, true);
+    frame.render_widget(
+        Paragraph::new(
+            std::iter::repeat_n(
+                Line::from(Span::styled("▌", Style::default().fg(ACCENT).bg(SURFACE))),
+                area.height as usize,
+            )
+            .collect::<Vec<_>>(),
+        )
+        .style(Style::default().bg(SURFACE)),
+        Rect::new(area.x, area.y, 1, area.height),
+    );
+    let input_area = Rect::new(
+        area.x.saturating_add(2),
+        area.y,
+        area.width.saturating_sub(3),
+        area.height,
+    );
     if input_area.is_empty() {
         return;
     }
@@ -4142,9 +4362,10 @@ fn render_footer_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let y = area.y + area.height.saturating_sub(1) / 2;
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("ZEX / ", Style::default().fg(ACCENT)),
-                Span::styled(label, Style::default().fg(TEXT)),
+                Span::styled("ZEX / ", Style::default().fg(ACCENT).bg(SURFACE)),
+                Span::styled(label, Style::default().fg(TEXT).bg(SURFACE)),
             ]))
+            .style(Style::default().bg(SURFACE))
             .alignment(Alignment::Center),
             Rect::new(input_area.x, y, input_area.width, 1),
         );
@@ -4173,35 +4394,60 @@ fn render_footer_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let y = area.y + area.height.saturating_sub(1) / 2;
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("◌ ", Style::default().fg(ACCENT)),
-                Span::styled(busy_text, Style::default().fg(TEXT)),
+                Span::styled("◌ ", Style::default().fg(ACCENT).bg(SURFACE)),
+                Span::styled(busy_text, Style::default().fg(TEXT).bg(SURFACE)),
             ]))
+            .style(Style::default().bg(SURFACE))
             .wrap(Wrap { trim: false }),
             Rect::new(input_area.x, y, input_area.width, 1),
         );
         return;
     }
 
-    let prompt_width = UnicodeWidthStr::width(INPUT_PROMPT).min(input_area.width as usize) as u16;
-    let prompt_area = Rect::new(input_area.x, input_area.y, prompt_width, input_area.height);
+    render_input_buffer(frame, input_area, app, INPUT_PROMPT, None, SURFACE);
+}
+
+fn render_input_buffer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    prompt: &str,
+    placeholder: Option<Line<'static>>,
+    background: Color,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let prompt_width = UnicodeWidthStr::width(prompt).min(area.width as usize) as u16;
+    let prompt_area = Rect::new(area.x, area.y, prompt_width, area.height);
     let editor_area = Rect::new(
         prompt_area.right(),
-        input_area.y,
-        input_area.width.saturating_sub(prompt_width),
-        input_area.height,
+        area.y,
+        area.width.saturating_sub(prompt_width),
+        area.height,
     );
     if editor_area.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled(INPUT_PROMPT, Style::default().fg(ACCENT))),
-            input_area,
+            Paragraph::new(Span::styled(
+                prompt.to_owned(),
+                Style::default().fg(ACCENT).bg(background),
+            ))
+            .style(Style::default().bg(background)),
+            area,
         );
         return;
     }
 
-    frame.render_widget(
-        Paragraph::new(Span::styled(INPUT_PROMPT, Style::default().fg(ACCENT))),
-        prompt_area,
-    );
+    if prompt_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                prompt.to_owned(),
+                Style::default().fg(ACCENT).bg(background),
+            ))
+            .style(Style::default().bg(background)),
+            prompt_area,
+        );
+    }
 
     let editor_width = editor_area.width.max(1) as usize;
     let visible_rows = editor_area.height.max(1) as usize;
@@ -4212,15 +4458,32 @@ fn render_footer_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         Text::from(Line::from(Span::styled(
             app.input.content.clone(),
-            Style::default().fg(TEXT_STRONG),
+            Style::default().fg(TEXT_STRONG).bg(background),
         )))
     };
     frame.render_widget(
         Paragraph::new(editor)
+            .style(Style::default().bg(background))
             .wrap(Wrap { trim: false })
             .scroll((vertical_scroll.min(u16::MAX as usize) as u16, 0)),
         editor_area,
     );
+    if app.input.is_empty()
+        && let Some(placeholder) = placeholder
+        && editor_area.width > 1
+    {
+        frame.render_widget(
+            Paragraph::new(placeholder)
+                .style(Style::default().bg(background))
+                .wrap(Wrap { trim: true }),
+            Rect::new(
+                editor_area.x + 1,
+                editor_area.y,
+                editor_area.width - 1,
+                editor_area.height,
+            ),
+        );
+    }
 
     let cursor_y = metrics.cursor_row.saturating_sub(vertical_scroll) as u16;
     frame.set_cursor_position((
@@ -4510,10 +4773,10 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
-        ACCENT, App, AppContext, CommandOutput, InputAction, InputBuffer, KeyBurst, ProviderPane,
-        SCROLL_STEP, SURFACE, SURFACE_RAISED, Status, ThinkingEntry, ToolStatus, TranscriptEntry,
-        UiRegions, command_specs, handle_key_event, handle_terminal_event, input_metrics, render,
-        truncate_chars, ui_regions,
+        ACCENT, App, AppContext, BACKGROUND, CommandOutput, InputAction, InputBuffer, KeyBurst,
+        ProviderPane, SCROLL_STEP, SURFACE, SURFACE_RAISED, Status, ThinkingEntry, ToolStatus,
+        TranscriptEntry, UiRegions, command_specs, handle_key_event, handle_terminal_event,
+        input_metrics, landing_regions, render, truncate_chars, ui_regions,
     };
     use crate::agent::{AgentEvent, Message, MessageRole};
     use crate::config::{ModelConfig, ModelRef, ProviderCatalog, ProviderConfig, SecretValue};
@@ -4703,7 +4966,7 @@ mod tests {
         let screen = format!("{}", terminal.backend());
         assert!(screen.contains("Models"));
         assert!(screen.contains("Current: OpenAI / GPT-5"));
-        assert!(!screen.contains("Describe a task. Zex will keep the work in one timeline."));
+        assert!(!screen.contains("Ask anything…"));
 
         app.dismiss_model_picker();
         app.open_provider_editor();
@@ -4713,7 +4976,7 @@ mod tests {
         assert!(screen.contains("Provider details"));
         assert!(screen.contains("API key"));
         assert!(!screen.contains("secret"));
-        assert!(!screen.contains("Describe a task. Zex will keep the work in one timeline."));
+        assert!(!screen.contains("Ask anything…"));
     }
 
     #[test]
@@ -5079,8 +5342,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_state_uses_native_background_and_unified_footer_separators() {
-        let mut app = app();
+    fn empty_state_centers_the_zex_card_and_keeps_status_quiet() {
+        let mut app = configured_app();
         app.working_dir = PathBuf::from("D:/workspaces/zex");
         app.git_status = Some(super::GitStatus {
             branch: "main".to_owned(),
@@ -5093,28 +5356,30 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
-        let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 100, 24), &app);
+        let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 100, 24));
 
-        assert!(screen.contains("Describe a task. Zex will keep the work in one timeline."));
-        assert!(screen.contains("/ commands · /model switch · /resume continue"));
-        assert!(screen.contains("ZEX"));
+        assert!(screen.contains("Z  E  X"));
+        assert!(screen.contains("Ask anything…"));
+        assert!(screen.contains("帮我看下这个项目的结构"));
+        assert!(screen.contains("Agent  ·  gpt-5  ·  OpenAI"));
         assert!(screen.contains("Enter send"));
-        assert!(screen.contains("think high"));
-        assert!(screen.contains("main@a1b2c3d"));
-        assert!(screen.contains("ctx 25%"));
-        assert!(screen.contains("● idle"));
-        assert_ne!(style_at(&terminal, 0, 0).bg, Some(SURFACE));
-        assert_ne!(style_at(&terminal, 0, 0).bg, Some(SURFACE_RAISED));
-        let footer = super::footer_regions(regions.footer);
+        assert!(screen.contains("D:/workspaces/zex"));
+        assert!(screen.contains("zex 0.1.0"));
+        assert!(!screen.contains("think high"));
+        assert!(!screen.contains("ctx 25%"));
+        assert!(!screen.contains("● idle"));
+        assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
+        assert!(regions.card.y > 4);
+        assert!(regions.card.bottom() < regions.status.y);
+        assert!(regions.card.width < 100);
         assert_eq!(
-            terminal.backend().buffer()[(footer.input.x, footer.input.y)].symbol(),
-            "│"
+            terminal.backend().buffer()[(regions.card.x, regions.card.y)].symbol(),
+            "▌"
         );
         assert_eq!(
-            terminal.backend().buffer()[(footer.right.x, footer.input.y)].symbol(),
-            "│"
+            style_at(&terminal, regions.card.x + 1, regions.card.y).bg,
+            Some(SURFACE)
         );
-        assert_regions_fill(ratatui::layout::Rect::new(0, 0, 100, 24), regions);
     }
 
     #[test]
@@ -5124,15 +5389,15 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
-        let input = super::footer_regions(regions.footer).input;
-        let editor_x = input.x + 3;
+        let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16));
+        let editor_x = regions.card.x + 3;
+        let editor_y = regions.card.y + 1;
 
         terminal
             .backend_mut()
-            .assert_cursor_position((editor_x, input.y));
+            .assert_cursor_position((editor_x, editor_y));
         assert_eq!(
-            terminal.backend().buffer()[(editor_x, input.y)].symbol(),
+            terminal.backend().buffer()[(editor_x, editor_y)].symbol(),
             " ",
             "the IME preedit must not overlap application-rendered text"
         );
@@ -5147,18 +5412,19 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
-        let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
-        let input = super::footer_regions(regions.footer).input;
-        let editor_x = input.x + 3;
+        let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16));
+        let editor_x = regions.card.x + 3;
+        let editor_y = regions.card.y + 1;
 
-        assert!(screen.contains("› hello"));
+        assert!(screen.contains("hello"));
+        assert!(!screen.contains("Ask anything…"));
         terminal
             .backend_mut()
-            .assert_cursor_position((editor_x + 5, input.y));
+            .assert_cursor_position((editor_x + 5, editor_y));
     }
 
     #[test]
-    fn layout_remains_edge_aligned_across_terminal_sizes() {
+    fn empty_layout_remains_composed_across_terminal_sizes() {
         for (width, height) in [(120, 32), (70, 18), (38, 12), (16, 6), (6, 3)] {
             let mut app = app();
             app.input
@@ -5169,20 +5435,23 @@ mod tests {
 
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             let area = ratatui::layout::Rect::new(0, 0, width, height);
-            let regions = ui_regions(area, &app);
-            assert_regions_fill(area, regions);
-            assert!(regions.footer.height <= height);
-            assert_ne!(style_at(&terminal, 0, 0).bg, Some(SURFACE));
-            assert_ne!(style_at(&terminal, 0, 0).bg, Some(SURFACE_RAISED));
+            let regions = landing_regions(area);
+            assert!(regions.brand.bottom() <= area.bottom());
+            assert!(regions.card.bottom() <= area.bottom());
+            assert!(regions.hint.bottom() <= area.bottom());
+            assert!(regions.status.bottom() <= area.bottom());
+            assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
         }
     }
 
     #[test]
-    fn short_timeline_is_bottom_anchored_near_the_footer() {
+    fn first_turn_switches_to_a_top_anchored_work_timeline() {
         let mut app = app();
+        assert!(app.landing_visible());
+        app.start_turn();
         app.transcript.push(TranscriptEntry::Message {
-            role: MessageRole::Assistant,
-            content: "Bottom anchored answer".to_owned(),
+            role: MessageRole::User,
+            content: "Inspect the project".to_owned(),
         });
         let area = ratatui::layout::Rect::new(0, 0, 100, 24);
         let backend = TestBackend::new(area.width, area.height);
@@ -5192,11 +5461,35 @@ mod tests {
 
         let regions = ui_regions(area, &app);
         let screen = format!("{}", terminal.backend());
-        let answer_row = screen
+        let message_row = screen
             .lines()
-            .position(|row| row.contains("Bottom anchored answer"))
-            .expect("answer should be visible") as u16;
-        assert_eq!(answer_row, regions.transcript.bottom().saturating_sub(3));
+            .position(|row| row.contains("Inspect the project"))
+            .expect("message should be visible") as u16;
+        assert!(!app.landing_visible());
+        assert!(!screen.contains("Ask anything…"));
+        assert!(screen.contains("thinking"));
+        assert_eq!(message_row, regions.transcript.y);
+    }
+
+    #[test]
+    fn clearing_the_timeline_restores_the_landing_layout() {
+        let mut app = app();
+        app.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::User,
+            delta: "Inspect the project".to_owned(),
+        });
+        assert!(!app.landing_visible());
+
+        app.reset_transcript();
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+
+        assert!(app.landing_visible());
+        assert!(screen.contains("Z  E  X"));
+        assert!(screen.contains("Ask anything…"));
+        assert!(!screen.contains("Inspect the project"));
     }
 
     #[test]
@@ -5254,14 +5547,18 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
-        assert!(screen.contains("ZEX"));
-        assert!(screen.contains("50%"), "screen:\n{screen}");
+        assert!(screen.contains("zex 0.1.0"), "screen:\n{screen}");
+        assert!(!screen.contains("50%"));
         assert!(!screen.contains("feature/very-long-branch-name"));
     }
 
     #[test]
     fn idle_thinking_and_running_states_are_clear_in_the_footer() {
         let mut app = app();
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Ready for the next step.".to_owned(),
+        });
         let backend = TestBackend::new(100, 18);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -5292,6 +5589,10 @@ mod tests {
     #[test]
     fn multiline_input_scrolls_inside_the_stable_footer() {
         let mut app = app();
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Ready.".to_owned(),
+        });
         let area = ratatui::layout::Rect::new(0, 0, 72, 18);
         let single = ui_regions(area, &app);
         app.input
@@ -5307,11 +5608,7 @@ mod tests {
         for y in footer.input.y..footer.input.bottom() {
             assert_eq!(
                 terminal.backend().buffer()[(footer.input.x, y)].symbol(),
-                "│"
-            );
-            assert_eq!(
-                terminal.backend().buffer()[(footer.right.x, y)].symbol(),
-                "│"
+                "▌"
             );
         }
     }
@@ -5319,6 +5616,10 @@ mod tests {
     #[test]
     fn completion_panel_aligns_with_footer_and_highlights_selection() {
         let mut app = app();
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Ready.".to_owned(),
+        });
         app.input.insert_str("/");
         app.refresh_completion();
         let backend = TestBackend::new(100, 28);
@@ -5327,15 +5628,13 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 100, 28), &app);
         let footer = super::footer_regions(regions.footer);
-        let panel_x = footer.input.x;
-        let input_separator_x = footer.input.x;
+        let completion = super::align_with_footer_input(regions.completion, regions.footer);
+        assert!(regions.completion.width > 0);
+        assert_eq!(completion.x, footer.input.x);
+        assert_eq!(completion.width, footer.input.width);
         assert_eq!(
-            style_at(&terminal, panel_x, regions.completion.y).fg,
-            Some(super::MUTED)
-        );
-        assert_eq!(
-            terminal.backend().buffer()[(input_separator_x, footer.input.y)].symbol(),
-            "│"
+            terminal.backend().buffer()[(footer.input.x, footer.input.y)].symbol(),
+            "▌"
         );
         let selected_row = regions.completion.y + 1;
         assert!(
@@ -5463,6 +5762,11 @@ mod tests {
         let folded = format!("{}", terminal.backend());
         assert!(folded.contains("think · medium · done"));
         assert!(folded.contains("Inspect constraints first."));
+        let thinking_row = folded
+            .lines()
+            .position(|row| row.contains("think · medium · done"))
+            .expect("thinking row should be visible") as u16;
+        assert!((0..100).any(|x| style_at(&terminal, x, thinking_row).bg == Some(SURFACE)));
 
         app.select_tool(false);
         app.toggle_selected_tool();
@@ -5549,6 +5853,11 @@ mod tests {
 
         assert!(screen.contains("bash · git status · exit 0 · 8ms"));
         assert!(screen.contains("grep · render_footer · 11 matches · 14ms"));
+        let tool_row = screen
+            .lines()
+            .position(|row| row.contains("bash · git status"))
+            .expect("tool row should be visible") as u16;
+        assert!((0..110).any(|x| style_at(&terminal, x, tool_row).bg == Some(SURFACE)));
     }
 
     #[test]
