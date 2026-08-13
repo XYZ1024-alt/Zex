@@ -172,18 +172,18 @@ zex
 
 TUI 占满 terminal 工作区，但不铺自定义整屏背景。它保持单列时间流，不使用左侧对话、右侧工具的仪表盘分栏：
 
-1. 主区：可滚动 feed，按发生顺序显示 user/assistant 文本、思考卡片和 tool 卡片。当前 core 未生产 planning/todo 事件，因此不会为不存在的数据预留面板；以后新增对应事件时仍进入同一 feed。
-2. 斜杠补全：输入 `/` 时浮在输入框上方，不占永久分区。
-3. 固定状态栏：`ZEX` 标识、ready/thinking/working 状态、model、think 强度、context 占用、短工作目录和可用时的 git branch@commit；窄终端自动隐藏路径等次要字段。
-4. 最底输入框：状态与输入使用 Zex 青蓝 accent 的左右侧条夹住内容；输入框始终是屏幕最后一个区域，支持多行向上扩展，最多显示 6 行；快捷键提示保持在输入框上方的一行内。
+1. 主区：可滚动时间流，按发生顺序显示 user/assistant 文本、思考卡片和 tool 卡片。短时间流靠近输入区向上生长，长时间流占满主区并正常滚动；当前 core 未生产 planning/todo 事件，因此不会为不存在的数据预留面板。
+2. 斜杠补全：输入 `/` 时固定浮在中央输入列上方，不遮挡左右状态，也不占永久分区。
+3. 固定底栏：两行主信息带，下面紧接一行快捷键。左段稳定显示 `ZEX`、run 与短 session、工作目录或 git；右段严格按 model → think → context → idle/thinking/running 状态排列；中央保留输入或当前活动。
+4. 三段之间只使用低亮度细 `│` 分隔。中央输入可编辑多行，但在固定两行高度内滚动，不推动主区或底栏跳动；不保留空白状态行。
 
-根区域、空状态、用户消息和 assistant 正文都使用终端原生背景；近黑 surface 只用于 tool 卡片、代码块、斜杠补全面板和帮助面板。界面使用暖灰正文、冷灰次要文本、Zex 青蓝 accent，以及柔和的 success/error 色。用户消息只用轻量 `›` 标记；assistant 正文不带角色标签，也不显示醒目的 `YOU` / `ASSISTANT`。基础 Markdown 标题、列表、引用和代码围栏形成清楚但克制的层级。
+根区域、空状态、用户消息和 assistant 正文都使用终端原生背景；近黑 surface 只用于代码块、展开的 tool 输出和斜杠补全。界面使用冷中性正文、明显更暗的次要文本、单一 Zex 钢青 accent，以及低饱和 success/error 色。用户消息使用轻量 `›` 引导，assistant 正文使用低亮度 `│` 连成单一时间流；两者都不显示 `YOU` / `ASSISTANT` 标签。基础 Markdown 标题、列表、引用和代码围栏形成清楚但克制的层级。
 
 思考内容优先读取 Provider 的 `reasoning_content`、`reasoning`、`reasoning_details` / `thinking_blocks` 或 Responses API reasoning summary；缺少显式字段时再解析完整的 `<think>...</think>`。思考与 assistant 最终回答、tool call 分开保存，并在单一时间流中显示为默认折叠卡片。`/thinking show|hide` 控制卡片可见性并持久化，隐藏期间数据仍保留，因此再次显示或恢复会话时可重新渲染；该开关独立于 `/think` 的模型思考强度。
 
 Provider 与模型都可声明 `[thinking]`（`min_level`、`max_level`、可选精确 `supported`、`mode = "effort"`）和 `[compat]`（`supports_reasoning_effort`、`supports_interleaved_thinking`、`reasoning_effort_map`）。合并优先级为安全默认 → models.dev → Provider 手动配置 → 模型手动配置。缺失能力时使用安全范围 `off/low/medium/high`，因此 `xhigh` 和 `max` 会降级到 `high`，不会原样发送未知值。工具调用轮次仅在目标模型声明支持 interleaved thinking 时回传 reasoning；最终回答及不支持该能力的模型历史会在请求层剥离 reasoning，但会话中的可查看内容仍保留。
 
-思考和 tool 卡片都使用近黑 surface 和细 accent rail。tool 标题突出工具名；`bash` 显示 `$ command`。默认态只显示标题、running/done/failed/interrupted、耗时和一行结果摘要；无输出的成功命令显示 `Completed`。`exit_code`、stdout/stderr 全文、timeout 和参数只在展开后出现，`Ctrl-O` 展开或折叠当前卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 只在状态变化、输入、新事件或 toast 过期时按固定帧率差分重绘。
+思考和 tool 卡片共用 Zex 摘要语法。思考卡为 `think · level · active|done · summary`；tool 卡为 `tool · subject · result · duration`，其中 `bash` 显示 `exit N`，`read` 显示行数，`grep` / `glob` 显示匹配数。默认折叠态严格占一行；展开后才显示 input、output、timeout、行数和收起提示。`Ctrl-O` 展开或折叠当前卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 只在状态变化、输入、新事件或 toast 过期时按固定帧率差分重绘。
 
 | 快捷键 | idle 模式 | turn 运行中 |
 | --- | --- | --- |
@@ -204,7 +204,7 @@ Provider 与模型都可声明 `[thinking]`（`min_level`、`max_level`、可选
 
 ### 斜杠命令
 
-TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册表与解析模块；`/help` 和补全列表因此不会漂移。输入 `/` 后按前缀过滤，例如 `/se` 只显示 `/sessions`。Up/Down 选择，Tab 补全，Enter 在前缀未完整时先补全、命令完整时执行，Esc 关闭。命中的斜杠命令不会作为普通用户消息发给模型；未知命令返回可读错误。`/model`、`/think`、`/thinking`、`/compact`、新建与恢复会话等短暂状态反馈只更新底栏或显示约 4 秒 toast，不写入主 feed；`/help` 使用有限高度的临时命令面板，Esc 关闭且不污染对话时间流；`/sessions` 仍作为需要阅读的结果进入时间流。`/thinking` 是 TUI 显示设置，headless 模式会返回明确错误。
+TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册表与解析模块；`/help` 和补全列表因此不会漂移。输入 `/` 后按前缀过滤，例如 `/se` 只显示 `/sessions`。Up/Down 选择，Tab 补全，Enter 在前缀未完整时先补全、命令完整时执行，Esc 关闭。命中的斜杠命令不会作为普通用户消息发给模型；未知命令返回可读错误。`/model`、`/provider`、`/resume` 和 `/help` 都替换主区显示干净列表或表单，使用统一左侧选中指示，Esc 退出后精确恢复原时间流滚动位置。模型、thinking、compact、新建与恢复会话等短暂状态反馈只更新底栏或显示约 4 秒 toast，不写入主 feed；`/sessions` 仍作为需要阅读的结果进入时间流。`/thinking` 是 TUI 显示设置，headless 模式会返回明确错误。
 
 | 命令 | 行为 |
 | --- | --- |
@@ -367,9 +367,9 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
    cargo run --
    ```
 
-   预期进入 TUI。先输入 `记住数字 37`，再输入 `必须使用 read 读取 Cargo.toml，然后告诉我刚才的数字`。主区应显示两轮对话、Provider 返回时默认折叠的 `Thinking` 卡片，以及默认折叠的 `read` running/done 卡片；状态栏应在 `ready`、`thinking`、`working` 间切换并显示 model、短路径或 branch、think 强度/显示状态和 context。按 Tab 选择思考或 tool 卡片、按 Ctrl-O 展开详情，再用鼠标滚轮或 PageUp/PageDown 滚动历史。第二轮回答应保留上下文。
+   预期进入 TUI。先输入 `记住数字 37`，再输入 `必须使用 read 读取 Cargo.toml，然后告诉我刚才的数字`。主区应显示两轮单一时间流、默认折叠的 `think · level · state · summary` 卡片，以及默认折叠的 `read · Cargo.toml · N lines · duration` 卡片；底栏应在 `idle`、`thinking`、`running` 间切换，并按 model → think → context → status 显示右侧信息。按 Tab 选择思考或 tool 卡片、按 Ctrl-O 展开详情，再用鼠标滚轮或 PageUp/PageDown 滚动历史。第二轮回答应保留上下文。
 
-6. 验证多行输入与中断：用 Shift-Enter 或 Alt-Enter 输入两行后按 Enter 发送。再提交一个会运行较久的请求，并在 `thinking` 或 `working` 状态按 Ctrl-C。预期底部短暂显示 interrupted toast，运行中的 tool 标记为 interrupted，状态恢复 `ready`，可立即发送下一条消息。
+6. 验证多行输入与中断：用 Shift-Enter 或 Alt-Enter 输入两行后按 Enter 发送。预期中央输入在固定两行高度内滚动，底栏和主区不跳动。再提交一个会运行较久的请求，并在 `thinking` 或 `running` 状态按 Ctrl-C。预期底部短暂显示 interrupted toast，运行中的 tool 标记为 stopped，状态恢复 `idle`，可立即发送下一条消息。
 
 7. 验证错误摘要：使用错误 API Key 启动 TUI 并提交一句话。预期主区只出现一条可读错误，不重复刷屏；Esc 或 Ctrl-C 可正常退出并恢复终端。
 
@@ -412,10 +412,11 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 13. 验证本次 TUI 交互：
 
     1. 输入 `/se`，预期输入框上方只出现 `/sessions` 与说明；Up/Down 选择，Tab 补全，Esc 关闭。
-    2. 要求模型连续执行 `git status` 和 `git rev-parse --short HEAD`。预期同一 feed 内出现两个 `$ git …` surface 卡片；默认折叠态只显示状态、耗时和短摘要，展开后才显示完整 output、参数和 timeout。
+    2. 要求模型连续执行 `git status` 和 `git rev-parse --short HEAD`。预期同一时间流内出现 `bash · git status · exit 0 · duration` 和 `bash · git rev-parse --short HEAD · exit 0 · duration` 两张单行卡片；展开后才显示完整 output、参数和 timeout。
     3. 按 Tab 选中工具并按 Ctrl-O 展开/折叠。
     4. 输入 `/think high`，再连续按 Ctrl-T。预期状态栏 think 更新，项目 `.zex/config.toml` 写入最新偏好；每次只更新 toast，不向主 feed 追加消息。不支持推理强度的模型显示 `n/a`，不崩溃。
     5. 输入 `/thinking hide` 后提交会返回思考内容的请求。预期不显示思考卡片，但最终回答和 tool 卡片不受影响；输入 `/thinking show` 后新返回的思考内容恢复为默认折叠卡片，配置写入 `hide_thinking_block`。
+    6. 分别打开 `/model`、`/resume`、`/help`、`/provider`，确认页面替换主区、选中态使用统一左侧指示，`/help` 每条命令独占一行；退出后时间流精确回到原滚动位置。
 
 ## 模块
 

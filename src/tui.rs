@@ -19,10 +19,10 @@ use futures_util::StreamExt;
 use ratatui::{
     DefaultTerminal, Frame, TerminalOptions, Viewport,
     backend::CrosstermBackend,
-    layout::{Alignment, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -49,23 +49,24 @@ const MAX_THINKING_DETAIL_CHARS: usize = 16_000;
 const MAX_TOOL_DETAIL_CHARS: usize = 4_000;
 const MAX_TOOL_ARGUMENT_CHARS: usize = 2_000;
 const MAX_INPUT_HISTORY: usize = 100;
-const MAX_INPUT_ROWS: u16 = 6;
 const MIN_TRANSCRIPT_HEIGHT: u16 = 2;
 const HORIZONTAL_GUTTER: u16 = 1;
+const FOOTER_HEIGHT: u16 = 2;
+const TIMELINE_BOTTOM_GAP: u16 = 1;
 const INPUT_PROMPT: &str = "› ";
 const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-const SURFACE: Color = Color::Rgb(20, 23, 28);
-const SURFACE_RAISED: Color = Color::Rgb(27, 31, 37);
-const TEXT: Color = Color::Rgb(207, 213, 220);
-const TEXT_STRONG: Color = Color::Rgb(235, 239, 243);
-const DIM: Color = Color::Rgb(111, 120, 131);
-const MUTED: Color = Color::Rgb(69, 77, 87);
-const ACCENT: Color = Color::Rgb(104, 165, 184);
-const SUCCESS: Color = Color::Rgb(116, 171, 136);
-const ERROR: Color = Color::Rgb(198, 111, 118);
+const SURFACE: Color = Color::Rgb(22, 26, 31);
+const SURFACE_RAISED: Color = Color::Rgb(29, 34, 40);
+const TEXT: Color = Color::Rgb(202, 209, 216);
+const TEXT_STRONG: Color = Color::Rgb(234, 238, 242);
+const DIM: Color = Color::Rgb(105, 116, 127);
+const MUTED: Color = Color::Rgb(61, 71, 81);
+const ACCENT: Color = Color::Rgb(101, 158, 178);
+const SUCCESS: Color = Color::Rgb(112, 160, 130);
+const ERROR: Color = Color::Rgb(187, 105, 113);
 
 pub fn is_available() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
@@ -734,15 +735,22 @@ fn handle_key_event(
 
     if app.session_picker_open() && !turn_active {
         match key.code {
-            KeyCode::Up => app.select_session(true),
-            KeyCode::Down => app.select_session(false),
+            KeyCode::Up | KeyCode::Char('k') => app.select_session(true),
+            KeyCode::Down | KeyCode::Char('j') => app.select_session(false),
             KeyCode::Enter => {
                 if let Some(session_id) = app.take_selected_session() {
                     return InputAction::Resume(session_id);
                 }
             }
-            KeyCode::Esc => app.dismiss_session_picker(),
+            KeyCode::Esc | KeyCode::Char('q') => app.dismiss_session_picker(),
             _ => {}
+        }
+        return InputAction::None;
+    }
+
+    if app.help_open && !turn_active {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            app.help_open = false;
         }
         return InputAction::None;
     }
@@ -899,9 +907,9 @@ enum Status {
 impl Status {
     fn label(self) -> &'static str {
         match self {
-            Self::Idle => "ready",
+            Self::Idle => "idle",
             Self::Thinking => "thinking",
-            Self::RunningTool => "working",
+            Self::RunningTool => "running",
             Self::Cancelling => "stopping",
             Self::Error => "error",
         }
@@ -937,9 +945,9 @@ impl ToolStatus {
     fn label(self) -> &'static str {
         match self {
             Self::Running => "running",
-            Self::Done => "done",
+            Self::Done => "ok",
             Self::Failed => "failed",
-            Self::Cancelled => "interrupted",
+            Self::Cancelled => "stopped",
         }
     }
 
@@ -950,15 +958,12 @@ impl ToolStatus {
             Self::Failed => ERROR,
         }
     }
+}
 
-    fn symbol(self) -> &'static str {
-        match self {
-            Self::Running => "◌",
-            Self::Done => "✓",
-            Self::Failed => "×",
-            Self::Cancelled => "−",
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingStatus {
+    Active,
+    Done,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1809,6 +1814,13 @@ impl App {
 
     fn session_picker_open(&self) -> bool {
         self.session_picker.is_some()
+    }
+
+    fn page_open(&self) -> bool {
+        self.help_open
+            || self.session_picker_open()
+            || self.model_picker_open()
+            || self.provider_editor_open()
     }
 
     fn select_session(&mut self, reverse: bool) {
@@ -2707,32 +2719,66 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_model_picker(frame, regions.transcript, app);
     } else if app.provider_editor_open() {
         render_provider_editor(frame, regions.transcript, app);
+    } else if app.session_picker_open() {
+        render_session_picker(frame, regions.transcript, app);
+    } else if app.help_open {
+        render_help_page(frame, regions.transcript);
     } else {
         render_transcript(frame, regions.transcript, app);
-        render_completion(frame, regions.completion, app);
+        let completion = align_with_footer_input(regions.completion, regions.footer);
+        render_completion(frame, completion, app);
     }
-    render_status(frame, regions.status, app);
+    render_footer(frame, regions.footer, app);
     render_keymap(frame, regions.keymap, app);
-    if !app.model_picker_open() && !app.provider_editor_open() {
-        render_input(frame, regions.input, app);
-        render_help_overlay(frame, regions.transcript, app);
-        render_session_picker(frame, regions.transcript, app);
-    }
 }
 
-fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
-    let footer = content_area(area);
-    let rail_color = if app.busy {
-        ACCENT
-    } else {
-        status_rail_color(app.status)
+    let regions = footer_regions(area);
+    render_footer_context(frame, regions.left, app);
+    render_footer_separator(frame, regions.input.x, area);
+    render_footer_input(frame, regions.input, app);
+    render_footer_separator(frame, regions.right.x, area);
+    render_footer_runtime(frame, regions.right, app);
+}
+
+fn render_footer_context(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let area = footer_segment_area(area, true, false);
+    if area.is_empty() {
+        return;
+    }
+    let session = app
+        .session_id
+        .as_deref()
+        .map(short_session_id)
+        .unwrap_or("new");
+    let location = match &app.git_status {
+        Some(git) => format!("{}@{}", single_line(&git.branch, 18), git.commit),
+        None => short_path(&app.working_dir, area.width as usize),
     };
-    let content = render_footer_rails(frame, footer, rail_color);
-    let content = horizontal_inset(content, 1);
-    if content.is_empty() {
+    let title = if area.height == 1 || area.width < 14 {
+        format!("ZEX {session}")
+    } else {
+        format!("ZEX · run {session}")
+    };
+    let mut lines = vec![Line::from(vec![Span::styled(
+        single_line(&title, area.width as usize),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )])];
+    if area.height > 1 {
+        lines.push(Line::from(Span::styled(
+            single_line(&location, area.width as usize),
+            Style::default().fg(DIM),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_footer_runtime(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let area = footer_segment_area(area, true, true);
+    if area.is_empty() {
         return;
     }
     let context_percent = app
@@ -2745,24 +2791,6 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         || app.thinking_preference.to_string(),
         |level| level.to_string(),
     );
-    let thinking = format!(
-        "{thinking}/{}",
-        if app.show_thinking { "show" } else { "hide" }
-    );
-    let location = match &app.git_status {
-        Some(git) => format!(
-            "{}  {}@{}",
-            short_path(&app.working_dir, 32),
-            single_line(&git.branch, 18),
-            git.commit
-        ),
-        None => short_path(&app.working_dir, 48),
-    };
-    let session = app
-        .session_id
-        .as_deref()
-        .map(short_session_id)
-        .unwrap_or("new");
     let model_label = ModelRef::from_key(&app.model)
         .and_then(|target| {
             app.providers.model(&target).map(|(provider, model)| {
@@ -2770,96 +2798,42 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             })
         })
         .unwrap_or_else(|| app.model.clone());
-
-    let right_text = if content.width >= 18 {
-        format!("ctx {context_percent}%")
+    let runtime = format!("{} {}", app.status.symbol(), app.status.label());
+    let compact = format!("{} · {context_percent}%", app.status.label());
+    let title = if area.height == 1 {
+        format!("{context_percent}% · {}", app.status.label())
     } else {
-        format!("{context_percent}%")
+        format!("{model_label} · think {thinking}")
     };
-    let right_width = UnicodeWidthStr::width(right_text.as_str()).min(content.width as usize);
-    let gap = usize::from(content.width as usize > right_width + 1);
-    let left_width = content
-        .width
-        .saturating_sub(right_width as u16)
-        .saturating_sub(gap as u16);
-    let left = Rect::new(content.x, content.y, left_width, content.height);
-    let right = Rect::new(
-        content.right().saturating_sub(right_width as u16),
-        content.y,
-        right_width as u16,
-        content.height,
+    let mut lines = vec![Line::from(Span::styled(
+        truncate_inline(&title, area.width as usize),
+        Style::default()
+            .fg(TEXT_STRONG)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if area.height > 1 {
+        let detail = if area.width < 18 {
+            Line::from(Span::styled(
+                single_line(&compact, area.width as usize),
+                Style::default().fg(app.status.color()),
+            ))
+        } else {
+            Line::from(vec![
+                Span::styled(
+                    format!("ctx {context_percent}% · "),
+                    Style::default().fg(DIM),
+                ),
+                Span::styled(runtime, Style::default().fg(app.status.color())),
+            ])
+        };
+        lines.push(detail);
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Right)
+            .wrap(Wrap { trim: false }),
+        area,
     );
-
-    let model_limit = if left_width >= 80 {
-        32
-    } else if left_width >= 52 {
-        24
-    } else {
-        14
-    };
-    let mut spans = vec![
-        Span::styled(
-            "ZEX",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ", Style::default()),
-        Span::styled(app.status.symbol(), Style::default().fg(app.status.color())),
-        Span::styled(
-            format!(" {}", app.status.label()),
-            Style::default().fg(app.status.color()),
-        ),
-        Span::styled("  ·  ", Style::default().fg(MUTED)),
-        Span::styled(
-            single_line(&model_label, model_limit),
-            Style::default().fg(TEXT_STRONG),
-        ),
-    ];
-    if left_width >= 42 {
-        spans.extend([
-            Span::styled("  ·  think ", Style::default().fg(DIM)),
-            Span::styled(thinking, Style::default().fg(TEXT)),
-        ]);
-    }
-    if left_width >= 62 && app.session_id.is_some() {
-        spans.extend([
-            Span::styled("  ·  session ", Style::default().fg(DIM)),
-            Span::styled(session, Style::default().fg(TEXT)),
-        ]);
-    }
-    if left_width >= 76 {
-        spans.extend([
-            Span::styled("  ·  ", Style::default().fg(MUTED)),
-            Span::styled(location, Style::default().fg(DIM)),
-        ]);
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), left);
-    if right.width > 0 {
-        frame.render_widget(
-            Paragraph::new(if content.width >= 18 {
-                Line::from(vec![
-                    Span::styled("ctx ", Style::default().fg(DIM)),
-                    Span::styled(
-                        format!("{context_percent}%"),
-                        Style::default().fg(TEXT_STRONG),
-                    ),
-                ])
-            } else {
-                Line::from(Span::styled(
-                    format!("{context_percent}%"),
-                    Style::default().fg(TEXT_STRONG),
-                ))
-            })
-            .alignment(Alignment::Right),
-            right,
-        );
-    } else if content.width > 0 {
-        frame.render_widget(
-            Paragraph::new(right_text)
-                .style(Style::default().fg(TEXT_STRONG))
-                .alignment(Alignment::Right),
-            content,
-        );
-    }
 }
 
 fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &App) {
@@ -2870,40 +2844,31 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &App) {
         return;
     }
 
-    let viewport = content_area(viewport);
-    let width = viewport.width.clamp(1, 88);
-    let max_visible = viewport.height.saturating_sub(4).max(1) as usize;
-    let visible_count = picker.sessions.len().clamp(1, max_visible);
-    let height = viewport
-        .height
-        .min((visible_count as u16).saturating_mul(2).saturating_add(4))
-        .max(1);
-    let area = Rect::new(
-        viewport.x + viewport.width.saturating_sub(width) / 2,
-        viewport.y + viewport.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
-    let inner_width = area.width.saturating_sub(4) as usize;
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            "Resume session",
-            Style::default()
-                .fg(TEXT_STRONG)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if picker.sessions.is_empty() {
-                "  Esc close"
-            } else {
-                "  ↑↓ select · Enter resume · Esc cancel"
-            },
-            Style::default().fg(DIM),
-        ),
-    ])];
+    let area = horizontal_inset(viewport, HORIZONTAL_GUTTER);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let max_visible = area.height.saturating_sub(3).max(1) as usize / 2;
+    let visible_count = picker.sessions.len().clamp(1, max_visible.max(1));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "Session index",
+                Style::default()
+                    .fg(TEXT_STRONG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if picker.sessions.is_empty() {
+                    "  Esc close"
+                } else {
+                    "  ↑↓ select · Enter resume · Esc cancel"
+                },
+                Style::default().fg(DIM),
+            ),
+        ]),
+        Line::default(),
+    ];
 
     if picker.sessions.is_empty() {
-        lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "No saved sessions",
             Style::default().fg(DIM),
@@ -2920,10 +2885,14 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &App) {
             .take(visible_count)
         {
             let selected = index == picker.selected;
-            let background = if selected { ACCENT } else { SURFACE_RAISED };
-            let foreground = if selected { Color::Black } else { TEXT_STRONG };
-            let secondary = if selected { Color::Black } else { DIM };
-            let marker = if selected { "›" } else { " " };
+            let background = if selected {
+                SURFACE_RAISED
+            } else {
+                Color::Reset
+            };
+            let foreground = TEXT_STRONG;
+            let secondary = if selected { TEXT } else { DIM };
+            let marker = if selected { "▌" } else { " " };
             let timestamp = format_session_time(session.updated_at);
             let metadata = format!(
                 "{} · {} message{}",
@@ -2966,20 +2935,7 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &App) {
         }
     }
 
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(ACCENT))
-                    .style(Style::default().bg(SURFACE_RAISED))
-                    .padding(ratatui::widgets::Padding::horizontal(1)),
-            )
-            .style(Style::default().bg(SURFACE_RAISED))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2989,7 +2945,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
-    let area = horizontal_inset(content_area(area), HORIZONTAL_GUTTER);
+    let area = horizontal_inset(area, HORIZONTAL_GUTTER);
     let active = app.providers.active_model.as_ref();
     let current = active
         .and_then(|target| app.providers.model(target))
@@ -3040,14 +2996,20 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 Color::Reset
             };
-            let marker = if selected { "›" } else { " " };
+            let marker = if selected { "▌" } else { " " };
             let current_marker = if current { "●" } else { " " };
             let thinking = choice.thinking.summary();
-            lines.push(
+            let row = if area.width >= 76 {
                 Line::from(vec![
                     Span::styled(
                         format!("{marker} {current_marker} "),
-                        Style::default().fg(if current { SUCCESS } else { ACCENT }),
+                        Style::default().fg(if selected {
+                            ACCENT
+                        } else if current {
+                            SUCCESS
+                        } else {
+                            MUTED
+                        }),
                     ),
                     Span::styled(
                         pad_display(&single_line(&choice.model_name, 30), 32),
@@ -3059,8 +3021,26 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     ),
                     Span::styled(format!("think {thinking}"), Style::default().fg(DIM)),
                 ])
-                .style(Style::default().bg(background)),
-            );
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{marker} {current_marker} "),
+                        Style::default().fg(if selected {
+                            ACCENT
+                        } else if current {
+                            SUCCESS
+                        } else {
+                            MUTED
+                        }),
+                    ),
+                    Span::styled(
+                        single_line(&choice.model_name, area.width.saturating_sub(18) as usize),
+                        Style::default().fg(TEXT_STRONG),
+                    ),
+                    Span::styled(format!(" · think {thinking}"), Style::default().fg(DIM)),
+                ])
+            };
+            lines.push(row.style(Style::default().bg(background)));
         }
     }
 
@@ -3116,7 +3096,7 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
             provider_lines.push(
                 Line::from(vec![
                     Span::styled(
-                        if selected { "› " } else { "  " },
+                        if selected { "▌ " } else { "  " },
                         Style::default().fg(ACCENT),
                     ),
                     Span::styled(
@@ -3197,7 +3177,7 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(
             Line::from(vec![
                 Span::styled(
-                    format!("{} {:<10}", if selected { "›" } else { " " }, label),
+                    format!("{} {:<10}", if selected { "▌" } else { " " }, label),
                     Style::default().fg(if selected { ACCENT } else { DIM }),
                 ),
                 Span::styled(single_line(&value, 70), Style::default().fg(TEXT_STRONG)),
@@ -3241,7 +3221,7 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
             lines.push(
                 Line::from(vec![
                     Span::styled(
-                        if selected { "› " } else { "  " },
+                        if selected { "▌ " } else { "  " },
                         Style::default().fg(ACCENT),
                     ),
                     Span::styled(
@@ -3312,65 +3292,103 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
 struct UiRegions {
     transcript: Rect,
     completion: Rect,
-    status: Rect,
+    footer: Rect,
     keymap: Rect,
-    input: Rect,
 }
 
 fn ui_regions(area: Rect, app: &App) -> UiRegions {
-    let desired_input = if app.model_picker_open() || app.provider_editor_open() {
-        0
+    let keymap_height = u16::from(area.height >= 3);
+    let footer_height = if area.height >= 6 {
+        FOOTER_HEIGHT
     } else {
-        input_height(&app.input, area.width)
+        area.height.saturating_sub(keymap_height).min(1)
     };
-    let input_height = desired_input
-        .min(area.height.saturating_sub(2).max(1))
-        .min(area.height);
-    let status_height = u16::from(area.height > input_height);
-    let keymap_height = u16::from(area.height > input_height + status_height);
-    let fixed_height = input_height + status_height + keymap_height;
+    let fixed_height = footer_height + keymap_height;
     let remaining = area.height.saturating_sub(fixed_height);
     let transcript_reserve = MIN_TRANSCRIPT_HEIGHT.min(remaining);
+    let completion_width =
+        footer_regions(Rect::new(area.x, area.y, area.width, footer_height.max(1)))
+            .input
+            .width;
     let completion_height =
-        completion_height(app).min(remaining.saturating_sub(transcript_reserve));
+        completion_height(app, completion_width).min(remaining.saturating_sub(transcript_reserve));
     let transcript_height = remaining.saturating_sub(completion_height);
 
-    let transcript = Rect::new(area.x, area.y, area.width, transcript_height);
-    let completion = Rect::new(area.x, transcript.bottom(), area.width, completion_height);
-    let status = Rect::new(area.x, completion.bottom(), area.width, status_height);
-    let keymap = Rect::new(area.x, status.bottom(), area.width, keymap_height);
-    let input = Rect::new(area.x, keymap.bottom(), area.width, input_height);
-
-    debug_assert_eq!(input.bottom(), area.bottom());
-    debug_assert!(
-        transcript.height + completion.height + status.height + keymap.height + input.height
-            == area.height
-    );
+    let [transcript, completion, footer, keymap] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(transcript_height),
+            Constraint::Length(completion_height),
+            Constraint::Length(footer_height),
+            Constraint::Length(keymap_height),
+        ])
+        .areas(area);
 
     UiRegions {
         transcript,
         completion,
-        status,
+        footer,
         keymap,
-        input,
     }
 }
 
-fn render_footer_rails(frame: &mut Frame<'_>, area: Rect, color: Color) -> Rect {
-    if area.width < 2 || area.height == 0 {
-        return area;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FooterRegions {
+    left: Rect,
+    input: Rect,
+    right: Rect,
+}
+
+fn footer_regions(area: Rect) -> FooterRegions {
+    let (left_width, right_width) = match area.width {
+        110.. => (24, 38),
+        84..=109 => (22, 32),
+        60..=83 => (18, 24),
+        30..=59 => (9, 12),
+        _ => (0, 0),
+    };
+    let [left, input, right] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(left_width),
+            Constraint::Min(1),
+            Constraint::Length(right_width),
+        ])
+        .areas(area);
+    FooterRegions { left, input, right }
+}
+
+fn align_with_footer_input(area: Rect, footer: Rect) -> Rect {
+    let input = footer_regions(footer).input;
+    Rect::new(input.x, area.y, input.width, area.height)
+}
+
+fn render_footer_separator(frame: &mut Frame<'_>, x: u16, area: Rect) {
+    if x == area.x || x >= area.right() || area.height == 0 {
+        return;
     }
     frame.render_widget(
-        Block::default()
-            .borders(Borders::LEFT | Borders::RIGHT)
-            .border_type(BorderType::Thick)
-            .border_style(Style::default().fg(color)),
-        area,
+        Paragraph::new(
+            std::iter::repeat_n(
+                Line::from(Span::styled("│", Style::default().fg(MUTED))),
+                area.height as usize,
+            )
+            .collect::<Vec<_>>(),
+        ),
+        Rect::new(x, area.y, 1, area.height),
     );
+}
+
+fn footer_segment_area(area: Rect, inset_left: bool, inset_right: bool) -> Rect {
+    if area.is_empty() {
+        return area;
+    }
+    let left = u16::from(inset_left && area.width > 1);
+    let right = u16::from(inset_right && area.width > left + 1);
     Rect::new(
-        area.x.saturating_add(1),
+        area.x.saturating_add(left),
         area.y,
-        area.width.saturating_sub(2),
+        area.width.saturating_sub(left + right),
         area.height,
     )
 }
@@ -3417,8 +3435,19 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         app.scroll_top = app.scroll_top.min(app.max_scroll);
     }
 
+    let render_area = if line_count < area.height as usize {
+        let content_height = line_count.min(area.height as usize) as u16;
+        let y = area
+            .bottom()
+            .saturating_sub(TIMELINE_BOTTOM_GAP)
+            .saturating_sub(content_height)
+            .max(area.y);
+        Rect::new(area.x, y, area.width, content_height)
+    } else {
+        area
+    };
     let paragraph = paragraph.scroll((app.scroll_top.min(u16::MAX as usize) as u16, 0));
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, render_area);
 
     if !app.follow_output && app.max_scroll > 0 {
         let indicator = format!(
@@ -3442,19 +3471,23 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
     if area.is_empty() {
         return;
     }
-    let height = area.height.min(2);
-    let y = area.y + area.height.saturating_sub(height) / 2;
+    let height = area.height.min(3);
+    let y = area.y + area.height.saturating_sub(height) / 3;
     let empty_area = Rect::new(area.x, y, area.width, height);
     let mut lines = vec![Line::from(Span::styled(
-        "Zex",
-        Style::default()
-            .fg(TEXT_STRONG)
-            .add_modifier(Modifier::BOLD),
+        "ZEX",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     ))];
     if height > 1 {
         lines.push(Line::from(Span::styled(
-            "Ask anything, or type / for commands",
+            "Describe a task. Zex will keep the work in one timeline.",
             Style::default().fg(DIM),
+        )));
+    }
+    if height > 2 {
+        lines.push(Line::from(Span::styled(
+            "/ commands · /model switch · /resume continue",
+            Style::default().fg(MUTED),
         )));
     }
     frame.render_widget(
@@ -3465,12 +3498,33 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn completion_height(app: &App) -> u16 {
-    if app.model_picker_open() || app.provider_editor_open() {
+fn completion_height(app: &App, width: u16) -> u16 {
+    if app.page_open() {
         return 0;
     }
     if app.completion_open() {
-        app.completion_matches().len() as u16 + 2
+        let matches = app.completion_matches();
+        let usage_width = matches
+            .iter()
+            .map(|command| UnicodeWidthStr::width(command.usage))
+            .max()
+            .unwrap_or(0);
+        let inner_width = width.saturating_sub(4).max(1) as usize;
+        matches
+            .iter()
+            .map(|command| {
+                let wide = inner_width.saturating_sub(2) >= usage_width + 2 + 18;
+                let line_width = if wide {
+                    2 + usage_width + 2 + UnicodeWidthStr::width(command.description)
+                } else {
+                    2 + UnicodeWidthStr::width(command.usage)
+                        + 3
+                        + UnicodeWidthStr::width(command.description)
+                };
+                line_width.div_ceil(inner_width).max(1) as u16
+            })
+            .sum::<u16>()
+            .saturating_add(2)
     } else {
         0
     }
@@ -3480,12 +3534,8 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.height == 0 {
         return;
     }
-    let area = content_area(area);
-    if area.is_empty() {
-        return;
-    }
     let matches = app.completion_matches();
-    let inner_width = area.width.saturating_sub(4) as usize;
+    let inner_width = area.width.saturating_sub(2) as usize;
     let usage_width = matches
         .iter()
         .map(|command| UnicodeWidthStr::width(command.usage))
@@ -3501,19 +3551,20 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
             let available = inner_width.saturating_sub(2);
             let wide = available >= usage_width + 2 + 18;
             let command_style = Style::default()
-                .fg(if selected { Color::Black } else { TEXT })
-                .bg(if selected { ACCENT } else { SURFACE_RAISED })
+                .fg(if selected { TEXT_STRONG } else { TEXT })
+                .bg(if selected { SURFACE_RAISED } else { SURFACE })
                 .add_modifier(if selected {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
                 });
             let marker_style = Style::default()
-                .fg(if selected { Color::Black } else { MUTED })
-                .bg(if selected { ACCENT } else { SURFACE_RAISED });
+                .fg(if selected { ACCENT } else { MUTED })
+                .bg(if selected { SURFACE_RAISED } else { SURFACE });
             let description_style = Style::default()
-                .fg(if selected { Color::Black } else { DIM })
-                .bg(if selected { ACCENT } else { SURFACE_RAISED });
+                .fg(if selected { TEXT } else { DIM })
+                .bg(if selected { SURFACE_RAISED } else { SURFACE });
+            let row_style = Style::default().bg(if selected { SURFACE_RAISED } else { SURFACE });
             if wide {
                 Line::from(vec![
                     Span::styled(format!("{marker} "), marker_style),
@@ -3521,11 +3572,7 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     Span::raw("  "),
                     Span::styled(command.description, description_style),
                 ])
-                .style(if selected {
-                    Style::default().bg(ACCENT)
-                } else {
-                    Style::default().bg(SURFACE_RAISED)
-                })
+                .style(row_style)
             } else {
                 Line::from(vec![
                     Span::styled(format!("{marker} "), marker_style),
@@ -3533,11 +3580,7 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     Span::styled(" · ", description_style),
                     Span::styled(command.description, description_style),
                 ])
-                .style(if selected {
-                    Style::default().bg(ACCENT)
-                } else {
-                    Style::default().bg(SURFACE_RAISED)
-                })
+                .style(row_style)
             }
         })
         .collect::<Vec<_>>();
@@ -3545,11 +3588,11 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(ACCENT))
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(MUTED))
                     .padding(ratatui::widgets::Padding::horizontal(1)),
             )
-            .style(Style::default().bg(SURFACE_RAISED))
+            .style(Style::default().bg(SURFACE))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -3560,18 +3603,27 @@ fn transcript_text(app: &App) -> Text<'static> {
     for (index, entry) in app.transcript.iter().enumerate() {
         match entry {
             TranscriptEntry::Message { role, content } => {
-                if *role == MessageRole::User {
-                    lines.push(Line::from(Span::styled(
-                        "›",
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    )));
-                }
                 append_markdown_lines(&mut lines, content, *role);
                 lines.push(Line::default());
             }
             TranscriptEntry::Thinking(thinking) => {
                 if app.show_thinking {
-                    append_thinking_lines(&mut lines, thinking, app.selected_card == Some(index));
+                    let status = if app.busy
+                        && app.status == Status::Thinking
+                        && index + 1 == app.transcript.len()
+                    {
+                        ThinkingStatus::Active
+                    } else {
+                        ThinkingStatus::Done
+                    };
+                    let level = app.thinking_level.unwrap_or(app.thinking_preference);
+                    append_thinking_lines(
+                        &mut lines,
+                        thinking,
+                        status,
+                        level,
+                        app.selected_card == Some(index),
+                    );
                 }
             }
             TranscriptEntry::Tool(tool) => {
@@ -3619,38 +3671,15 @@ fn transcript_text(app: &App) -> Text<'static> {
     Text::from(lines)
 }
 
-fn render_help_overlay(frame: &mut Frame<'_>, viewport: Rect, app: &App) {
-    if !app.help_open || viewport.is_empty() {
+fn render_help_page(frame: &mut Frame<'_>, viewport: Rect) {
+    if viewport.is_empty() {
         return;
     }
 
-    let viewport = content_area(viewport);
-    let width = viewport.width.clamp(1, 76);
-    let desired_height = command_specs().len() as u16 + 4;
-    let height = viewport.height.min(desired_height).max(1);
-    let area = Rect::new(
-        viewport.x,
-        viewport.bottom().saturating_sub(height),
-        width,
-        height,
-    );
-    let inner_width = area.width.saturating_sub(4) as usize;
+    let area = horizontal_inset(viewport, HORIZONTAL_GUTTER);
+    let inner_width = area.width as usize;
     let lines = help_lines(inner_width);
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(ACCENT))
-                    .style(Style::default().bg(SURFACE_RAISED))
-                    .padding(ratatui::widgets::Padding::horizontal(1)),
-            )
-            .style(Style::default().bg(SURFACE_RAISED))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn help_lines(width: usize) -> Vec<Line<'static>> {
@@ -3662,7 +3691,7 @@ fn help_lines(width: usize) -> Vec<Line<'static>> {
     let wide = width >= usage_width + 2 + 24;
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            "Commands",
+            "Command index",
             Style::default()
                 .fg(TEXT_STRONG)
                 .add_modifier(Modifier::BOLD),
@@ -3726,13 +3755,14 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
         MessageRole::User => TEXT_STRONG,
         MessageRole::Assistant => TEXT,
     };
-    let content_prefix = match role {
-        MessageRole::User => "  ",
-        MessageRole::Assistant => "",
-    };
     let mut in_code_block = false;
 
-    for source_line in content.split('\n') {
+    for (index, source_line) in content.split('\n').enumerate() {
+        let content_prefix = match (role, index) {
+            (MessageRole::User, 0) => "› ",
+            (MessageRole::User, _) => "  ",
+            (MessageRole::Assistant, _) => "│ ",
+        };
         let trimmed = source_line.trim_start();
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
@@ -3823,170 +3853,179 @@ fn append_markdown_lines(lines: &mut Vec<Line<'static>>, content: &str, role: Me
     }
 }
 
-fn append_thinking_lines(lines: &mut Vec<Line<'static>>, thinking: &ThinkingEntry, selected: bool) {
-    let marker = if selected { "›" } else { " " };
+fn append_thinking_lines(
+    lines: &mut Vec<Line<'static>>,
+    thinking: &ThinkingEntry,
+    status: ThinkingStatus,
+    level: ThinkingLevel,
+    selected: bool,
+) {
     let fold = if thinking.expanded { "▾" } else { "▸" };
     let rail_color = if selected {
         ACCENT
     } else {
         Color::Rgb(55, 65, 74)
     };
-    let card_style = Style::default().bg(SURFACE);
-    lines.push(
-        Line::from(vec![
+    let header_style = if selected {
+        Style::default().bg(SURFACE_RAISED)
+    } else {
+        Style::default()
+    };
+    let (state, state_color) = match status {
+        ThinkingStatus::Active => ("active", ACCENT),
+        ThinkingStatus::Done => ("done", DIM),
+    };
+    let mut header = vec![
+        Span::styled(
+            format!("{} {fold} ", if selected { "›" } else { " " }),
+            Style::default().fg(rail_color),
+        ),
+        Span::styled(
+            "think",
+            Style::default()
+                .fg(TEXT_STRONG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", Style::default().fg(MUTED)),
+        Span::styled(level.to_string(), Style::default().fg(DIM)),
+        Span::styled(" · ", Style::default().fg(MUTED)),
+        Span::styled(state, Style::default().fg(state_color)),
+    ];
+    if !thinking.expanded {
+        header.extend([
+            Span::styled("   ", Style::default().fg(MUTED)),
             Span::styled(
-                format!("{marker} {fold} "),
-                Style::default().fg(rail_color).bg(SURFACE),
+                single_line(&thinking.content, 120),
+                Style::default().fg(DIM),
             ),
-            Span::styled(
-                "Thinking",
-                Style::default()
-                    .fg(TEXT_STRONG)
-                    .bg(SURFACE)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])
-        .style(card_style),
-    );
+        ]);
+    }
+    lines.push(Line::from(header).style(header_style));
 
     if thinking.expanded {
         for line in thinking.content.split('\n') {
-            lines.push(
-                Line::from(vec![
-                    Span::styled("  │  ", Style::default().fg(rail_color).bg(SURFACE)),
-                    Span::styled(line.to_owned(), Style::default().fg(TEXT).bg(SURFACE)),
-                ])
-                .style(card_style),
-            );
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(rail_color)),
+                Span::styled(line.to_owned(), Style::default().fg(DIM)),
+            ]));
         }
-        lines.push(
-            Line::from(Span::styled(
-                "  └  ",
-                Style::default().fg(rail_color).bg(SURFACE),
-            ))
-            .style(card_style),
-        );
-    } else {
-        lines.push(
-            Line::from(vec![
-                Span::styled("  │  ", Style::default().fg(rail_color).bg(SURFACE)),
-                Span::styled(
-                    single_line(&thinking.content, 120),
-                    Style::default().fg(DIM).bg(SURFACE),
+        lines.push(Line::from(vec![
+            Span::styled("  └ ", Style::default().fg(rail_color)),
+            Span::styled(
+                format!(
+                    "{} lines · Ctrl+O collapse",
+                    thinking.content.lines().count().max(1)
                 ),
-            ])
-            .style(card_style),
-        );
+                Style::default().fg(MUTED),
+            ),
+        ]));
     }
     lines.push(Line::default());
 }
 
 fn append_tool_lines(lines: &mut Vec<Line<'static>>, tool: &ToolEntry, selected: bool) {
-    let marker = if selected { "›" } else { " " };
     let fold = if tool.expanded { "▾" } else { "▸" };
-    let title = tool_title(tool);
+    let subject = tool_subject(tool);
     let elapsed = tool_elapsed(tool);
-    let card_style = Style::default().bg(SURFACE);
     let rail_color = if selected {
         ACCENT
     } else {
         Color::Rgb(55, 65, 74)
     };
-    lines.push(
-        Line::from(vec![
-            Span::styled(
-                format!("{marker} {fold} "),
-                Style::default().fg(rail_color).bg(SURFACE),
-            ),
-            Span::styled(title, Style::default().fg(TEXT_STRONG).bg(SURFACE)),
-            Span::styled("  ", card_style),
-            Span::styled(
-                format!("{} {}", tool.status.symbol(), tool.status.label()),
-                Style::default().fg(tool.status.color()).bg(SURFACE),
-            ),
-            Span::styled(
-                format!("  {}", format_duration(elapsed)),
-                Style::default().fg(DIM).bg(SURFACE),
-            ),
-        ])
-        .style(card_style),
-    );
-
-    if !tool.expanded {
-        lines.push(
-            Line::from(vec![
-                Span::styled("  │  ", Style::default().fg(rail_color).bg(SURFACE)),
-                Span::styled(tool_summary(tool), Style::default().fg(DIM).bg(SURFACE)),
-            ])
-            .style(card_style),
-        );
+    let header_style = if selected {
+        Style::default().bg(SURFACE_RAISED)
+    } else {
+        Style::default()
+    };
+    let mut header = vec![
+        Span::styled(
+            format!("{} {fold} ", if selected { "›" } else { " " }),
+            Style::default().fg(rail_color),
+        ),
+        Span::styled(
+            tool.name.clone(),
+            Style::default()
+                .fg(TEXT_STRONG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", Style::default().fg(MUTED)),
+        Span::styled(subject, Style::default().fg(TEXT)),
+        Span::styled(" · ", Style::default().fg(MUTED)),
+        Span::styled(
+            tool_result(tool),
+            Style::default().fg(tool_result_color(tool)),
+        ),
+        Span::styled(" · ", Style::default().fg(MUTED)),
+        Span::styled(format_duration(elapsed), Style::default().fg(DIM)),
+    ];
+    if !tool.expanded
+        && let Some(summary) = tool_summary(tool)
+    {
+        header.extend([
+            Span::styled("   ", Style::default().fg(MUTED)),
+            Span::styled(summary, Style::default().fg(DIM)),
+        ]);
     }
+    lines.push(Line::from(header).style(header_style));
 
     if tool.expanded {
-        lines.push(
-            Line::from(vec![
-                Span::styled("  │  ", Style::default().fg(rail_color).bg(SURFACE)),
-                Span::styled("input", Style::default().fg(DIM).bg(SURFACE)),
-            ])
-            .style(card_style),
-        );
+        lines.push(Line::from(vec![
+            Span::styled("  │ ", Style::default().fg(rail_color)),
+            Span::styled("input", Style::default().fg(DIM)),
+        ]));
         for line in tool.arguments.split('\n') {
-            lines.push(
-                Line::from(vec![
-                    Span::styled("  │    ", Style::default().fg(rail_color).bg(SURFACE)),
-                    Span::styled(line.to_owned(), Style::default().fg(TEXT).bg(SURFACE)),
-                ])
-                .style(card_style),
-            );
+            lines.push(Line::from(vec![
+                Span::styled("  │   ", Style::default().fg(rail_color)),
+                Span::styled(line.to_owned(), Style::default().fg(TEXT)),
+            ]));
         }
-        lines.push(
-            Line::from(vec![
-                Span::styled("  │  ", Style::default().fg(rail_color).bg(SURFACE)),
-                Span::styled("output", Style::default().fg(DIM).bg(SURFACE)),
-            ])
-            .style(card_style),
-        );
+        lines.push(Line::from(vec![
+            Span::styled("  │ ", Style::default().fg(rail_color)),
+            Span::styled("output", Style::default().fg(DIM)),
+        ]));
         if tool.output.is_empty() {
-            lines.push(
-                Line::from(vec![
-                    Span::styled("  │    ", Style::default().fg(rail_color).bg(SURFACE)),
-                    Span::styled("waiting for result…", Style::default().fg(DIM).bg(SURFACE)),
-                ])
-                .style(card_style),
-            );
+            lines.push(Line::from(vec![
+                Span::styled("  │   ", Style::default().fg(rail_color).bg(SURFACE)),
+                Span::styled("waiting for result…", Style::default().fg(DIM).bg(SURFACE)),
+            ]));
         } else {
             for line in tool.output.split('\n') {
-                lines.push(
-                    Line::from(vec![
-                        Span::styled("  │    ", Style::default().fg(rail_color).bg(SURFACE)),
-                        Span::styled(line.to_owned(), Style::default().fg(TEXT).bg(SURFACE)),
-                    ])
-                    .style(card_style),
-                );
+                lines.push(Line::from(vec![
+                    Span::styled("  │   ", Style::default().fg(rail_color).bg(SURFACE)),
+                    Span::styled(line.to_owned(), Style::default().fg(TEXT).bg(SURFACE)),
+                ]));
             }
         }
-        lines.push(
-            Line::from(vec![
-                Span::styled("  └  ", Style::default().fg(rail_color).bg(SURFACE)),
-                Span::styled(
-                    format!("timeout {}", format_duration(tool.timeout)),
-                    Style::default().fg(DIM).bg(SURFACE),
+        lines.push(Line::from(vec![
+            Span::styled("  └ ", Style::default().fg(rail_color)),
+            Span::styled(
+                format!(
+                    "{} lines · timeout {} · Ctrl+O collapse",
+                    tool.output.lines().count().max(1),
+                    format_duration(tool.timeout)
                 ),
-            ])
-            .style(card_style),
-        );
+                Style::default().fg(DIM),
+            ),
+        ]));
     }
     lines.push(Line::default());
 }
 
-fn tool_title(tool: &ToolEntry) -> String {
-    if tool.name == "bash"
-        && let Ok(arguments) = serde_json::from_str::<Value>(&tool.arguments)
-        && let Some(command) = arguments.get("command").and_then(Value::as_str)
-    {
-        return format!("$ {}", single_line(command, 100));
-    }
-    tool.name.clone()
+fn tool_subject(tool: &ToolEntry) -> String {
+    let Ok(arguments) = serde_json::from_str::<Value>(&tool.arguments) else {
+        return single_line(&tool.arguments, 100);
+    };
+    let key = match tool.name.as_str() {
+        "bash" => "command",
+        "read" | "write" | "edit" => "path",
+        "grep" | "glob" => "pattern",
+        _ => "",
+    };
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|value| single_line(value, 100))
+        .unwrap_or_else(|| single_line(&tool.arguments, 100))
 }
 
 fn tool_elapsed(tool: &ToolEntry) -> Duration {
@@ -4003,37 +4042,70 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-fn tool_summary(tool: &ToolEntry) -> String {
+fn tool_result(tool: &ToolEntry) -> String {
     match tool.status {
-        ToolStatus::Running => return "Working…".to_owned(),
-        ToolStatus::Cancelled => return "Interrupted".to_owned(),
-        ToolStatus::Failed => {}
-        ToolStatus::Done if tool.output.trim().is_empty() => return "Completed".to_owned(),
-        ToolStatus::Done => {}
+        ToolStatus::Running => return "running".to_owned(),
+        ToolStatus::Cancelled => return "stopped".to_owned(),
+        ToolStatus::Failed if tool.name != "bash" => return "failed".to_owned(),
+        ToolStatus::Done | ToolStatus::Failed => {}
     }
 
     if tool.name == "bash" {
-        if let Some(summary) = bash_output_summary(&tool.output) {
-            return summary;
+        if let Some(code) = bash_exit_code(&tool.output) {
+            return format!("exit {code}");
         }
-        return if tool.status == ToolStatus::Failed {
-            "Command failed".to_owned()
-        } else {
-            "Completed".to_owned()
-        };
+        return tool.status.label().to_owned();
     }
-    let source = if tool.output.trim().is_empty() {
-        &tool.arguments
-    } else {
-        &tool.output
-    };
-    single_line(
-        source
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or(source),
-        120,
-    )
+    match tool.name.as_str() {
+        "read" => format!("{} lines", tool.output.lines().count()),
+        "grep" if tool.output.starts_with("No matches found.") => "0 matches".to_owned(),
+        "grep" => trailing_count_summary(&tool.output, "matching line(s)", "matches")
+            .unwrap_or_else(|| format!("{} matches", content_line_count(&tool.output))),
+        "glob" if tool.output.starts_with("No matching paths found.") => "0 paths".to_owned(),
+        "glob" => trailing_count_summary(&tool.output, "matching path(s)", "paths")
+            .unwrap_or_else(|| format!("{} paths", content_line_count(&tool.output))),
+        _ => "ok".to_owned(),
+    }
+}
+
+fn tool_result_color(tool: &ToolEntry) -> Color {
+    if tool.name == "bash" && bash_exit_code(&tool.output).is_some_and(|code| code != "0") {
+        return ERROR;
+    }
+    tool.status.color()
+}
+
+fn tool_summary(tool: &ToolEntry) -> Option<String> {
+    if matches!(tool.status, ToolStatus::Running | ToolStatus::Cancelled)
+        || tool.output.trim().is_empty()
+    {
+        return None;
+    }
+    if tool.name == "bash" {
+        return bash_output_summary(&tool.output);
+    }
+    tool.output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| single_line(line, 96))
+        .filter(|summary| summary != &tool_result(tool))
+}
+
+fn bash_exit_code(output: &str) -> Option<&str> {
+    output.strip_prefix("exit_code: ")?.lines().next()
+}
+
+fn content_line_count(output: &str) -> usize {
+    output
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .count()
+        .max(1)
+}
+
+fn trailing_count_summary(output: &str, marker: &str, label: &str) -> Option<String> {
+    let line = output.lines().rev().find(|line| line.contains(marker))?;
+    Some(format!("{} {label}", line.split_whitespace().next()?))
 }
 
 fn bash_output_summary(output: &str) -> Option<String> {
@@ -4048,37 +4120,64 @@ fn bash_output_summary(output: &str) -> Option<String> {
     Some(single_line(summary, 120))
 }
 
-fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_footer_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
-    let footer = content_area(area);
-    let rail_color = if app.busy {
-        ACCENT
-    } else {
-        status_rail_color(app.status)
-    };
-    let input_area = horizontal_inset(render_footer_rails(frame, footer, rail_color), 1);
+    let input_area = footer_segment_area(area, true, true);
     if input_area.is_empty() {
+        return;
+    }
+
+    if app.page_open() {
+        let label = if app.model_picker_open() {
+            "model index"
+        } else if app.provider_editor_open() {
+            "provider config"
+        } else if app.session_picker_open() {
+            "session index"
+        } else {
+            "command index"
+        };
+        let y = area.y + area.height.saturating_sub(1) / 2;
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("ZEX / ", Style::default().fg(ACCENT)),
+                Span::styled(label, Style::default().fg(TEXT)),
+            ]))
+            .alignment(Alignment::Center),
+            Rect::new(input_area.x, y, input_area.width, 1),
+        );
         return;
     }
 
     if app.busy {
         let busy_text = match app.status {
-            Status::Thinking => "Agent is thinking",
-            Status::RunningTool => "Agent is working",
-            Status::Cancelling => "Stopping agent",
-            Status::Error => "Agent stopped with an error",
-            Status::Idle => "Agent is working",
+            Status::Thinking => "processing turn".to_owned(),
+            Status::RunningTool => app
+                .transcript
+                .iter()
+                .rev()
+                .find_map(|entry| {
+                    let TranscriptEntry::Tool(tool) = entry else {
+                        return None;
+                    };
+                    (tool.status == ToolStatus::Running)
+                        .then(|| format!("{} · {}", tool.name, tool_subject(tool)))
+                })
+                .unwrap_or_else(|| "running tool".to_owned()),
+            Status::Cancelling => "stopping".to_owned(),
+            Status::Error => "stopped with an error".to_owned(),
+            Status::Idle => "working".to_owned(),
         };
+        let y = area.y + area.height.saturating_sub(1) / 2;
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("◌ ", Style::default().fg(ACCENT)),
                 Span::styled(busy_text, Style::default().fg(TEXT)),
-                Span::styled(" · Ctrl+C to stop", Style::default().fg(DIM)),
             ]))
             .wrap(Wrap { trim: false }),
-            input_area,
+            Rect::new(input_area.x, y, input_area.width, 1),
         );
         return;
     }
@@ -4130,14 +4229,6 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ));
 }
 
-fn status_rail_color(status: Status) -> Color {
-    match status {
-        Status::Idle => Color::Rgb(76, 128, 145),
-        Status::Thinking | Status::RunningTool | Status::Cancelling => ACCENT,
-        Status::Error => ERROR,
-    }
-}
-
 fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
@@ -4162,9 +4253,11 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(Span::styled(text, Style::default().fg(DIM)))
     } else if app.session_picker_open() {
         Line::from(Span::styled(
-            "↑↓ select · Enter resume · Esc cancel",
+            "↑↓/jk select · Enter resume · Esc/q cancel",
             Style::default().fg(DIM),
         ))
+    } else if app.help_open {
+        Line::from(Span::styled("Esc/q return", Style::default().fg(DIM)))
     } else if let Some(toast) = &app.toast {
         Line::from(vec![
             Span::styled("● ", Style::default().fg(toast.color())),
@@ -4177,16 +4270,16 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ))
     } else if app.busy {
         let text = if area.width >= 72 {
-            "Ctrl+C stop · PgUp/PgDn scroll · Ctrl+O card details"
+            "Ctrl+C stop · PgUp/PgDn scroll · Ctrl+O cards"
         } else {
             "Ctrl+C stop · PgUp/PgDn scroll"
         };
         Line::from(Span::styled(text, Style::default().fg(DIM)))
     } else {
         let text = if area.width >= 92 {
-            "Enter send · Shift+Enter newline · ↑↓ history · / commands"
+            "Enter send · Shift+Enter newline · PgUp/PgDn scroll · Ctrl+O cards · / commands"
         } else {
-            "Enter send · ↑↓ history · / commands"
+            "Enter send · PgUp/PgDn scroll · / commands"
         };
         Line::from(Span::styled(text, Style::default().fg(DIM)))
     };
@@ -4235,15 +4328,6 @@ fn wrapped_position(input: &str, width: usize) -> (usize, usize) {
     (row, column)
 }
 
-fn input_height(input: &InputBuffer, terminal_width: u16) -> u16 {
-    let content_width = content_area(Rect::new(0, 0, terminal_width, 1)).width;
-    let inner_width = content_width.saturating_sub(6).max(1) as usize;
-    let rows = input_metrics(&input.content, input.cursor, inner_width)
-        .total_rows
-        .min(MAX_INPUT_ROWS as usize) as u16;
-    rows.max(1)
-}
-
 fn format_json(value: &str) -> String {
     serde_json::from_str::<Value>(value)
         .ok()
@@ -4263,6 +4347,22 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 fn single_line(value: &str, max_chars: usize) -> String {
     truncate_chars(&value.replace(['\r', '\n'], " "), max_chars).replace("\n… truncated", " …")
+}
+
+fn truncate_inline(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut chars = value.chars();
+    let content = chars
+        .by_ref()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{content}…")
+    } else {
+        value.to_owned()
+    }
 }
 
 fn short_session_id(id: &str) -> &str {
@@ -4533,10 +4633,9 @@ mod tests {
     fn assert_regions_fill(area: ratatui::layout::Rect, regions: UiRegions) {
         assert_eq!(regions.transcript.y, area.y);
         assert_eq!(regions.completion.y, regions.transcript.bottom());
-        assert_eq!(regions.status.y, regions.completion.bottom());
-        assert_eq!(regions.keymap.y, regions.status.bottom());
-        assert_eq!(regions.input.y, regions.keymap.bottom());
-        assert_eq!(regions.input.bottom(), area.bottom());
+        assert_eq!(regions.footer.y, regions.completion.bottom());
+        assert_eq!(regions.keymap.y, regions.footer.bottom());
+        assert_eq!(regions.keymap.bottom(), area.bottom());
     }
 
     #[test]
@@ -4604,7 +4703,7 @@ mod tests {
         let screen = format!("{}", terminal.backend());
         assert!(screen.contains("Models"));
         assert!(screen.contains("Current: OpenAI / GPT-5"));
-        assert!(!screen.contains("Ask anything, or type / for commands"));
+        assert!(!screen.contains("Describe a task. Zex will keep the work in one timeline."));
 
         app.dismiss_model_picker();
         app.open_provider_editor();
@@ -4614,7 +4713,7 @@ mod tests {
         assert!(screen.contains("Provider details"));
         assert!(screen.contains("API key"));
         assert!(!screen.contains("secret"));
-        assert!(!screen.contains("Ask anything, or type / for commands"));
+        assert!(!screen.contains("Describe a task. Zex will keep the work in one timeline."));
     }
 
     #[test]
@@ -4980,7 +5079,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_state_uses_native_background_and_full_width_footer_rails() {
+    fn empty_state_uses_native_background_and_unified_footer_separators() {
         let mut app = app();
         app.working_dir = PathBuf::from("D:/workspaces/zex");
         app.git_status = Some(super::GitStatus {
@@ -4996,22 +5095,24 @@ mod tests {
         let screen = format!("{}", terminal.backend());
         let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 100, 24), &app);
 
-        assert!(screen.contains("Zex"));
-        assert!(screen.contains("Ask anything, or type / for commands"));
+        assert!(screen.contains("Describe a task. Zex will keep the work in one timeline."));
+        assert!(screen.contains("/ commands · /model switch · /resume continue"));
         assert!(screen.contains("ZEX"));
         assert!(screen.contains("Enter send"));
         assert!(screen.contains("think high"));
         assert!(screen.contains("main@a1b2c3d"));
         assert!(screen.contains("ctx 25%"));
+        assert!(screen.contains("● idle"));
         assert_ne!(style_at(&terminal, 0, 0).bg, Some(SURFACE));
         assert_ne!(style_at(&terminal, 0, 0).bg, Some(SURFACE_RAISED));
+        let footer = super::footer_regions(regions.footer);
         assert_eq!(
-            style_at(&terminal, 1, regions.status.y).fg,
-            Some(super::status_rail_color(Status::Idle))
+            terminal.backend().buffer()[(footer.input.x, footer.input.y)].symbol(),
+            "│"
         );
         assert_eq!(
-            style_at(&terminal, 98, regions.input.y).fg,
-            Some(super::status_rail_color(Status::Idle))
+            terminal.backend().buffer()[(footer.right.x, footer.input.y)].symbol(),
+            "│"
         );
         assert_regions_fill(ratatui::layout::Rect::new(0, 0, 100, 24), regions);
     }
@@ -5023,11 +5124,15 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let input = ui_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app).input;
+        let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
+        let input = super::footer_regions(regions.footer).input;
+        let editor_x = input.x + 3;
 
-        terminal.backend_mut().assert_cursor_position((5, input.y));
+        terminal
+            .backend_mut()
+            .assert_cursor_position((editor_x, input.y));
         assert_eq!(
-            terminal.backend().buffer()[(5, input.y)].symbol(),
+            terminal.backend().buffer()[(editor_x, input.y)].symbol(),
             " ",
             "the IME preedit must not overlap application-rendered text"
         );
@@ -5042,10 +5147,14 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
-        let input = ui_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app).input;
+        let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
+        let input = super::footer_regions(regions.footer).input;
+        let editor_x = input.x + 3;
 
         assert!(screen.contains("› hello"));
-        terminal.backend_mut().assert_cursor_position((10, input.y));
+        terminal
+            .backend_mut()
+            .assert_cursor_position((editor_x + 5, input.y));
     }
 
     #[test]
@@ -5062,11 +5171,32 @@ mod tests {
             let area = ratatui::layout::Rect::new(0, 0, width, height);
             let regions = ui_regions(area, &app);
             assert_regions_fill(area, regions);
-            assert!(regions.input.height >= 1);
-            assert!(regions.input.height <= height);
+            assert!(regions.footer.height <= height);
             assert_ne!(style_at(&terminal, 0, 0).bg, Some(SURFACE));
             assert_ne!(style_at(&terminal, 0, 0).bg, Some(SURFACE_RAISED));
         }
+    }
+
+    #[test]
+    fn short_timeline_is_bottom_anchored_near_the_footer() {
+        let mut app = app();
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Bottom anchored answer".to_owned(),
+        });
+        let area = ratatui::layout::Rect::new(0, 0, 100, 24);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let regions = ui_regions(area, &app);
+        let screen = format!("{}", terminal.backend());
+        let answer_row = screen
+            .lines()
+            .position(|row| row.contains("Bottom anchored answer"))
+            .expect("answer should be visible") as u16;
+        assert_eq!(answer_row, regions.transcript.bottom().saturating_sub(3));
     }
 
     #[test]
@@ -5104,7 +5234,7 @@ mod tests {
         assert!(saw_surface);
         assert!(saw_native_background);
         assert!(format!("{}", terminal.backend()).contains("fn main() {}"));
-        assert!(format!("{}", terminal.backend()).contains("$ cargo check"));
+        assert!(format!("{}", terminal.backend()).contains("bash · cargo check"));
     }
 
     #[test]
@@ -5124,35 +5254,27 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
-        let status_rows = screen
-            .lines()
-            .filter(|row| row.contains("ZEX") || row.contains("ready"))
-            .collect::<Vec<_>>();
-
-        assert_eq!(status_rows.len(), 1);
-        assert!(status_rows[0].contains("ZEX"));
-        assert!(status_rows[0].contains("ready"));
-        assert!(status_rows[0].contains("50%"));
+        assert!(screen.contains("ZEX"));
+        assert!(screen.contains("50%"), "screen:\n{screen}");
         assert!(!screen.contains("feature/very-long-branch-name"));
     }
 
     #[test]
-    fn ready_thinking_and_running_states_are_clear_in_the_footer() {
+    fn idle_thinking_and_running_states_are_clear_in_the_footer() {
         let mut app = app();
         let backend = TestBackend::new(100, 18);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let ready = format!("{}", terminal.backend());
-        assert!(ready.contains("ready"));
-        assert!(ready.contains("Enter send"));
+        let idle = format!("{}", terminal.backend());
+        assert!(idle.contains("idle"));
+        assert!(idle.contains("Enter send"));
 
         app.start_turn();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let thinking = format!("{}", terminal.backend());
         assert!(thinking.contains("thinking"));
-        assert!(thinking.contains("Agent is thinking"));
-        assert!(thinking.contains("Ctrl+C to stop"));
+        assert!(thinking.contains("Ctrl+C stop"));
 
         app.apply_agent_event(AgentEvent::ToolStart {
             call_id: "call-running".to_owned(),
@@ -5162,13 +5284,13 @@ mod tests {
         });
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let running = format!("{}", terminal.backend());
-        assert!(running.contains("working"));
-        assert!(running.contains("Agent is working"));
-        assert_eq!(running.matches("Agent is working").count(), 1);
+        assert!(running.contains("running"));
+        assert!(running.contains("read · Cargo.toml"));
+        assert!(running.contains("Ctrl+C stop"));
     }
 
     #[test]
-    fn multiline_input_grows_upward_and_keeps_the_footer_rails() {
+    fn multiline_input_scrolls_inside_the_stable_footer() {
         let mut app = app();
         let area = ratatui::layout::Rect::new(0, 0, 72, 18);
         let single = ui_regions(area, &app);
@@ -5180,17 +5302,16 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
-        assert!(multiline.input.height > single.input.height);
-        assert_eq!(multiline.input.bottom(), single.input.bottom());
-        assert!(multiline.input.y < single.input.y);
-        for y in multiline.input.y..multiline.input.bottom() {
+        assert_eq!(multiline.footer, single.footer);
+        let footer = super::footer_regions(multiline.footer);
+        for y in footer.input.y..footer.input.bottom() {
             assert_eq!(
-                style_at(&terminal, 1, y).fg,
-                Some(super::status_rail_color(Status::Idle))
+                terminal.backend().buffer()[(footer.input.x, y)].symbol(),
+                "│"
             );
             assert_eq!(
-                style_at(&terminal, 70, y).fg,
-                Some(super::status_rail_color(Status::Idle))
+                terminal.backend().buffer()[(footer.right.x, y)].symbol(),
+                "│"
             );
         }
     }
@@ -5205,18 +5326,26 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 100, 28), &app);
-        let panel_x = 1;
-        let input_rail_x = 1;
+        let footer = super::footer_regions(regions.footer);
+        let panel_x = footer.input.x;
+        let input_separator_x = footer.input.x;
         assert_eq!(
             style_at(&terminal, panel_x, regions.completion.y).fg,
-            Some(ACCENT)
+            Some(super::MUTED)
         );
         assert_eq!(
-            style_at(&terminal, input_rail_x, regions.input.y).fg,
-            Some(super::status_rail_color(Status::Idle))
+            terminal.backend().buffer()[(input_separator_x, footer.input.y)].symbol(),
+            "│"
         );
         let selected_row = regions.completion.y + 1;
-        assert!((2..98).any(|x| style_at(&terminal, x, selected_row).bg == Some(ACCENT)));
+        assert!(
+            (regions.completion.x..regions.completion.right()).any(|x| style_at(
+                &terminal,
+                x,
+                selected_row
+            )
+            .fg == Some(ACCENT))
+        );
         assert!(
             terminal
                 .backend()
@@ -5332,7 +5461,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let folded = format!("{}", terminal.backend());
-        assert!(folded.contains("Thinking"));
+        assert!(folded.contains("think · medium · done"));
         assert!(folded.contains("Inspect constraints first."));
 
         app.select_tool(false);
@@ -5341,6 +5470,85 @@ mod tests {
             panic!("expected thinking entry");
         };
         assert!(thinking.expanded);
+    }
+
+    #[test]
+    fn folded_trace_and_tool_cards_use_one_summary_row_each() {
+        let mut app = app();
+        app.apply_agent_event(AgentEvent::ThinkingDelta {
+            delta: "Inspect constraints first.".to_owned(),
+        });
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-summary".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        app.apply_agent_event(AgentEvent::ToolEnd {
+            call_id: "call-summary".to_owned(),
+            name: "read".to_owned(),
+            output: "package zex".to_owned(),
+            is_error: false,
+            elapsed: Duration::from_millis(12),
+        });
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        let rows = screen.lines().collect::<Vec<_>>();
+
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Inspect constraints first."))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("read · Cargo.toml"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn tool_cards_use_zex_subject_result_and_duration_summaries() {
+        let mut app = app();
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-bash".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"git status"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        app.apply_agent_event(AgentEvent::ToolEnd {
+            call_id: "call-bash".to_owned(),
+            name: "bash".to_owned(),
+            output: "exit_code: 0\nstdout:\nclean\nstderr:\n".to_owned(),
+            is_error: false,
+            elapsed: Duration::from_millis(8),
+        });
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-grep".to_owned(),
+            name: "grep".to_owned(),
+            arguments: r#"{"pattern":"render_footer"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        app.apply_agent_event(AgentEvent::ToolEnd {
+            call_id: "call-grep".to_owned(),
+            name: "grep".to_owned(),
+            output: "src/tui.rs:1:render_footer\n\n11 matching line(s) in 1 file(s)".to_owned(),
+            is_error: false,
+            elapsed: Duration::from_millis(14),
+        });
+        let backend = TestBackend::new(110, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+
+        assert!(screen.contains("bash · git status · exit 0 · 8ms"));
+        assert!(screen.contains("grep · render_footer · 11 matches · 14ms"));
     }
 
     #[test]
@@ -5828,7 +6036,7 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let populated = format!("{}", terminal.backend());
-        assert!(populated.contains("Resume session"));
+        assert!(populated.contains("Session index"));
         assert!(populated.contains("cafebabe"));
         assert!(!populated.contains("20260812-121500-cafebabe"));
         assert!(populated.contains("1970-01-01"));
@@ -5853,7 +6061,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
 
-        assert!(screen.contains("session cafebabe"));
+        assert!(screen.contains("run cafebabe"));
     }
 
     #[test]
@@ -5890,6 +6098,33 @@ mod tests {
         )));
         assert_eq!(app.session_id.as_deref(), Some("20260812-121500-cafebabe"));
         assert_eq!(app.model, "saved-model");
+    }
+
+    #[test]
+    fn main_area_pages_restore_the_exact_timeline_scroll_position() {
+        let mut app = configured_app();
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Keep this timeline position.".to_owned(),
+        });
+        app.scroll_top = 7;
+        app.max_scroll = 30;
+        app.follow_output = false;
+
+        app.push_command_output(CommandOutput::Help);
+        app.cancel_ui_layer();
+        assert_eq!(app.scroll_top, 7);
+        assert!(!app.follow_output);
+
+        app.open_model_picker();
+        app.dismiss_model_picker();
+        assert_eq!(app.scroll_top, 7);
+        assert!(!app.follow_output);
+
+        app.open_session_picker(Vec::new());
+        app.dismiss_session_picker();
+        assert_eq!(app.scroll_top, 7);
+        assert!(!app.follow_output);
     }
 
     #[test]
@@ -5964,6 +6199,36 @@ mod tests {
         assert_eq!(app.input.content, "/");
         assert!(app.history_cursor.is_none());
         assert_eq!(app.completion.selected, 1);
+    }
+
+    #[test]
+    fn dismissed_completion_returns_arrows_to_input_history() {
+        let mut app = app();
+        app.remember_submission("older task");
+        app.input.insert_str("/");
+        app.refresh_completion();
+
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        );
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Up,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        );
+
+        assert_eq!(app.input.content, "older task");
+        assert!(app.history_cursor.is_some());
     }
 
     #[test]
@@ -6159,6 +6424,62 @@ mod tests {
     }
 
     #[test]
+    fn footer_updates_model_thinking_session_and_status_without_feed_rows() {
+        let mut app = configured_app();
+        app.session_id = Some("20260812-121500-cafebabe".to_owned());
+        app.thinking_level = Some(ThinkingLevel::Max);
+        app.status = Status::RunningTool;
+        let transcript_len = app.transcript.len();
+        let backend = TestBackend::new(120, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+
+        assert!(screen.contains("OpenAI / GPT-5"));
+        assert!(screen.contains("think max"));
+        assert!(screen.contains("run cafebabe"));
+        assert!(screen.contains("running"));
+        assert_eq!(app.transcript.len(), transcript_len);
+    }
+
+    #[test]
+    fn model_picker_navigation_does_not_mutate_the_timeline_scroll() {
+        let mut app = configured_app();
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Keep the selected viewport.".to_owned(),
+        });
+        app.scroll_top = 11;
+        app.max_scroll = 40;
+        app.follow_output = false;
+        app.open_model_picker();
+
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        );
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        );
+
+        assert_eq!(app.scroll_top, 11);
+        assert!(!app.follow_output);
+        assert!(!app.model_picker_open());
+    }
+
+    #[test]
     fn ctrl_o_expands_selected_tool() {
         let mut app = app();
         app.apply_agent_event(AgentEvent::ToolStart {
@@ -6215,13 +6536,12 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
 
-        assert!(screen.contains("$ git status"));
-        assert!(screen.contains("$ git rev-parse --short HEAD"));
-        assert!(screen.contains("done  20ms"));
+        assert!(screen.contains("bash · git status · ok · 20ms"));
+        assert!(screen.contains("bash · git rev-parse --short HEAD · ok · 21ms"));
         assert!(!screen.contains("timeout 30.0s"));
         assert!(!screen.contains("Ctrl+O"));
         assert!(screen.contains("/sessions"));
-        assert!(screen.contains("View saved sessions"));
+        assert!(screen.contains("List saved sessions"));
         assert!(screen.contains("think high"));
         assert!(screen.contains("› /se"));
 
@@ -6243,8 +6563,8 @@ mod tests {
             .rposition(|row| row.contains("› /se"))
             .expect("missing input row");
         assert!(completion_row < status_row);
-        assert!(status_row < keymap_row);
-        assert!(keymap_row < input_row);
+        assert!(completion_row < input_row);
+        assert!(input_row < keymap_row);
     }
 
     #[test]
@@ -6462,9 +6782,9 @@ mod tests {
         assert!(!screen.contains("ASSISTANT"));
         assert!(!screen.lines().any(|row| row.trim() == "you"));
         assert!(screen.contains("read"));
-        assert!(screen.contains("done"));
+        assert!(screen.contains("1 lines"));
         assert!(screen.contains("package zex"));
-        assert!(screen.contains("done  14ms"));
+        assert!(screen.contains("read · Cargo.toml · 1 lines · 14ms"));
         assert!(!screen.contains("Ctrl+O expand"));
         assert!(!screen.contains("timeout 60.0s"));
         assert!(!screen.contains("\"path\": \"Cargo.toml\""));
@@ -6504,8 +6824,7 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let folded = format!("{}", terminal.backend());
-        assert!(folded.contains("$ git status --short --branch"));
-        assert!(folded.contains("done  18ms"));
+        assert!(folded.contains("bash · git status --short --branch · exit 0 · 18ms"));
         assert_eq!(folded.matches("## main...origin/main [ahead 1]").count(), 1);
         assert_eq!(
             folded
@@ -6549,7 +6868,7 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
-        assert!(screen.contains("Completed"));
+        assert!(screen.contains("bash · git status --porcelain · exit 0 · 9ms"));
         assert!(!screen.contains("exit_code: 0"));
         assert!(!screen.contains("stdout:"));
         assert!(!screen.contains("stderr:"));
@@ -6570,8 +6889,8 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
-        assert_eq!(screen.matches("Agent is working").count(), 1);
-        assert!(screen.contains("$ git status"));
+        assert!(screen.contains("Ctrl+C stop"));
+        assert!(screen.contains("bash · git status · running"));
         assert!(screen.contains("running"));
     }
 }

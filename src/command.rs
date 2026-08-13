@@ -22,43 +22,43 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/help",
         usage: "/help",
-        description: "List slash commands",
+        description: "Open command index",
         accepts_arguments: false,
     },
     CommandSpec {
         name: "/model",
         usage: "/model",
-        description: "Choose the active configured model",
+        description: "Switch the active model",
         accepts_arguments: false,
     },
     CommandSpec {
         name: "/provider",
         usage: "/provider",
-        description: "Configure Providers and their models",
+        description: "Configure providers and models",
         accepts_arguments: false,
     },
     CommandSpec {
         name: "/clear",
         usage: "/clear",
-        description: "Start a new session (alias of /new)",
+        description: "Start a new session",
         accepts_arguments: false,
     },
     CommandSpec {
         name: "/new",
         usage: "/new",
-        description: "Start a new session (alias of /clear)",
+        description: "Start a new session",
         accepts_arguments: false,
     },
     CommandSpec {
         name: "/sessions",
         usage: "/sessions",
-        description: "View saved sessions",
+        description: "List saved sessions",
         accepts_arguments: false,
     },
     CommandSpec {
         name: "/resume",
         usage: "/resume [id]",
-        description: "Choose a saved session, or resume ID directly",
+        description: "Resume a saved session",
         accepts_arguments: true,
     },
     CommandSpec {
@@ -70,13 +70,13 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/think",
         usage: "/think [level]",
-        description: "Show, set, or cycle thinking level",
+        description: "Set thinking level",
         accepts_arguments: true,
     },
     CommandSpec {
         name: "/thinking",
         usage: "/thinking [show|hide]",
-        description: "Show or set thinking-card visibility",
+        description: "Show or hide thinking cards",
         accepts_arguments: true,
     },
 ];
@@ -819,31 +819,28 @@ mod tests {
                 .iter()
                 .find(|command| command.name == "/clear")
                 .map(|command| command.description),
-            Some("Start a new session (alias of /new)")
+            Some("Start a new session")
         );
         assert_eq!(
             command_specs()
                 .iter()
                 .find(|command| command.name == "/new")
                 .map(|command| command.description),
-            Some("Start a new session (alias of /clear)")
+            Some("Start a new session")
         );
         assert_eq!(
             command_specs()
                 .iter()
                 .find(|command| command.name == "/sessions")
                 .map(|command| command.description),
-            Some("View saved sessions")
+            Some("List saved sessions")
         );
         assert_eq!(
             command_specs()
                 .iter()
                 .find(|command| command.name == "/resume")
                 .map(|command| (command.usage, command.description)),
-            Some((
-                "/resume [id]",
-                "Choose a saved session, or resume ID directly"
-            ))
+            Some(("/resume [id]", "Resume a saved session"))
         );
     }
 }
