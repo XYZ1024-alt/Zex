@@ -51,8 +51,10 @@ const MAX_TOOL_ARGUMENT_CHARS: usize = 2_000;
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 12;
 const MAX_INPUT_HISTORY: usize = 100;
 const MIN_TRANSCRIPT_HEIGHT: u16 = 2;
-const HORIZONTAL_GUTTER: u16 = 1;
+const HORIZONTAL_GUTTER: u16 = 2;
 const MAX_INPUT_ROWS: usize = 5;
+const INPUT_HORIZONTAL_PADDING: u16 = 3;
+const INPUT_VERTICAL_PADDING: u16 = 1;
 const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -70,11 +72,11 @@ const ACCENT_SECONDARY: Color = Color::Rgb(187, 154, 247); // #BB9AF7
 const OK: Color = Color::Rgb(158, 206, 106); // #9ECE6A
 const BAD: Color = Color::Rgb(219, 75, 75); // #DB4B4B
 const LANDING_LOGO_ROWS: [&str; 5] = [
-    "██████ ██████ ██  ██",
-    "    ██ ██      ████ ",
-    "   ██  █████    ██  ",
-    " ██    ██      ████ ",
-    "██████ ██████ ██  ██",
+    "█████ █████ ██ ██",
+    "   ██ ██     ███ ",
+    "  ██  ████    █  ",
+    " ██   ██     ███ ",
+    "█████ █████ ██ ██",
 ];
 const LANDING_LOGO_DARK: Color = Color::Rgb(82, 82, 82);
 

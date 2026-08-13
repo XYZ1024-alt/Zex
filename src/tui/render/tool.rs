@@ -162,7 +162,6 @@ pub(super) fn append_tool_lines(
             .style(card_bg),
         );
     }
-    lines.push(Line::default());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -279,7 +278,7 @@ pub(in crate::tui) fn tool_detail_line_count(tool: &ToolEntry) -> usize {
 
 fn tool_marker(tool: &ToolEntry) -> &'static str {
     if tool.expanded {
-        return "◆";
+        return "●";
     }
     match tool.status {
         ToolStatus::Running => "◌",

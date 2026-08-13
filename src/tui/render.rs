@@ -1081,12 +1081,16 @@ pub(super) fn ui_regions(area: Rect, app: &App) -> UiRegions {
         input_metrics(
             &app.input.content,
             app.input.cursor,
-            footer_input_width(area.width).saturating_sub(4).max(1) as usize,
+            footer_input_width(area.width)
+                .saturating_sub(INPUT_HORIZONTAL_PADDING.saturating_mul(2))
+                .max(1) as usize,
         )
         .total_rows
         .clamp(1, MAX_INPUT_ROWS)
     };
-    let preferred_footer_height = (requested_input_rows as u16).saturating_add(1);
+    let preferred_footer_height = (requested_input_rows as u16)
+        .saturating_add(1)
+        .saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2));
     let footer_height = if area.height
         >= keymap_height
             .saturating_add(working_height)
@@ -1169,6 +1173,13 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     let area = content_area(area);
+    let area = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        area.height
+            .saturating_sub(u16::from(area.height > MIN_TRANSCRIPT_HEIGHT)),
+    );
     if app.transcript.is_empty() {
         app.transcript_page_height = area.height as usize;
         app.max_scroll = 0;
@@ -1271,17 +1282,17 @@ pub(super) fn landing_regions(area: Rect, app: &App) -> LandingRegions {
     let input_rows = input_metrics(
         &app.input.content,
         app.input.cursor,
-        card_width.saturating_sub(4).max(1) as usize,
+        card_width.saturating_sub(7).max(1) as usize,
     )
     .total_rows
     .clamp(1, MAX_INPUT_ROWS) as u16;
     let card_height = match stage.height {
-        9.. => input_rows.saturating_add(1).max(2),
-        5..=8 => 3,
+        11.. => input_rows.saturating_add(4).max(5),
+        5..=10 => 3,
         1..=4 => 1,
         _ => 0,
     };
-    let brand_height = if stage.height >= 13 {
+    let brand_height = if stage.height >= 15 {
         LANDING_LOGO_ROWS.len() as u16
     } else {
         0
@@ -1339,15 +1350,21 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     render_landing_card(frame, regions.card, app);
 
     if !regions.hint.is_empty() {
-        let hint = if regions.hint.width >= 28 {
-            "enter send    / commands"
+        let hint = if regions.hint.width >= 62 {
+            "Enter send  ·  Shift+Enter line break  ·  / actions"
         } else {
-            "enter    /"
+            "Enter send  ·  / actions"
         };
+        let hint_area = Rect::new(
+            regions.hint.x.saturating_add(4),
+            regions.hint.y,
+            regions.hint.width.saturating_sub(7),
+            regions.hint.height,
+        );
         frame.render_widget(
             Paragraph::new(Span::styled(hint, Style::default().fg(TEXT_FAINT)))
-                .alignment(Alignment::Right),
-            regions.hint,
+                .alignment(Alignment::Left),
+            hint_area,
         );
     }
 
@@ -1372,11 +1389,14 @@ fn landing_logo_line(row: &str) -> Line<'static> {
     Line::from(
         row.char_indices()
             .map(|(column, character)| {
-                let color = lerp_color(
-                    LANDING_LOGO_DARK,
-                    TEXT_STRONG,
-                    UnicodeWidthStr::width(&row[..column]) as f32 / width as f32,
-                );
+                let position = UnicodeWidthStr::width(&row[..column]) as f32 / width as f32;
+                let color = if position < 0.34 {
+                    lerp_color(LANDING_LOGO_DARK, TEXT_DIM, position / 0.34)
+                } else if position < 0.72 {
+                    lerp_color(TEXT_DIM, TEXT_STRONG, (position - 0.34) / 0.38)
+                } else {
+                    lerp_color(TEXT_STRONG, TEXT_DIM, (position - 0.72) / 0.28)
+                };
                 Span::styled(
                     character.to_string(),
                     Style::default().fg(color).bg(BACKGROUND),
@@ -1391,8 +1411,8 @@ fn landing_card_width(width: u16) -> u16 {
         return 0;
     }
     let max_width = width.saturating_sub(2).max(1);
-    let target = (u32::from(width) * 3 / 5) as u16;
-    target.clamp(max_width.min(24), max_width.min(72))
+    let target = (u32::from(width) * 11 / 20) as u16;
+    target.clamp(max_width.min(32), max_width.min(66))
 }
 
 fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -1413,35 +1433,47 @@ fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     for row in 0..inner_rows {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                "▎",
+                "▌",
                 Style::default().fg(ACCENT_PRIMARY).bg(SURFACE),
             )),
             Rect::new(area.x, area.y + row, 1, 1),
         );
     }
+    let full_layout = inner_rows >= 5;
     let model_row = u16::from(inner_rows >= 2);
+    let metadata_y = area
+        .bottom()
+        .saturating_sub(if full_layout { 2 } else { 1 });
+    let editor_y = area.y.saturating_add(u16::from(full_layout));
+    let editor_bottom = if model_row == 1 {
+        metadata_y.saturating_sub(u16::from(full_layout))
+    } else {
+        area.bottom()
+    };
     let editor_area = Rect::new(
-        area.x + 3,
-        area.y,
-        area.width.saturating_sub(4),
-        inner_rows - model_row,
+        area.x.saturating_add(4),
+        editor_y,
+        area.width.saturating_sub(7),
+        editor_bottom.saturating_sub(editor_y),
     );
-    if model_row == 1 {
+    if model_row == 1 && area.width > 7 {
         let model = model_short_name(&app.model);
+        let thinking = thinking_short_name(app.thinking_level.unwrap_or(app.thinking_preference));
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
-                    "Build",
+                    model,
                     Style::default()
                         .fg(ACCENT_PRIMARY)
                         .bg(SURFACE)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("  ·  ", Style::default().fg(TEXT_FAINT).bg(SURFACE)),
-                Span::styled(model, Style::default().fg(TEXT_DIM).bg(SURFACE)),
+                Span::styled("    ", Style::default().fg(TEXT_FAINT).bg(SURFACE)),
+                Span::styled("ZEX / ", Style::default().fg(TEXT_FAINT).bg(SURFACE)),
+                Span::styled(thinking, Style::default().fg(TEXT_DIM).bg(SURFACE)),
             ]))
             .style(Style::default().bg(SURFACE)),
-            Rect::new(editor_area.x, editor_area.bottom(), editor_area.width, 1),
+            Rect::new(editor_area.x, metadata_y, editor_area.width, 1),
         );
     }
     if !editor_area.is_empty() {
@@ -1658,6 +1690,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
     let mut card_lines = Vec::new();
     let mut output_lines = Vec::new();
     for (index, entry) in app.transcript.iter().enumerate() {
+        let next = app.transcript.get(index + 1);
         match entry {
             TranscriptEntry::Message { role, content } => {
                 let final_answer = *role == MessageRole::Assistant
@@ -1667,7 +1700,6 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                         Some(TranscriptEntry::Turn(_))
                     );
                 append_markdown_lines(&mut lines, content, *role, final_answer, width);
-                lines.push(Line::default());
             }
             TranscriptEntry::Thinking(thinking) => {
                 if app.show_thinking {
@@ -1739,23 +1771,47 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
             }
             TranscriptEntry::Turn(turn) => {
                 append_turn_line(&mut lines, turn, width);
-                lines.push(Line::default());
             }
             TranscriptEntry::Sessions(sessions) => {
                 append_session_lines(&mut lines, sessions);
-                lines.push(Line::default());
             }
         }
+        append_transcript_gap(&mut lines, entry, next);
     }
     if app.busy {
+        if !lines.is_empty() && !lines.last().is_some_and(|line| line.spans.is_empty()) {
+            lines.push(Line::default());
+        }
         append_running_turn_line(&mut lines, app, width);
-        lines.push(Line::default());
     }
 
     TranscriptRender {
         text: Text::from(lines),
         card_lines,
         output_lines,
+    }
+}
+
+fn append_transcript_gap(
+    lines: &mut Vec<Line<'static>>,
+    entry: &TranscriptEntry,
+    next: Option<&TranscriptEntry>,
+) {
+    let Some(next) = next else {
+        return;
+    };
+    let compact_tool_sequence = matches!(
+        (entry, next),
+        (
+            TranscriptEntry::Tool(ToolEntry {
+                expanded: false,
+                ..
+            }),
+            TranscriptEntry::Tool(_)
+        ) | (TranscriptEntry::Thinking(_), TranscriptEntry::Tool(_))
+    );
+    if !compact_tool_sequence {
+        lines.push(Line::default());
     }
 }
 
@@ -1884,32 +1940,30 @@ fn append_turn_line(lines: &mut Vec<Line<'static>>, turn: &TurnEntry, width: usi
         TurnOutcome::Failed => ("✗", "turn failed", BAD),
         TurnOutcome::Stopped => ("×", "turn stopped", TEXT_DIM),
     };
-    let mut details = vec![
-        model_short_name(&turn.model),
-        thinking_short_name(turn.thinking).to_owned(),
-        format!(
-            "{} tool{}",
-            turn.tool_count,
-            if turn.tool_count == 1 { "" } else { "s" }
-        ),
-    ];
+    let mut details = vec![format!(
+        "{} tool{}",
+        turn.tool_count,
+        if turn.tool_count == 1 { "" } else { "s" }
+    )];
     if let Some(elapsed) = turn.elapsed {
         details.push(format_turn_duration(elapsed));
     }
     if let Some(tokens) = turn.output_tokens {
         details.push(format_compact_count(tokens));
     }
-    let prefix = format!("{marker} {label}   ");
+    let prefix = format!("{label}  ");
     let details = details.join("  ·  ");
-    let details_width = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+    let details_width = width.saturating_sub(4 + UnicodeWidthStr::width(prefix.as_str()));
     lines.push(Line::from(vec![
+        Span::raw("  "),
         Span::styled(
-            prefix,
+            format!("{marker} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(prefix, Style::default().fg(TEXT_DIM)),
         Span::styled(
             truncate_display(&details, details_width),
-            Style::default().fg(TEXT_DIM),
+            Style::default().fg(TEXT_FAINT),
         ),
     ]));
 }
@@ -1920,8 +1974,6 @@ fn append_running_turn_line(lines: &mut Vec<Line<'static>>, app: &App, width: us
         .map(|started| format_turn_duration(started.elapsed()))
         .unwrap_or_else(|| "0s".to_owned());
     let details = [
-        model_short_name(&app.model),
-        thinking_short_name(app.thinking_level.unwrap_or(app.thinking_preference)).to_owned(),
         format!(
             "{} tool{}",
             app.turn_tool_count,
@@ -1930,18 +1982,20 @@ fn append_running_turn_line(lines: &mut Vec<Line<'static>>, app: &App, width: us
         elapsed,
     ]
     .join("  ·  ");
-    let prefix = "… running     ";
-    let details_width = width.saturating_sub(UnicodeWidthStr::width(prefix));
+    let prefix = "running  ";
+    let details_width = width.saturating_sub(4 + UnicodeWidthStr::width(prefix));
     lines.push(Line::from(vec![
+        Span::raw("  "),
         Span::styled(
-            prefix,
+            "◌ ",
             Style::default()
                 .fg(ACCENT_PRIMARY)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(prefix, Style::default().fg(TEXT_DIM)),
         Span::styled(
             truncate_display(&details, details_width),
-            Style::default().fg(TEXT_DIM),
+            Style::default().fg(TEXT_FAINT),
         ),
     ]));
 }
@@ -1976,7 +2030,8 @@ fn append_markdown_lines(
 ) {
     let base_color = match role {
         MessageRole::User => TEXT_STRONG,
-        MessageRole::Assistant => TEXT,
+        MessageRole::Assistant if final_answer => TEXT,
+        MessageRole::Assistant => TEXT_DIM,
     };
     let mut in_code_block = false;
     let mut first_visual_line = true;
@@ -2117,9 +2172,9 @@ fn message_rail(
 ) -> &'static str {
     let rail = match (role, final_answer, *first_visual_line) {
         (MessageRole::Assistant, true, _) => "  ",
-        (MessageRole::User, _, true) => "│ ",
-        (MessageRole::User, _, false) => "│ ",
-        (MessageRole::Assistant, false, true) => "• ",
+        (MessageRole::User, _, true) => "▎  ",
+        (MessageRole::User, _, false) => "▎  ",
+        (MessageRole::Assistant, false, true) => "  ",
         (MessageRole::Assistant, false, false) => "  ",
     };
     *first_visual_line = false;
@@ -2142,7 +2197,11 @@ fn append_wrapped_message_lines(
     width: usize,
     content_style: Style,
 ) {
-    for segment in wrap_display_words(content, width.saturating_sub(2).max(1)) {
+    let rail_width = match role {
+        MessageRole::User => 3,
+        MessageRole::Assistant => 2,
+    };
+    for segment in wrap_display_words(content, width.saturating_sub(rail_width).max(1)) {
         let rail = message_rail(role, final_answer, first_visual_line);
         lines.push(Line::from(vec![
             Span::styled(rail, Style::default().fg(message_rail_color(role))),
@@ -2161,7 +2220,11 @@ fn append_output_block_lines(
     content_color: Color,
 ) {
     let marker_width = UnicodeWidthStr::width(marker);
-    let content_width = width.saturating_sub(2 + marker_width).max(1);
+    let rail_width = match role {
+        MessageRole::User => 3,
+        MessageRole::Assistant => 2,
+    };
+    let content_width = width.saturating_sub(rail_width + marker_width).max(1);
     for (index, segment) in wrap_display_words(content, content_width)
         .into_iter()
         .enumerate()
@@ -2318,10 +2381,12 @@ fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     let input_area = Rect::new(
-        area.x.saturating_add(2),
-        area.y,
-        area.width.saturating_sub(4),
-        area.height,
+        area.x.saturating_add(INPUT_HORIZONTAL_PADDING),
+        area.y.saturating_add(INPUT_VERTICAL_PADDING),
+        area.width
+            .saturating_sub(INPUT_HORIZONTAL_PADDING.saturating_mul(2)),
+        area.height
+            .saturating_sub(INPUT_VERTICAL_PADDING.saturating_mul(2)),
     );
     if input_area.is_empty() {
         return;

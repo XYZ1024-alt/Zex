@@ -276,7 +276,11 @@ fn thinking_statusline_hides_stale_rate_and_keeps_input_frame_empty() {
     assert!(!screen.contains("42.7 tok/s"));
     assert!(!screen.contains("processing turn"));
     assert_eq!(
-        terminal.backend().buffer()[(regions.footer.x + 3, regions.footer.y + 1)].symbol(),
+        terminal.backend().buffer()[(
+            regions.footer.x + super::INPUT_HORIZONTAL_PADDING,
+            regions.footer.y + 1 + super::INPUT_VERTICAL_PADDING,
+        )]
+            .symbol(),
         " "
     );
 }
@@ -687,11 +691,10 @@ fn empty_state_centers_the_zex_card_and_keeps_status_quiet() {
     assert!(screen.contains(LANDING_LOGO_ROWS[0]));
     assert!(!screen.contains("Z  E  X"));
     assert!(screen.contains("Ask anything..."));
-    assert!(screen.contains("enter send"));
-    assert!(screen.contains("/ commands"));
-    assert!(screen.contains("Build"));
+    assert!(screen.contains("Enter send"));
+    assert!(screen.contains("/ actions"));
     assert!(screen.contains("gpt-5"));
-    assert!(!screen.contains("high"));
+    assert!(screen.contains("ZEX / high"));
     assert!(!screen.contains("25.0%/120Kc"));
     assert!(screen.contains("D:/workspaces/zex"));
     assert!(screen.contains(env!("CARGO_PKG_VERSION")));
@@ -702,14 +705,27 @@ fn empty_state_centers_the_zex_card_and_keeps_status_quiet() {
     assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
     assert!(regions.card.y > 4);
     assert!(regions.card.bottom() < regions.status.y);
-    assert!(regions.card.width < 100);
+    assert_eq!(regions.card.width, 55);
+    assert_eq!(regions.card.height, 5);
     assert_eq!(
         terminal.backend().buffer()[(regions.card.x, regions.card.y)].symbol(),
-        "▎"
+        "▌"
     );
     assert_eq!(
         style_at(&terminal, regions.card.x + 1, regions.card.y).bg,
         Some(SURFACE)
+    );
+    assert_eq!(
+        terminal.backend().buffer()[(regions.card.x + 4, regions.card.y)].symbol(),
+        " "
+    );
+    assert_eq!(
+        terminal.backend().buffer()[(regions.card.x + 4, regions.card.y + 1)].symbol(),
+        " "
+    );
+    assert_eq!(
+        style_at(&terminal, regions.card.x + 4, regions.card.bottom() - 2).fg,
+        Some(ACCENT_PRIMARY)
     );
     let logo_x = regions.brand.x
         + regions
@@ -719,17 +735,16 @@ fn empty_state_centers_the_zex_card_and_keeps_status_quiet() {
             / 2;
     assert_eq!(
         style_at(&terminal, logo_x, regions.brand.y).fg,
-        Some(LANDING_LOGO_DARK)
-    );
-    assert_eq!(
-        style_at(
-            &terminal,
-            logo_x + LANDING_LOGO_ROWS[0].chars().count() as u16 - 1,
-            regions.brand.y
-        )
-        .fg,
         Some(super::TEXT_STRONG)
     );
+    let logo_end = style_at(
+        &terminal,
+        logo_x + LANDING_LOGO_ROWS[0].chars().count() as u16 - 1,
+        regions.brand.y,
+    )
+    .fg;
+    assert_ne!(logo_end, Some(super::TEXT_STRONG));
+    assert_ne!(logo_end, Some(LANDING_LOGO_DARK));
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let version_x = 100 - version.chars().count() as u16 - super::HORIZONTAL_GUTTER;
     assert_eq!(
@@ -746,8 +761,8 @@ fn empty_input_keeps_the_cursor_cell_clear_for_ime_preedit() {
 
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
-    let editor_x = regions.card.x + 3;
-    let editor_y = regions.card.y;
+    let editor_x = regions.card.x + 4;
+    let editor_y = regions.card.y + 1;
 
     terminal
         .backend_mut()
@@ -769,8 +784,8 @@ fn typed_input_starts_at_the_empty_editor_cursor_origin() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
     let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
-    let editor_x = regions.card.x + 3;
-    let editor_y = regions.card.y;
+    let editor_x = regions.card.x + 4;
+    let editor_y = regions.card.y + 1;
 
     assert!(screen.contains("hello"));
     assert!(!screen.contains("Ask anything..."));
@@ -1028,13 +1043,10 @@ fn multiline_input_scrolls_inside_the_stable_footer() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
     assert!(multiline.footer.height > single.footer.height);
-    for y in [
-        multiline.footer.y + 1,
-        multiline.footer.y + 2,
-        multiline.footer.bottom() - 1,
-    ] {
+    for y in multiline.footer.y + 1..multiline.footer.bottom() {
         assert_eq!(
-            terminal.backend().buffer()[(multiline.footer.x + 1, y)].symbol(),
+            terminal.backend().buffer()[(multiline.footer.x + super::HORIZONTAL_GUTTER, y,)]
+                .symbol(),
             "│"
         );
     }
@@ -1287,11 +1299,29 @@ fn completed_turn_status_precedes_the_final_answer() {
         .lines()
         .position(|row| row.contains("turn done"))
         .expect("missing completed turn row");
+    let user_row = screen
+        .lines()
+        .position(|row| row.contains("Inspect the project"))
+        .expect("missing user message");
+    let tool_row = screen
+        .lines()
+        .position(|row| row.contains("read") && row.contains("Cargo.toml"))
+        .expect("missing tool summary");
     let answer_row = screen
         .lines()
         .position(|row| row.contains("Final answer."))
         .expect("missing final answer");
+    assert_eq!(
+        terminal.backend().buffer()[(super::HORIZONTAL_GUTTER, user_row as u16)].symbol(),
+        "▎"
+    );
+    assert_eq!(
+        style_at(&terminal, super::HORIZONTAL_GUTTER, user_row as u16,).fg,
+        Some(ACCENT_PRIMARY)
+    );
+    assert!(user_row < tool_row);
     assert!(status_row < answer_row);
+    assert_eq!(answer_row, status_row + 2);
     assert!(screen.contains("1 tool"));
     assert!(screen.contains("1.2k"));
 }
@@ -1315,9 +1345,11 @@ fn active_turn_renders_running_status_without_system_feed_rows() {
 
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
-    assert!(screen.lines().any(|row| {
-        row.contains("running") && row.contains("test-model") && row.contains("1 tool")
-    }));
+    assert!(
+        screen
+            .lines()
+            .any(|row| row.contains("running") && row.contains("1 tool"))
+    );
     assert_eq!(screen.matches("Working...").count(), 1);
 }
 
