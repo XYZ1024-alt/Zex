@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+        Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -58,6 +59,7 @@ const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 const BACKGROUND: Color = Color::Rgb(9, 12, 15);
 const SURFACE: Color = Color::Rgb(18, 22, 26);
+const SURFACE_HOVER: Color = Color::Rgb(21, 26, 31);
 const SURFACE_RAISED: Color = Color::Rgb(25, 30, 35);
 const TEXT: Color = Color::Rgb(194, 202, 209);
 const TEXT_STRONG: Color = Color::Rgb(232, 236, 239);
@@ -588,22 +590,133 @@ fn handle_terminal_event(
             }
             InputAction::None
         }
-        Event::Mouse(mouse)
-            if !app.completion_open()
-                && !app.session_picker_open()
-                && !app.model_picker_open()
-                && !app.provider_editor_open() =>
-        {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => app.scroll_lines_up(SCROLL_STEP),
-                MouseEventKind::ScrollDown => app.scroll_lines_down(SCROLL_STEP),
-                _ => {}
-            }
-            InputAction::None
-        }
+        Event::Mouse(mouse) => handle_mouse_event(mouse, app, turn_active),
         Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
             let in_paste_burst = burst.observe(key, now);
             handle_key_event(key, app, turn_active, in_paste_burst)
+        }
+        _ => InputAction::None,
+    }
+}
+
+fn handle_mouse_event(mouse: MouseEvent, app: &mut App, turn_active: bool) -> InputAction {
+    let target = app.hit_target_at(mouse.column, mouse.row);
+    match mouse.kind {
+        MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+            app.hovered = target;
+            InputAction::None
+        }
+        MouseEventKind::ScrollUp if !app.page_open() => {
+            app.scroll_lines_up(SCROLL_STEP);
+            InputAction::None
+        }
+        MouseEventKind::ScrollDown if !app.page_open() => {
+            app.scroll_lines_down(SCROLL_STEP);
+            InputAction::None
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.hovered.clone_from(&target);
+            let repeated = target
+                .as_ref()
+                .is_some_and(|target| app.armed_click.as_ref() == Some(target));
+            app.armed_click = target
+                .as_ref()
+                .filter(|target| target.requires_confirmation())
+                .cloned();
+
+            match target {
+                Some(HitTarget::Transcript) => {
+                    app.input_focused = false;
+                    InputAction::None
+                }
+                Some(HitTarget::Card(index)) => {
+                    app.armed_click = None;
+                    app.input_focused = false;
+                    app.toggle_card(index);
+                    InputAction::None
+                }
+                Some(HitTarget::ToolOutput(index)) => {
+                    app.armed_click = None;
+                    app.input_focused = false;
+                    app.selected_card = Some(index);
+                    app.toggle_selected_tool_output();
+                    InputAction::None
+                }
+                Some(HitTarget::Completion(index)) => {
+                    app.input_focused = false;
+                    app.select_completion_at(index);
+                    if repeated {
+                        app.take_selected_completion()
+                            .map(InputAction::Submit)
+                            .unwrap_or(InputAction::None)
+                    } else {
+                        InputAction::None
+                    }
+                }
+                Some(HitTarget::Session(index)) => {
+                    app.input_focused = false;
+                    app.select_session_at(index);
+                    if repeated {
+                        app.take_selected_session()
+                            .map(InputAction::Resume)
+                            .unwrap_or(InputAction::None)
+                    } else {
+                        InputAction::None
+                    }
+                }
+                Some(HitTarget::Model(index)) => {
+                    app.input_focused = false;
+                    app.select_model_at(index);
+                    if repeated {
+                        app.take_selected_model()
+                            .map(InputAction::SwitchModel)
+                            .unwrap_or(InputAction::None)
+                    } else {
+                        InputAction::None
+                    }
+                }
+                Some(HitTarget::Help(index)) => {
+                    app.input_focused = false;
+                    app.select_help_at(index);
+                    if repeated {
+                        app.selected_help_command()
+                            .map(|command| InputAction::Submit(command.name.to_owned()))
+                            .unwrap_or(InputAction::None)
+                    } else {
+                        InputAction::None
+                    }
+                }
+                Some(HitTarget::Provider { pane, index }) => {
+                    app.input_focused = false;
+                    let selected = app.provider_item_selected(pane, index);
+                    app.select_provider_at(pane, index);
+                    if repeated && selected {
+                        app.edit_provider_item();
+                    }
+                    InputAction::None
+                }
+                Some(HitTarget::Input) if !turn_active && !app.page_open() => {
+                    app.armed_click = None;
+                    app.focus_input();
+                    InputAction::None
+                }
+                Some(HitTarget::StatusModel) if !turn_active => {
+                    app.armed_click = None;
+                    app.input_focused = false;
+                    app.open_model_picker();
+                    InputAction::None
+                }
+                Some(HitTarget::StatusThinking) if !turn_active => {
+                    app.armed_click = None;
+                    app.input_focused = false;
+                    next_thinking_action(app)
+                }
+                _ => {
+                    app.armed_click = None;
+                    app.input_focused = false;
+                    InputAction::None
+                }
+            }
         }
         _ => InputAction::None,
     }
@@ -615,6 +728,8 @@ fn handle_key_event(
     turn_active: bool,
     in_paste_burst: bool,
 ) -> InputAction {
+    app.armed_click = None;
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return if turn_active {
             InputAction::Interrupt
@@ -629,7 +744,7 @@ fn handle_key_event(
             KeyCode::Down | KeyCode::Char('j') => app.select_model(false),
             KeyCode::Home | KeyCode::Char('g') => app.select_first_model(),
             KeyCode::End | KeyCode::Char('G') => app.select_last_model(),
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char(' ') => {
                 if let Some(target) = app.take_selected_model() {
                     return InputAction::SwitchModel(target);
                 }
@@ -640,13 +755,18 @@ fn handle_key_event(
         return InputAction::None;
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('s')
+        && app.provider_editor_open()
+        && !turn_active
+    {
+        return app
+            .provider_catalog_to_save()
+            .map(InputAction::SaveProviders)
+            .unwrap_or(InputAction::None);
+    }
+
     if app.provider_editor_open() && !turn_active {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            return app
-                .provider_catalog_to_save()
-                .map(InputAction::SaveProviders)
-                .unwrap_or(InputAction::None);
-        }
         if app.provider_editor_is_confirming() {
             match key.code {
                 KeyCode::Enter | KeyCode::Char('y') => app.confirm_provider_action(),
@@ -699,7 +819,7 @@ fn handle_key_event(
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-        app.toggle_selected_tool();
+        app.toggle_all_cards();
         return InputAction::None;
     }
 
@@ -712,23 +832,7 @@ fn handle_key_event(
         return if turn_active {
             InputAction::None
         } else {
-            let levels = app
-                .providers
-                .active_model
-                .as_ref()
-                .map(|model| {
-                    app.providers
-                        .thinking_capabilities(model)
-                        .available_levels()
-                })
-                .unwrap_or_else(|| {
-                    crate::provider::ThinkingCapabilities::default().available_levels()
-                });
-            let current = levels
-                .iter()
-                .position(|level| *level == app.thinking_preference)
-                .unwrap_or(0);
-            InputAction::Submit(format!("/think {}", levels[(current + 1) % levels.len()]))
+            next_thinking_action(app)
         };
     }
 
@@ -736,7 +840,7 @@ fn handle_key_event(
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => app.select_session(true),
             KeyCode::Down | KeyCode::Char('j') => app.select_session(false),
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char(' ') => {
                 if let Some(session_id) = app.take_selected_session() {
                     return InputAction::Resume(session_id);
                 }
@@ -748,8 +852,16 @@ fn handle_key_event(
     }
 
     if app.help_open && !turn_active {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            app.help_open = false;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => app.select_help(true),
+            KeyCode::Down | KeyCode::Char('j') => app.select_help(false),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(command) = app.selected_help_command() {
+                    return InputAction::Submit(command.name.to_owned());
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => app.dismiss_help(),
+            _ => {}
         }
         return InputAction::None;
     }
@@ -769,9 +881,10 @@ fn handle_key_event(
                 return InputAction::None;
             }
             KeyCode::Enter => {
-                if app.complete_or_execute_selected() {
-                    return InputAction::None;
-                }
+                return app
+                    .take_selected_completion()
+                    .map(InputAction::Submit)
+                    .unwrap_or(InputAction::None);
             }
             KeyCode::Esc => {
                 app.dismiss_completion();
@@ -810,6 +923,10 @@ fn handle_key_event(
             }
             return InputAction::None;
         }
+        KeyCode::Char(' ') if app.selected_card.is_some() && app.input.is_empty() => {
+            app.toggle_selected_tool();
+            return InputAction::None;
+        }
         KeyCode::Esc => {
             return if app.cancel_ui_layer() || turn_active {
                 InputAction::None
@@ -821,6 +938,11 @@ fn handle_key_event(
     }
 
     if turn_active {
+        return InputAction::None;
+    }
+
+    if !app.input_focused && app.selected_card.is_some() && key.code == KeyCode::Enter {
+        app.toggle_selected_tool();
         return InputAction::None;
     }
 
@@ -894,6 +1016,24 @@ fn handle_key_event(
     InputAction::None
 }
 
+fn next_thinking_action(app: &App) -> InputAction {
+    let levels = app
+        .providers
+        .active_model
+        .as_ref()
+        .map(|model| {
+            app.providers
+                .thinking_capabilities(model)
+                .available_levels()
+        })
+        .unwrap_or_else(|| crate::provider::ThinkingCapabilities::default().available_levels());
+    let current = levels
+        .iter()
+        .position(|level| *level == app.thinking_preference)
+        .unwrap_or(0);
+    InputAction::Submit(format!("/think {}", levels[(current + 1) % levels.len()]))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Idle,
@@ -953,6 +1093,40 @@ impl ToolStatus {
 enum ThinkingStatus {
     Active,
     Done,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HitTarget {
+    Transcript,
+    Card(usize),
+    ToolOutput(usize),
+    Completion(usize),
+    Session(usize),
+    Model(usize),
+    Help(usize),
+    Provider { pane: ProviderPane, index: usize },
+    Input,
+    StatusModel,
+    StatusThinking,
+}
+
+impl HitTarget {
+    fn requires_confirmation(&self) -> bool {
+        matches!(
+            self,
+            Self::Completion(_)
+                | Self::Session(_)
+                | Self::Model(_)
+                | Self::Help(_)
+                | Self::Provider { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HitRegion {
+    area: Rect,
+    target: HitTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1021,7 +1195,7 @@ impl Toast {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct InputBuffer {
     content: String,
     cursor: usize,
@@ -1168,19 +1342,19 @@ enum DeleteTarget {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FieldEditor {
     target: ProviderEditTarget,
     input: InputBuffer,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ProviderDialog {
     Delete(DeleteTarget),
     Discard,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ProviderEditor {
     original: ProviderCatalog,
     draft: ProviderCatalog,
@@ -1240,6 +1414,11 @@ struct App {
     active_tools: BTreeMap<String, String>,
     errors: VecDeque<String>,
     selected_card: Option<usize>,
+    hovered: Option<HitTarget>,
+    armed_click: Option<HitTarget>,
+    hit_regions: Vec<HitRegion>,
+    input_focused: bool,
+    help_selected: usize,
     status: Status,
     busy: bool,
     scroll_top: usize,
@@ -1283,6 +1462,11 @@ impl App {
             active_tools: BTreeMap::new(),
             errors: VecDeque::new(),
             selected_card: None,
+            hovered: None,
+            armed_click: None,
+            hit_regions: Vec::new(),
+            input_focused: true,
+            help_selected: 0,
             status: Status::Idle,
             busy: false,
             scroll_top: 0,
@@ -1378,8 +1562,35 @@ impl App {
         app
     }
 
+    fn begin_render(&mut self) {
+        self.hit_regions.clear();
+    }
+
+    fn register_hit(&mut self, area: Rect, target: HitTarget) {
+        if !area.is_empty() {
+            self.hit_regions.push(HitRegion { area, target });
+        }
+    }
+
+    fn hit_target_at(&self, x: u16, y: u16) -> Option<HitTarget> {
+        self.hit_regions
+            .iter()
+            .rev()
+            .find(|region| region.area.contains((x, y).into()))
+            .map(|region| region.target.clone())
+    }
+
+    fn hovered(&self, target: &HitTarget) -> bool {
+        self.hovered.as_ref() == Some(target)
+    }
+
+    fn armed(&self, target: &HitTarget) -> bool {
+        self.armed_click.as_ref() == Some(target)
+    }
+
     fn start_turn(&mut self) {
         self.help_open = false;
+        self.input_focused = false;
         self.busy = true;
         self.status = Status::Thinking;
         self.scroll_to_bottom();
@@ -1545,6 +1756,10 @@ impl App {
         self.active_tools.clear();
         self.errors.clear();
         self.selected_card = None;
+        self.hovered = None;
+        self.armed_click = None;
+        self.input_focused = true;
+        self.help_selected = 0;
         self.status = Status::Idle;
         self.toast = None;
         self.help_open = false;
@@ -1626,6 +1841,8 @@ impl App {
         match output {
             CommandOutput::Help => {
                 self.help_open = true;
+                self.help_selected = 0;
+                self.input_focused = false;
                 return false;
             }
             CommandOutput::Sessions(sessions) => {
@@ -1707,6 +1924,7 @@ impl App {
             (None, false) => 0,
         };
         self.selected_card = Some(indices[next]);
+        self.input_focused = false;
     }
 
     fn toggle_selected_tool(&mut self) {
@@ -1714,25 +1932,65 @@ impl App {
             self.selected_card = self.card_indices().last().copied();
         }
         if let Some(selected) = self.selected_card {
-            match self.transcript.get_mut(selected) {
-                Some(TranscriptEntry::Thinking(thinking)) => {
-                    thinking.expanded = !thinking.expanded;
+            self.toggle_card(selected);
+        }
+    }
+
+    fn toggle_card(&mut self, index: usize) {
+        self.selected_card = Some(index);
+        self.input_focused = false;
+        match self.transcript.get_mut(index) {
+            Some(TranscriptEntry::Thinking(thinking)) => {
+                thinking.expanded = !thinking.expanded;
+            }
+            Some(TranscriptEntry::Tool(tool)) => {
+                tool.expanded = !tool.expanded;
+                if !tool.expanded {
+                    tool.show_full_output = false;
                 }
-                Some(TranscriptEntry::Tool(tool)) => {
-                    if !tool.expanded {
-                        tool.expanded = true;
-                        tool.show_full_output = false;
-                    } else if !tool.show_full_output
-                        && tool_output_line_count(&tool.output) > TOOL_OUTPUT_PREVIEW_LINES
-                    {
-                        tool.show_full_output = true;
-                    } else {
-                        tool.expanded = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn toggle_all_cards(&mut self) {
+        let expand = self.card_indices().into_iter().any(|index| {
+            matches!(
+                self.transcript.get(index),
+                Some(TranscriptEntry::Thinking(ThinkingEntry {
+                    expanded: false,
+                    ..
+                })) | Some(TranscriptEntry::Tool(ToolEntry {
+                    expanded: false,
+                    ..
+                }))
+            )
+        });
+        for entry in &mut self.transcript {
+            match entry {
+                TranscriptEntry::Thinking(thinking) if self.show_thinking => {
+                    thinking.expanded = expand;
+                }
+                TranscriptEntry::Tool(tool) => {
+                    tool.expanded = expand;
+                    if !expand {
                         tool.show_full_output = false;
                     }
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn toggle_selected_tool_output(&mut self) {
+        let Some(selected) = self.selected_card else {
+            return;
+        };
+        let Some(TranscriptEntry::Tool(tool)) = self.transcript.get_mut(selected) else {
+            return;
+        };
+        if tool.expanded && tool_output_line_count(&tool.output) > TOOL_OUTPUT_PREVIEW_LINES {
+            tool.show_full_output = !tool.show_full_output;
         }
     }
 
@@ -1765,7 +2023,7 @@ impl App {
             return true;
         }
         if self.help_open {
-            self.help_open = false;
+            self.dismiss_help();
             return true;
         }
         if let Some(selected) = self.selected_card {
@@ -1824,6 +2082,7 @@ impl App {
 
     fn open_session_picker(&mut self, sessions: Vec<SessionSummary>) {
         self.help_open = false;
+        self.input_focused = false;
         self.completion.dismissed = true;
         self.session_picker = Some(SessionPicker {
             selected: sessions
@@ -1860,6 +2119,14 @@ impl App {
         };
     }
 
+    fn select_session_at(&mut self, index: usize) {
+        if let Some(picker) = &mut self.session_picker
+            && index < picker.sessions.len()
+        {
+            picker.selected = index;
+        }
+    }
+
     fn take_selected_session(&mut self) -> Option<String> {
         let picker = self.session_picker.take()?;
         picker
@@ -1870,6 +2137,32 @@ impl App {
 
     fn dismiss_session_picker(&mut self) {
         self.session_picker = None;
+    }
+
+    fn select_help(&mut self, reverse: bool) {
+        let count = command_specs().len();
+        if count == 0 {
+            return;
+        }
+        self.help_selected = if reverse {
+            self.help_selected.checked_sub(1).unwrap_or(count - 1)
+        } else {
+            (self.help_selected + 1) % count
+        };
+    }
+
+    fn select_help_at(&mut self, index: usize) {
+        if index < command_specs().len() {
+            self.help_selected = index;
+        }
+    }
+
+    fn selected_help_command(&self) -> Option<&'static CommandSpec> {
+        command_specs().get(self.help_selected)
+    }
+
+    fn dismiss_help(&mut self) {
+        self.help_open = false;
     }
 
     fn completion_matches(&self) -> Vec<&'static CommandSpec> {
@@ -1909,6 +2202,12 @@ impl App {
         };
     }
 
+    fn select_completion_at(&mut self, index: usize) {
+        if index < self.completion_matches().len() {
+            self.completion.selected = index;
+        }
+    }
+
     fn accept_completion(&mut self) {
         let matches = self.completion_matches();
         let Some(command) = matches.get(self.completion.selected) else {
@@ -1924,19 +2223,14 @@ impl App {
         self.completion.dismissed = true;
     }
 
-    fn complete_or_execute_selected(&mut self) -> bool {
+    fn take_selected_completion(&mut self) -> Option<String> {
         let matches = self.completion_matches();
-        let Some(command) = matches.get(self.completion.selected) else {
-            return false;
-        };
-        if self.input.content.trim() == command.name {
-            if command.accepts_arguments {
-                self.completion.dismissed = true;
-            }
-            return false;
-        }
-        self.accept_completion();
-        true
+        let command = matches.get(self.completion.selected)?;
+        let command = command.name.to_owned();
+        self.input.clear();
+        self.reset_history_navigation();
+        self.completion.dismissed = true;
+        Some(command)
     }
 
     fn dismiss_completion(&mut self) {
@@ -1993,7 +2287,25 @@ impl App {
     }
 
     fn prepare_input_edit(&mut self) {
-        self.help_open = false;
+        self.dismiss_help();
+        self.input_focused = true;
+        self.selected_card = None;
+        self.reset_history_navigation();
+    }
+
+    fn focus_input(&mut self) {
+        if self.provider_editor_open() {
+            self.request_provider_exit();
+            if self.provider_editor_open() {
+                self.input_focused = false;
+                return;
+            }
+        }
+        self.dismiss_model_picker();
+        self.dismiss_session_picker();
+        self.dismiss_help();
+        self.input_focused = true;
+        self.selected_card = None;
         self.reset_history_navigation();
     }
 
@@ -2025,6 +2337,7 @@ impl App {
 
     fn open_model_picker(&mut self) {
         self.help_open = false;
+        self.input_focused = false;
         self.session_picker = None;
         self.provider_editor = None;
         self.input.clear();
@@ -2064,6 +2377,14 @@ impl App {
         };
     }
 
+    fn select_model_at(&mut self, index: usize) {
+        if let Some(picker) = &mut self.model_picker
+            && index < picker.choices.len()
+        {
+            picker.selected = index;
+        }
+    }
+
     fn select_first_model(&mut self) {
         if let Some(picker) = &mut self.model_picker {
             picker.selected = 0;
@@ -2088,6 +2409,7 @@ impl App {
 
     fn open_provider_editor(&mut self) {
         self.help_open = false;
+        self.input_focused = false;
         self.session_picker = None;
         self.model_picker = None;
         self.input.clear();
@@ -2158,6 +2480,45 @@ impl App {
                     (editor.model_selected + 1) % count
                 };
             }
+        }
+    }
+
+    fn provider_item_selected(&self, pane: ProviderPane, index: usize) -> bool {
+        self.provider_editor.as_ref().is_some_and(|editor| {
+            editor.pane == pane
+                && match pane {
+                    ProviderPane::Providers => editor.provider_selected == index,
+                    ProviderPane::Details => editor.detail_selected == index,
+                    ProviderPane::Models => editor.model_selected == index,
+                }
+        })
+    }
+
+    fn select_provider_at(&mut self, pane: ProviderPane, index: usize) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        let count = match pane {
+            ProviderPane::Providers => editor.draft.providers.len(),
+            ProviderPane::Details => ProviderField::COUNT,
+            ProviderPane::Models => editor
+                .selected_provider()
+                .map_or(0, |provider| provider.models.len()),
+        };
+        if index >= count {
+            return;
+        }
+        editor.pane = pane;
+        match pane {
+            ProviderPane::Providers => {
+                if editor.provider_selected != index {
+                    editor.provider_selected = index;
+                    editor.detail_selected = 0;
+                    editor.model_selected = 0;
+                }
+            }
+            ProviderPane::Details => editor.detail_selected = index,
+            ProviderPane::Models => editor.model_selected = index,
         }
     }
 
@@ -2742,6 +3103,7 @@ fn git_output(working_dir: &Path, arguments: &[&str]) -> Option<String> {
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
+    app.begin_render();
     frame.render_widget(Clear, area);
     frame
         .buffer_mut()
@@ -2761,7 +3123,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     } else if app.session_picker_open() {
         render_session_picker(frame, regions.transcript, app);
     } else if app.help_open {
-        render_help_page(frame, regions.transcript);
+        render_help_page(frame, regions.transcript, app);
     } else {
         render_transcript(frame, regions.transcript, app);
         let completion = align_with_footer_input(regions.completion, regions.footer);
@@ -2771,7 +3133,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_keymap(frame, regions.keymap, app);
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.is_empty() {
         return;
     }
@@ -2818,10 +3180,11 @@ struct StatuslineFields<'a> {
     identifier: Option<&'a str>,
 }
 
-fn render_statusline(frame: &mut Frame<'_>, area: Rect, app: &App, subdued: bool) {
+fn render_statusline(frame: &mut Frame<'_>, area: Rect, app: &mut App, subdued: bool) {
     if area.is_empty() {
         return;
     }
+    register_statusline_hits(app, area);
     frame.render_widget(
         Paragraph::new(statusline_line(app, area.width as usize, subdued))
             .style(Style::default().bg(BACKGROUND))
@@ -2901,6 +3264,34 @@ fn statusline_line(app: &App, width: usize, subdued: bool) -> Line<'static> {
     }
 
     compact_statusline(&model, thinking, &context, width, subdued)
+}
+
+fn register_statusline_hits(app: &mut App, area: Rect) {
+    if area.width == 0 {
+        return;
+    }
+    let model = model_short_name(&app.model);
+    let thinking = thinking_short_name(app.thinking_level.unwrap_or(app.thinking_preference));
+    let separator_width = UnicodeWidthStr::width("  ·  ") as u16;
+    let model_x = area
+        .x
+        .saturating_add(UnicodeWidthStr::width("ZEX") as u16)
+        .saturating_add(separator_width);
+    let model_width =
+        (UnicodeWidthStr::width(model.as_str()) as u16).min(area.right().saturating_sub(model_x));
+    let thinking_x = model_x
+        .saturating_add(model_width)
+        .saturating_add(separator_width);
+    let thinking_width =
+        (UnicodeWidthStr::width(thinking) as u16).min(area.right().saturating_sub(thinking_x));
+    app.register_hit(
+        Rect::new(model_x, area.y, model_width, 1),
+        HitTarget::StatusModel,
+    );
+    app.register_hit(
+        Rect::new(thinking_x, area.y, thinking_width, 1),
+        HitTarget::StatusThinking,
+    );
 }
 
 fn statusline_left_parts(layout: StatuslineLayout, fields: &StatuslineFields<'_>) -> Vec<String> {
@@ -2999,7 +3390,9 @@ fn styled_statusline(
             0 => Style::default()
                 .fg(if subdued { DIM } else { ACCENT })
                 .add_modifier(Modifier::BOLD),
-            1 | 2 => Style::default().fg(strong),
+            1 | 2 => Style::default()
+                .fg(strong)
+                .add_modifier(Modifier::UNDERLINED),
             _ => Style::default().fg(secondary),
         };
         spans.push(Span::styled(part, style));
@@ -3035,13 +3428,32 @@ fn compact_statusline(
         + UnicodeWidthStr::width(context)
         + UnicodeWidthStr::width(separator) * 3;
     let model = truncate_inline(model, width.saturating_sub(fixed).max(1));
-    let content = format!("ZEX{separator}{model}{separator}{thinking}{separator}{context}");
-    Line::from(Span::styled(
-        truncate_inline(&content, width),
-        Style::default()
-            .fg(if subdued { DIM } else { TEXT_STRONG })
-            .add_modifier(Modifier::BOLD),
-    ))
+    let strong = if subdued { TEXT } else { TEXT_STRONG };
+    let separator_style = Style::default().fg(if subdued { MUTED } else { DIM });
+    Line::from(vec![
+        Span::styled(
+            "ZEX",
+            Style::default()
+                .fg(if subdued { DIM } else { ACCENT })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(separator, separator_style),
+        Span::styled(
+            model,
+            Style::default()
+                .fg(strong)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Span::styled(separator, separator_style),
+        Span::styled(
+            thinking.to_owned(),
+            Style::default()
+                .fg(strong)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Span::styled(separator, separator_style),
+        Span::styled(context.to_owned(), Style::default().fg(DIM)),
+    ])
 }
 
 fn model_short_name(model: &str) -> String {
@@ -3102,8 +3514,8 @@ fn statusline_state_label(status: Status) -> &'static str {
     }
 }
 
-fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &App) {
-    let Some(picker) = &app.session_picker else {
+fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
+    let Some(picker) = app.session_picker.clone() else {
         return;
     };
     if viewport.is_empty() {
@@ -3150,8 +3562,17 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &App) {
             .skip(start)
             .take(visible_count)
         {
+            let target = HitTarget::Session(index);
             let selected = index == picker.selected;
-            let background = if selected { SURFACE_RAISED } else { BACKGROUND };
+            let hovered = app.hovered(&target);
+            let armed = app.armed(&target);
+            let background = if selected || armed {
+                SURFACE_RAISED
+            } else if hovered {
+                SURFACE_HOVER
+            } else {
+                BACKGROUND
+            };
             let foreground = TEXT_STRONG;
             let secondary = if selected { TEXT } else { DIM };
             let marker = if selected { "▌" } else { " " };
@@ -3197,19 +3618,36 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &App) {
         }
     }
 
+    if !picker.sessions.is_empty() {
+        let start = picker
+            .selected
+            .saturating_sub(visible_count.saturating_sub(1));
+        for offset in 0..visible_count.min(picker.sessions.len().saturating_sub(start)) {
+            app.register_hit(
+                Rect::new(
+                    area.x,
+                    area.y.saturating_add(2 + offset as u16 * 2),
+                    area.width,
+                    2,
+                ),
+                HitTarget::Session(start + offset),
+            );
+        }
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(picker) = &app.model_picker else {
+fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let Some(picker) = app.model_picker.clone() else {
         return;
     };
     if area.is_empty() {
         return;
     }
     let area = horizontal_inset(area, HORIZONTAL_GUTTER);
-    let active = app.providers.active_model.as_ref();
+    let active = app.providers.active_model.clone();
     let current = active
+        .as_ref()
         .and_then(|target| app.providers.model(target))
         .map(|(provider, model)| format!("{} / {}", provider.display_name, model.display_name))
         .unwrap_or_else(|| "none".to_owned());
@@ -3251,9 +3689,20 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 )));
             }
+            let target = HitTarget::Model(index);
             let selected = index == picker.selected;
-            let current = active.is_some_and(|active| *active == choice.target);
-            let background = if selected { SURFACE_RAISED } else { BACKGROUND };
+            let current = active
+                .as_ref()
+                .is_some_and(|active| *active == choice.target);
+            let hovered = app.hovered(&target);
+            let armed = app.armed(&target);
+            let background = if selected || armed {
+                SURFACE_RAISED
+            } else if hovered {
+                SURFACE_HOVER
+            } else {
+                BACKGROUND
+            };
             let marker = if selected { "▌" } else { " " };
             let current_marker = if current { "●" } else { " " };
             let thinking = choice.thinking.summary();
@@ -3302,11 +3751,26 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     }
 
+    let mut y = area.y.saturating_add(2);
+    let mut provider = "";
+    for (index, choice) in picker.choices.iter().enumerate() {
+        if choice.provider_name != provider {
+            if !provider.is_empty() {
+                y = y.saturating_add(1);
+            }
+            provider = &choice.provider_name;
+            y = y.saturating_add(1);
+        }
+        if y < area.bottom() {
+            app.register_hit(Rect::new(area.x, y, area.width, 1), HitTarget::Model(index));
+        }
+        y = y.saturating_add(1);
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(editor) = &app.provider_editor else {
+fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let Some(editor) = app.provider_editor.clone() else {
         return;
     };
     if area.is_empty() {
@@ -3350,7 +3814,13 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )));
     } else {
         for (index, provider) in editor.draft.providers.iter().enumerate() {
+            let target = HitTarget::Provider {
+                pane: ProviderPane::Providers,
+                index,
+            };
             let selected = index == editor.provider_selected;
+            let hovered = app.hovered(&target);
+            let armed = app.armed(&target);
             provider_lines.push(
                 Line::from(vec![
                     Span::styled(
@@ -3366,8 +3836,10 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     ),
                 ])
                 .style(Style::default().bg(
-                    if selected && editor.pane == ProviderPane::Providers {
+                    if (selected && editor.pane == ProviderPane::Providers) || armed {
                         SURFACE_RAISED
+                    } else if hovered {
+                        SURFACE_HOVER
                     } else {
                         BACKGROUND
                     },
@@ -3410,6 +3882,19 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
+    for index in 0..editor.draft.providers.len() {
+        let y = left.y.saturating_add(2 + index as u16);
+        if y < left.bottom() {
+            app.register_hit(
+                Rect::new(left.x, y, left.width.saturating_sub(1), 1),
+                HitTarget::Provider {
+                    pane: ProviderPane::Providers,
+                    index,
+                },
+            );
+        }
+    }
+
     let detail_active = editor.pane == ProviderPane::Details;
     let model_active = editor.pane == ProviderPane::Models;
     let api_key = if provider.api_key.is_empty() {
@@ -3431,7 +3916,13 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     ))];
     for (index, (label, value)) in fields.into_iter().enumerate() {
+        let target = HitTarget::Provider {
+            pane: ProviderPane::Details,
+            index,
+        };
         let selected = detail_active && editor.detail_selected == index;
+        let hovered = app.hovered(&target);
+        let armed = app.armed(&target);
         lines.push(
             Line::from(vec![
                 Span::styled(
@@ -3440,8 +3931,10 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ),
                 Span::styled(single_line(&value, 70), Style::default().fg(TEXT_STRONG)),
             ])
-            .style(Style::default().bg(if selected {
+            .style(Style::default().bg(if selected || armed {
                 SURFACE_RAISED
+            } else if hovered {
+                SURFACE_HOVER
             } else {
                 BACKGROUND
             })),
@@ -3463,7 +3956,13 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )));
     } else {
         for (index, model) in provider.models.iter().enumerate() {
+            let target = HitTarget::Provider {
+                pane: ProviderPane::Models,
+                index,
+            };
             let selected = model_active && editor.model_selected == index;
+            let hovered = app.hovered(&target);
+            let armed = app.armed(&target);
             let capabilities = editor.draft.thinking_capabilities(&ModelRef {
                 provider_id: provider.id.clone(),
                 model_id: model.id.clone(),
@@ -3495,8 +3994,10 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         Style::default().fg(DIM),
                     ),
                 ])
-                .style(Style::default().bg(if selected {
+                .style(Style::default().bg(if selected || armed {
                     SURFACE_RAISED
+                } else if hovered {
+                    SURFACE_HOVER
                 } else {
                     BACKGROUND
                 })),
@@ -3542,6 +4043,31 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(DIM),
             )),
         ]);
+    }
+    for index in 0..ProviderField::COUNT {
+        let y = right.y.saturating_add(1 + index as u16);
+        if y < right.bottom() {
+            app.register_hit(
+                Rect::new(right.x, y, right.width, 1),
+                HitTarget::Provider {
+                    pane: ProviderPane::Details,
+                    index,
+                },
+            );
+        }
+    }
+    let models_y = right.y.saturating_add(8);
+    for index in 0..provider.models.len() {
+        let y = models_y.saturating_add(index as u16);
+        if y < right.bottom() {
+            app.register_hit(
+                Rect::new(right.x, y, right.width, 1),
+                HitTarget::Provider {
+                    pane: ProviderPane::Models,
+                    index,
+                },
+            );
+        }
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), right);
 }
@@ -3650,8 +4176,9 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
-    let text = transcript_text(app, area.width as usize);
-    let paragraph = Paragraph::new(text)
+    app.register_hit(area, HitTarget::Transcript);
+    let transcript = transcript_text(app, area.width as usize);
+    let paragraph = Paragraph::new(transcript.text)
         .style(Style::default().fg(TEXT))
         .wrap(Wrap { trim: false });
     let line_count = paragraph.line_count(area.width.max(1));
@@ -3665,6 +4192,31 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     let paragraph = paragraph.scroll((app.scroll_top.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, area);
+    for (index, line) in transcript.card_lines {
+        let Some(y) = line
+            .checked_sub(app.scroll_top)
+            .and_then(|line| u16::try_from(line).ok())
+            .filter(|line| *line < area.height)
+            .map(|line| area.y.saturating_add(line))
+        else {
+            continue;
+        };
+        app.register_hit(Rect::new(area.x, y, area.width, 1), HitTarget::Card(index));
+    }
+    for (index, line) in transcript.output_lines {
+        let Some(y) = line
+            .checked_sub(app.scroll_top)
+            .and_then(|line| u16::try_from(line).ok())
+            .filter(|line| *line < area.height)
+            .map(|line| area.y.saturating_add(line))
+        else {
+            continue;
+        };
+        app.register_hit(
+            Rect::new(area.x, y, area.width, 1),
+            HitTarget::ToolOutput(index),
+        );
+    }
 
     if !app.follow_output && app.max_scroll > 0 {
         let indicator = format!(
@@ -3765,7 +4317,7 @@ fn landing_regions(area: Rect, app: &App) -> LandingRegions {
     }
 }
 
-fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.is_empty() {
         return;
     }
@@ -3830,14 +4382,14 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.is_empty() {
         return;
     }
     render_input_frame(frame, area, app);
 }
 
-fn render_landing_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_landing_status(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.is_empty() {
         return;
     }
@@ -3880,7 +4432,7 @@ fn completion_height(app: &App, width: u16) -> u16 {
     }
 }
 
-fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.height == 0 {
         return;
     }
@@ -3896,13 +4448,22 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .take(area.height.saturating_sub(2) as usize)
         .enumerate()
         .map(|(index, command)| {
+            let target = HitTarget::Completion(index);
             let selected = index == app.completion.selected;
+            let hovered = app.hovered(&target);
+            let armed = app.armed(&target);
             let marker = if selected { "›" } else { " " };
             let available = inner_width.saturating_sub(2);
             let wide = available >= usage_width + 2 + 18;
             let command_style = Style::default()
                 .fg(if selected { TEXT_STRONG } else { TEXT })
-                .bg(if selected { SURFACE_RAISED } else { SURFACE })
+                .bg(if selected || armed {
+                    SURFACE_RAISED
+                } else if hovered {
+                    SURFACE_HOVER
+                } else {
+                    SURFACE
+                })
                 .add_modifier(if selected {
                     Modifier::BOLD
                 } else {
@@ -3910,11 +4471,30 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 });
             let marker_style = Style::default()
                 .fg(if selected { ACCENT } else { MUTED })
-                .bg(if selected { SURFACE_RAISED } else { SURFACE });
-            let description_style = Style::default()
-                .fg(if selected { TEXT } else { DIM })
-                .bg(if selected { SURFACE_RAISED } else { SURFACE });
-            let row_style = Style::default().bg(if selected { SURFACE_RAISED } else { SURFACE });
+                .bg(if selected || armed {
+                    SURFACE_RAISED
+                } else if hovered {
+                    SURFACE_HOVER
+                } else {
+                    SURFACE
+                });
+            let description_style =
+                Style::default()
+                    .fg(if selected { TEXT } else { DIM })
+                    .bg(if selected || armed {
+                        SURFACE_RAISED
+                    } else if hovered {
+                        SURFACE_HOVER
+                    } else {
+                        SURFACE
+                    });
+            let row_style = Style::default().bg(if selected || armed {
+                SURFACE_RAISED
+            } else if hovered {
+                SURFACE_HOVER
+            } else {
+                SURFACE
+            });
             if wide {
                 Line::from(vec![
                     Span::styled(format!("{marker} "), marker_style),
@@ -3934,6 +4514,22 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
         })
         .collect::<Vec<_>>();
+    let inner = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(MUTED))
+        .padding(ratatui::widgets::Padding::horizontal(1))
+        .inner(area);
+    for index in 0..matches.len().min(inner.height as usize) {
+        app.register_hit(
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(index as u16),
+                inner.width,
+                1,
+            ),
+            HitTarget::Completion(index),
+        );
+    }
     frame.render_widget(
         Paragraph::new(lines)
             .block(
@@ -3948,8 +4544,16 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn transcript_text(app: &App, width: usize) -> Text<'static> {
+struct TranscriptRender {
+    text: Text<'static>,
+    card_lines: Vec<(usize, usize)>,
+    output_lines: Vec<(usize, usize)>,
+}
+
+fn transcript_text(app: &App, width: usize) -> TranscriptRender {
     let mut lines = Vec::new();
+    let mut card_lines = Vec::new();
+    let mut output_lines = Vec::new();
     for (index, entry) in app.transcript.iter().enumerate() {
         match entry {
             TranscriptEntry::Message { role, content } => {
@@ -3958,6 +4562,7 @@ fn transcript_text(app: &App, width: usize) -> Text<'static> {
             }
             TranscriptEntry::Thinking(thinking) => {
                 if app.show_thinking {
+                    card_lines.push((index, lines.len()));
                     let status = if app.busy
                         && app.status == Status::Thinking
                         && index + 1 == app.transcript.len()
@@ -3973,12 +4578,24 @@ fn transcript_text(app: &App, width: usize) -> Text<'static> {
                         status,
                         level,
                         app.selected_card == Some(index),
+                        app.hovered(&HitTarget::Card(index)),
                         width,
                     );
                 }
             }
             TranscriptEntry::Tool(tool) => {
-                append_tool_lines(&mut lines, tool, app.selected_card == Some(index), width)
+                card_lines.push((index, lines.len()));
+                append_tool_lines(
+                    &mut lines,
+                    tool,
+                    app.selected_card == Some(index),
+                    app.hovered(&HitTarget::Card(index)),
+                    width,
+                );
+                if tool.expanded && tool_output_line_count(&tool.output) > TOOL_OUTPUT_PREVIEW_LINES
+                {
+                    output_lines.push((index, lines.len().saturating_sub(2)));
+                }
             }
             TranscriptEntry::Error {
                 summary,
@@ -4019,21 +4636,31 @@ fn transcript_text(app: &App, width: usize) -> Text<'static> {
         }
     }
 
-    Text::from(lines)
+    TranscriptRender {
+        text: Text::from(lines),
+        card_lines,
+        output_lines,
+    }
 }
 
-fn render_help_page(frame: &mut Frame<'_>, viewport: Rect) {
+fn render_help_page(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
     if viewport.is_empty() {
         return;
     }
 
     let area = horizontal_inset(viewport, HORIZONTAL_GUTTER);
     let inner_width = area.width as usize;
-    let lines = help_lines(inner_width);
+    let lines = help_lines(app, inner_width);
+    for index in 0..command_specs().len() {
+        let y = area.y.saturating_add(1 + index as u16);
+        if y < area.bottom() {
+            app.register_hit(Rect::new(area.x, y, area.width, 1), HitTarget::Help(index));
+        }
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn help_lines(width: usize) -> Vec<Line<'static>> {
+fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let usage_width = command_specs()
         .iter()
         .map(|command| command.usage.len())
@@ -4047,20 +4674,44 @@ fn help_lines(width: usize) -> Vec<Line<'static>> {
                 .fg(TEXT_STRONG)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  Esc close", Style::default().fg(DIM)),
+        Span::styled(
+            "  ↑↓ select · Enter run · Esc close",
+            Style::default().fg(DIM),
+        ),
     ])];
-    lines.extend(command_specs().iter().map(|command| {
+    lines.extend(command_specs().iter().enumerate().map(|(index, command)| {
+        let target = HitTarget::Help(index);
+        let selected = app.help_selected == index;
+        let hovered = app.hovered(&target);
+        let armed = app.armed(&target);
+        let background = if selected || armed {
+            SURFACE_RAISED
+        } else if hovered {
+            SURFACE_HOVER
+        } else {
+            BACKGROUND
+        };
+        let marker = if selected { "▌ " } else { "  " };
         if wide {
             Line::from(vec![
+                Span::styled(marker, Style::default().fg(ACCENT)),
                 Span::styled(
                     format!("{:<usage_width$}", command.usage),
-                    Style::default().fg(ACCENT),
+                    Style::default().fg(if selected { TEXT_STRONG } else { ACCENT }),
                 ),
                 Span::raw("  "),
                 Span::styled(command.description, Style::default().fg(DIM)),
             ])
+            .style(Style::default().bg(background))
         } else {
-            Line::from(Span::styled(command.usage, Style::default().fg(ACCENT)))
+            Line::from(vec![
+                Span::styled(marker, Style::default().fg(ACCENT)),
+                Span::styled(
+                    command.usage,
+                    Style::default().fg(if selected { TEXT_STRONG } else { ACCENT }),
+                ),
+            ])
+            .style(Style::default().bg(background))
         }
     }));
     lines
@@ -4307,12 +4958,15 @@ fn append_thinking_lines(
     status: ThinkingStatus,
     level: ThinkingLevel,
     selected: bool,
+    hovered: bool,
     width: usize,
 ) {
     let fold = if thinking.expanded { "▾" } else { "▸" };
     let rail_color = if selected { ACCENT } else { MUTED };
     let header_style = if selected {
         Style::default().bg(SURFACE_RAISED)
+    } else if hovered {
+        Style::default().bg(SURFACE_HOVER)
     } else {
         Style::default().bg(SURFACE)
     };
@@ -4320,7 +4974,7 @@ fn append_thinking_lines(
         ThinkingStatus::Active => ("active", ACCENT),
         ThinkingStatus::Done => ("done", DIM),
     };
-    let marker = if selected { "›" } else { fold };
+    let marker = fold;
     let mut header = vec![
         Span::styled(format!("{marker} "), Style::default().fg(rail_color)),
         Span::styled(
@@ -4380,6 +5034,7 @@ fn append_tool_lines(
     lines: &mut Vec<Line<'static>>,
     tool: &ToolEntry,
     selected: bool,
+    hovered: bool,
     width: usize,
 ) {
     let fold = if tool.expanded { "▾" } else { "▸" };
@@ -4388,10 +5043,12 @@ fn append_tool_lines(
     let rail_color = if selected { ACCENT } else { MUTED };
     let header_style = if selected {
         Style::default().bg(SURFACE_RAISED)
+    } else if hovered {
+        Style::default().bg(SURFACE_HOVER)
     } else {
         Style::default().bg(SURFACE)
     };
-    let marker = if selected { "›" } else { fold };
+    let marker = fold;
     let result = tool_result(tool);
     let duration = format_duration(elapsed);
     lines.push(
@@ -4460,12 +5117,12 @@ fn append_tool_lines(
         let total_lines = tool_output_line_count(&tool.output);
         let output_state = if !tool.show_full_output && total_lines > TOOL_OUTPUT_PREVIEW_LINES {
             format!(
-                "{}/{} lines · Ctrl+O show all",
+                "{}/{} lines · click for all",
                 TOOL_OUTPUT_PREVIEW_LINES, total_lines
             )
         } else {
             format!(
-                "{} lines · timeout {} · Ctrl+O collapse",
+                "{} lines · timeout {} · click to preview",
                 total_lines,
                 format_duration(tool.timeout)
             )
@@ -4639,11 +5296,19 @@ fn trailing_count_summary(output: &str, marker: &str, label: &str) -> Option<Str
     Some(format!("{} {label}", line.split_whitespace().next()?))
 }
 
-fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.is_empty() {
         return;
     }
-    let border_style = Style::default().fg(Color::Rgb(72, 91, 98)).bg(BACKGROUND);
+    app.register_hit(area, HitTarget::Input);
+    let border = if app.input_focused && !app.page_open() && !app.busy {
+        ACCENT
+    } else if app.hovered(&HitTarget::Input) && !app.page_open() && !app.busy {
+        Color::Rgb(82, 105, 113)
+    } else {
+        Color::Rgb(72, 91, 98)
+    };
+    let border_style = Style::default().fg(border).bg(BACKGROUND);
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
@@ -4804,7 +5469,7 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     let hint = if app.model_picker_open() {
         Line::from(Span::styled(
-            "↑↓/jk select · Enter switch · Esc/q cancel",
+            "↑↓/jk select · Enter/Space switch · click twice · Esc/q cancel",
             Style::default().fg(DIM),
         ))
     } else if app.provider_editor_open() {
@@ -4818,11 +5483,14 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(Span::styled(text, Style::default().fg(DIM)))
     } else if app.session_picker_open() {
         Line::from(Span::styled(
-            "↑↓/jk select · Enter resume · Esc/q cancel",
+            "↑↓/jk select · Enter/Space resume · click twice · Esc/q cancel",
             Style::default().fg(DIM),
         ))
     } else if app.help_open {
-        Line::from(Span::styled("Esc/q return", Style::default().fg(DIM)))
+        Line::from(Span::styled(
+            "↑↓/jk select · Enter/Space run · click twice · Esc/q return",
+            Style::default().fg(DIM),
+        ))
     } else if let Some(toast) = &app.toast {
         Line::from(vec![
             Span::styled("● ", Style::default().fg(toast.color())),
@@ -4835,16 +5503,16 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ))
     } else if app.busy {
         let text = if area.width >= 72 {
-            "Ctrl+C stop · PgUp/PgDn scroll · Ctrl+O cards"
+            "Ctrl+C stop · wheel/PgUp/PgDn scroll · Ctrl+O all cards"
         } else {
             "Ctrl+C stop · PgUp/PgDn scroll"
         };
         Line::from(Span::styled(text, Style::default().fg(DIM)))
     } else {
         let text = if area.width >= 92 {
-            "Enter send · Shift+Enter newline · PgUp/PgDn scroll · Ctrl+O cards · / commands"
+            "Enter send · Shift+Enter newline · wheel scroll · Ctrl+O all cards · / commands"
         } else {
-            "Enter send · PgUp/PgDn scroll · / commands"
+            "Enter send · wheel/PgUp/PgDn scroll · / commands"
         };
         Line::from(Span::styled(text, Style::default().fg(DIM)))
     };
@@ -5164,10 +5832,11 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
-        ACCENT, App, AppContext, BACKGROUND, CommandOutput, ERROR, InputAction, InputBuffer,
-        KeyBurst, ProviderPane, SCROLL_STEP, SURFACE, SURFACE_RAISED, Status, ThinkingEntry,
-        ToolStatus, TranscriptEntry, command_specs, handle_key_event, handle_terminal_event,
-        input_metrics, landing_regions, render, truncate_chars, ui_regions,
+        ACCENT, App, AppContext, BACKGROUND, CommandOutput, ERROR, HitTarget, InputAction,
+        InputBuffer, KeyBurst, ProviderPane, SCROLL_STEP, SURFACE, SURFACE_RAISED, Status,
+        ThinkingEntry, ToolStatus, TranscriptEntry, command_specs, handle_key_event,
+        handle_mouse_event, handle_terminal_event, input_metrics, landing_regions, render,
+        truncate_chars, ui_regions,
     };
     use crate::agent::{AgentEvent, Message, MessageRole};
     use crate::config::{ModelConfig, ModelRef, ProviderCatalog, ProviderConfig, SecretValue};
@@ -5277,6 +5946,19 @@ mod tests {
             modifiers,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
+        }
+    }
+
+    fn mouse(
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
         }
     }
 
@@ -6522,13 +7204,13 @@ mod tests {
         let preview = format!("{}", terminal.backend());
         assert!(preview.contains("line 12"));
         assert!(!preview.contains("line 13"));
-        assert!(preview.contains("12/20 lines · Ctrl+O show all"));
+        assert!(preview.contains("12/20 lines · click for all"));
 
-        app.toggle_selected_tool();
+        app.toggle_selected_tool_output();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let full = format!("{}", terminal.backend());
         assert!(full.contains("line 20"));
-        assert!(full.contains("20 lines · timeout 30.0s · Ctrl+O collapse"));
+        assert!(full.contains("20 lines · timeout 30.0s · click to preview"));
     }
 
     #[test]
@@ -7292,6 +7974,288 @@ mod tests {
         app.scroll_lines_down(SCROLL_STEP);
         assert_eq!(app.scroll_top, 40);
         assert!(app.follow_output);
+    }
+
+    #[test]
+    fn mouse_click_toggles_tool_and_thinking_card_headers() {
+        let mut app = app();
+        app.transcript.extend([
+            TranscriptEntry::Thinking(ThinkingEntry {
+                content: "inspect state".to_owned(),
+                expanded: false,
+            }),
+            TranscriptEntry::Tool(super::ToolEntry {
+                call_id: "tool-1".to_owned(),
+                name: "read".to_owned(),
+                arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+                output: "contents".to_owned(),
+                status: ToolStatus::Done,
+                expanded: false,
+                show_full_output: false,
+                started_at: None,
+                elapsed: Some(Duration::from_millis(10)),
+                timeout: Duration::from_secs(30),
+            }),
+        ]);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let card_hits = app
+            .hit_regions
+            .iter()
+            .filter_map(|region| match region.target {
+                HitTarget::Card(index) => Some((index, region.area)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(card_hits.len(), 2);
+        for (index, area) in card_hits {
+            assert_eq!(
+                handle_mouse_event(
+                    mouse(
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                        area.x,
+                        area.y,
+                    ),
+                    &mut app,
+                    false,
+                ),
+                InputAction::None
+            );
+            match &app.transcript[index] {
+                TranscriptEntry::Thinking(thinking) => assert!(thinking.expanded),
+                TranscriptEntry::Tool(tool) => assert!(tool.expanded),
+                _ => panic!("expected clickable card"),
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_click_selects_then_confirms_completion() {
+        let mut app = app();
+        app.input.insert_str("/");
+        app.refresh_completion();
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let help_index = command_specs()
+            .iter()
+            .position(|command| command.name == "/help")
+            .unwrap();
+        let area = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Completion(help_index))
+            .unwrap()
+            .area;
+
+        let click = mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x,
+            area.y,
+        );
+        assert_eq!(
+            handle_mouse_event(click, &mut app, false),
+            InputAction::None
+        );
+        assert_eq!(app.completion.selected, help_index);
+        assert_eq!(
+            handle_mouse_event(click, &mut app, false),
+            InputAction::Submit("/help".to_owned())
+        );
+    }
+
+    #[test]
+    fn mouse_click_selects_then_confirms_model_and_session_rows() {
+        let mut app = configured_app();
+        app.open_model_picker();
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let area = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Model(1))
+            .unwrap()
+            .area;
+        let click = mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x,
+            area.y,
+        );
+        assert_eq!(
+            handle_mouse_event(click, &mut app, false),
+            InputAction::None
+        );
+        assert_eq!(app.model_picker.as_ref().unwrap().selected, 1);
+        assert!(matches!(
+            handle_mouse_event(click, &mut app, false),
+            InputAction::SwitchModel(ModelRef { model_id, .. }) if model_id == "gpt-4.1-mini"
+        ));
+
+        app.dismiss_model_picker();
+        app.open_session_picker(vec![
+            crate::session::SessionSummary {
+                id: "20260812-121500-cafebabe".to_owned(),
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                message_count: 1,
+                preview: "first".to_owned(),
+            },
+            crate::session::SessionSummary {
+                id: "20260812-131500-deadbeef".to_owned(),
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                message_count: 2,
+                preview: "second".to_owned(),
+            },
+        ]);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let area = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Session(1))
+            .unwrap()
+            .area;
+        let click = mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x,
+            area.y,
+        );
+        assert_eq!(
+            handle_mouse_event(click, &mut app, false),
+            InputAction::None
+        );
+        assert_eq!(app.session_picker.as_ref().unwrap().selected, 1);
+        assert_eq!(
+            handle_mouse_event(click, &mut app, false),
+            InputAction::Resume("20260812-131500-deadbeef".to_owned())
+        );
+    }
+
+    #[test]
+    fn ctrl_o_batches_card_expansion_and_collapse() {
+        let mut app = app();
+        app.transcript.extend([
+            TranscriptEntry::Thinking(ThinkingEntry {
+                content: "inspect state".to_owned(),
+                expanded: false,
+            }),
+            TranscriptEntry::Tool(super::ToolEntry {
+                call_id: "tool-1".to_owned(),
+                name: "read".to_owned(),
+                arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+                output: "contents".to_owned(),
+                status: ToolStatus::Done,
+                expanded: false,
+                show_full_output: false,
+                started_at: None,
+                elapsed: Some(Duration::from_millis(10)),
+                timeout: Duration::from_secs(30),
+            }),
+        ]);
+
+        let ctrl_o = key(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert_eq!(
+            handle_key_event(ctrl_o, &mut app, false, false),
+            InputAction::None
+        );
+        assert!(matches!(
+            &app.transcript[0],
+            TranscriptEntry::Thinking(ThinkingEntry { expanded: true, .. })
+        ));
+        assert!(matches!(
+            &app.transcript[1],
+            TranscriptEntry::Tool(super::ToolEntry { expanded: true, .. })
+        ));
+
+        assert_eq!(
+            handle_key_event(ctrl_o, &mut app, false, false),
+            InputAction::None
+        );
+        assert!(matches!(
+            &app.transcript[0],
+            TranscriptEntry::Thinking(ThinkingEntry {
+                expanded: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            &app.transcript[1],
+            TranscriptEntry::Tool(super::ToolEntry {
+                expanded: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mouse_click_focuses_input_and_statusline_fields_share_actions() {
+        let mut app = configured_app();
+        app.input_focused = false;
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let input = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Input)
+            .unwrap()
+            .area;
+        let think = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::StatusThinking)
+            .unwrap()
+            .area;
+
+        assert_eq!(
+            handle_mouse_event(
+                mouse(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                    input.x,
+                    input.y,
+                ),
+                &mut app,
+                false,
+            ),
+            InputAction::None
+        );
+        assert!(app.input_focused);
+        assert_eq!(
+            handle_mouse_event(
+                mouse(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                    think.x,
+                    think.y,
+                ),
+                &mut app,
+                false,
+            ),
+            InputAction::Submit("/think off".to_owned())
+        );
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let model = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::StatusModel)
+            .unwrap()
+            .area;
+        assert_eq!(
+            handle_mouse_event(
+                mouse(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                    model.x,
+                    model.y,
+                ),
+                &mut app,
+                false,
+            ),
+            InputAction::None
+        );
+        assert!(app.model_picker_open());
     }
 
     #[test]

@@ -183,7 +183,7 @@ TUI 占满 terminal 工作区，但不铺自定义整屏背景。它保持单列
 
 Provider 与模型都可声明 `[thinking]`（`min_level`、`max_level`、可选精确 `supported`、`mode = "effort"`）和 `[compat]`（`supports_reasoning_effort`、`supports_interleaved_thinking`、`reasoning_effort_map`）。合并优先级为安全默认 → models.dev → Provider 手动配置 → 模型手动配置。缺失能力时使用安全范围 `off/low/medium/high`，因此 `xhigh` 和 `max` 会降级到 `high`，不会原样发送未知值。工具调用轮次仅在目标模型声明支持 interleaved thinking 时回传 reasoning；最终回答及不支持该能力的模型历史会在请求层剥离 reasoning，但会话中的可查看内容仍保留。
 
-思考和 tool 卡片共用 Zex 摘要语法。思考卡为 `think · level · active|done · summary`；tool 卡为 `tool · subject · result · duration`，其中 `bash` 显示 `exit N`，`read` 显示行数，`grep` / `glob` 显示匹配数。默认折叠态严格占一行；展开后才显示 input、output、timeout、行数和收起提示。`Ctrl-O` 展开或折叠当前卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 只在状态变化、输入、新事件或 toast 过期时按固定帧率差分重绘。
+思考和 tool 卡片共用 Zex 摘要语法。思考卡为 `think · level · active|done · summary`；tool 卡为 `tool · subject · result · duration`，其中 `bash` 显示 `exit N`，`read` 显示行数，`grep` / `glob` 显示匹配数。默认折叠态严格占一行；点击标题行或选中后按 Enter / Space 可展开或折叠。`Ctrl-O` 批量展开或折叠全部卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 只在状态变化、输入、新事件或 toast 过期时按固定帧率差分重绘。
 
 | 快捷键 | idle 模式 | turn 运行中 |
 | --- | --- | --- |
@@ -196,7 +196,8 @@ Provider 与模型都可声明 `[thinking]`（`min_level`、`max_level`、可选
 | Home / End | 跳到历史顶部 / 底部 | 跳到历史顶部 / 底部 |
 | Tab / Shift-Tab | 补全打开时接受当前命令；输入为空时选择下一个 / 上一个思考或 tool 卡片 | 选择下一个 / 上一个思考或 tool 卡片 |
 | Up / Down | 补全打开时选择上一项 / 下一项；否则浏览已发送输入并恢复草稿 | — |
-| Ctrl-O | 展开 / 折叠当前思考或 tool 卡片；未选择时作用于最近一条 | 同左 |
+| Space | 激活当前列表项或已选卡片 | 激活已选卡片 |
+| Ctrl-O | 批量展开 / 折叠全部思考和 tool 卡片 | 同左 |
 | Ctrl-E | 展开 / 折叠最近一条错误详情 | 同左 |
 | Ctrl-T | 循环当前模型声明的可用级别并持久化 | — |
 
@@ -367,7 +368,7 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
    cargo run --
    ```
 
-   预期进入 TUI。先输入 `记住数字 37`，再输入 `必须使用 read 读取 Cargo.toml，然后告诉我刚才的数字`。主区应显示两轮单一时间流、默认折叠的 `think · level · state · summary` 卡片，以及默认折叠的 `read · Cargo.toml · N lines · duration` 卡片；底栏应在 `idle`、`thinking`、`running` 间切换，并按 model → think → context → status 显示右侧信息。按 Tab 选择思考或 tool 卡片、按 Ctrl-O 展开详情，再用鼠标滚轮或 PageUp/PageDown 滚动历史。第二轮回答应保留上下文。
+   预期进入 TUI。先输入 `记住数字 37`，再输入 `必须使用 read 读取 Cargo.toml，然后告诉我刚才的数字`。主区应显示两轮单一时间流、默认折叠的 `think · level · state · summary` 卡片，以及默认折叠的 `read · Cargo.toml · N lines · duration` 卡片；底栏应在 `idle`、`thinking`、`running` 间切换，并按 model → think → context → status 显示右侧信息。点击卡片标题可展开/折叠；Tab 选择卡片后可按 Enter / Space 激活；Ctrl-O 批量展开/折叠全部卡片。鼠标滚轮或 PageUp/PageDown 滚动历史。第二轮回答应保留上下文。
 
 6. 验证多行输入与中断：用 Shift-Enter 或 Alt-Enter 输入两行后按 Enter 发送。预期中央输入在固定两行高度内滚动，底栏和主区不跳动。再提交一个会运行较久的请求，并在 `thinking` 或 `running` 状态按 Ctrl-C。预期底部短暂显示 interrupted toast，运行中的 tool 标记为 stopped，状态恢复 `idle`，可立即发送下一条消息。
 
@@ -413,10 +414,10 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 
     1. 输入 `/se`，预期输入框上方只出现 `/sessions` 与说明；Up/Down 选择，Tab 补全，Esc 关闭。
     2. 要求模型连续执行 `git status` 和 `git rev-parse --short HEAD`。预期同一时间流内出现 `bash · git status · exit 0 · duration` 和 `bash · git rev-parse --short HEAD · exit 0 · duration` 两张单行卡片；展开后才显示完整 output、参数和 timeout。
-    3. 按 Tab 选中工具并按 Ctrl-O 展开/折叠。
+    3. 点击工具/思考卡标题展开或折叠；按 Tab 选中卡片后按 Enter / Space 激活；按 Ctrl-O 批量展开/折叠全部卡片。
     4. 输入 `/think high`，再连续按 Ctrl-T。预期状态栏 think 更新，项目 `.zex/config.toml` 写入最新偏好；每次只更新 toast，不向主 feed 追加消息。不支持推理强度的模型显示 `n/a`，不崩溃。
     5. 输入 `/thinking hide` 后提交会返回思考内容的请求。预期不显示思考卡片，但最终回答和 tool 卡片不受影响；输入 `/thinking show` 后新返回的思考内容恢复为默认折叠卡片，配置写入 `hide_thinking_block`。
-    6. 分别打开 `/model`、`/resume`、`/help`、`/provider`，确认页面替换主区、选中态使用统一左侧指示，`/help` 每条命令独占一行；退出后时间流精确回到原滚动位置。
+    6. 分别打开 `/model`、`/resume`、`/help`、`/provider`，确认页面替换主区、选中态使用统一左侧指示，`/help` 每条命令独占一行；点击一行会选中，再点一次或按 Enter / Space 确认。点击输入框恢复输入焦点；点击状态栏 model 打开模型选择器，点击 think 循环级别。退出后时间流精确回到原滚动位置。
 
 ## 模块
 
