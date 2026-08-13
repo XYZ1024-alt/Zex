@@ -688,7 +688,7 @@ fn empty_state_centers_a_large_zex_wordmark_and_focused_prompt_surface() {
 
     assert!(screen.contains(LANDING_LOGO_ROWS[0]));
     assert!(!screen.contains("precision, without noise"));
-    assert!(screen.contains("Ask anything…"));
+    assert!(!screen.contains("Ask anything…"));
     assert!(screen.contains("Enter send"));
     assert!(screen.contains("/ actions"));
     assert!(screen.contains("gpt-5"));
@@ -736,24 +736,38 @@ fn empty_state_centers_a_large_zex_wordmark_and_focused_prompt_surface() {
 }
 
 #[test]
-fn empty_input_places_the_placeholder_under_the_ime_preedit_cursor() {
+fn focused_empty_input_keeps_the_ime_preedit_region_clear() {
     let mut app = app();
     let backend = TestBackend::new(80, 16);
     let mut terminal = Terminal::new(backend).unwrap();
 
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let screen = format!("{}", terminal.backend());
     let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
     let editor_x = regions.card.x + 3;
     let editor_y = regions.card.y + 1;
 
+    assert!(!screen.contains("Ask anything…"));
     terminal
         .backend_mut()
         .assert_cursor_position((editor_x, editor_y));
     assert_eq!(
         terminal.backend().buffer()[(editor_x, editor_y)].symbol(),
-        "A",
-        "the IME preedit cursor should replace the placeholder instead of appearing before it"
+        " ",
+        "IME preedit text needs an empty row so no placeholder suffix remains after it"
     );
+}
+
+#[test]
+fn unfocused_empty_input_displays_the_placeholder() {
+    let mut app = app();
+    app.input_focused = false;
+    let backend = TestBackend::new(80, 16);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+    assert!(format!("{}", terminal.backend()).contains("Ask anything…"));
 }
 
 #[test]
@@ -1037,7 +1051,7 @@ fn clearing_the_timeline_restores_the_landing_layout() {
     assert!(app.landing_visible());
     assert!(screen.contains(LANDING_LOGO_ROWS[0]));
     assert!(!screen.contains("precision, without noise"));
-    assert!(screen.contains("Ask anything…"));
+    assert!(!screen.contains("Ask anything…"));
     assert!(!screen.contains("Inspect the project"));
 }
 

@@ -2636,6 +2636,7 @@ fn render_input_buffer(
         editor_area,
     );
     if app.input.is_empty()
+        && !app.input_focused
         && let Some(placeholder) = placeholder
         && editor_area.width > 0
     {
