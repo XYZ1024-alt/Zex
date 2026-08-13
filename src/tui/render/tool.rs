@@ -267,13 +267,13 @@ pub(in crate::tui) fn tool_detail_line_count(tool: &ToolEntry) -> usize {
 
 fn tool_marker(tool: &ToolEntry) -> &'static str {
     if tool.expanded {
-        return "●";
+        return "◆";
     }
     match tool.status {
-        ToolStatus::Running => "◌",
-        ToolStatus::Done => "●",
-        ToolStatus::Failed => "✗",
-        ToolStatus::Cancelled => "×",
+        ToolStatus::Running => "◇",
+        ToolStatus::Done => "♦",
+        ToolStatus::Failed => "×",
+        ToolStatus::Cancelled => "·",
     }
 }
 

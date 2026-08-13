@@ -23,7 +23,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -54,7 +54,6 @@ const MIN_TRANSCRIPT_HEIGHT: u16 = 2;
 const HORIZONTAL_GUTTER: u16 = 2;
 const MAX_INPUT_ROWS: usize = 5;
 const INPUT_HORIZONTAL_PADDING: u16 = 3;
-const INPUT_VERTICAL_PADDING: u16 = 1;
 const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
