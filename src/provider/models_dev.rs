@@ -17,7 +17,8 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(8);
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelsDevCatalog {
     models: BTreeMap<(String, String), ThinkingCapabilities>,
-    model_providers: BTreeMap<String, BTreeSet<String>>,
+    canonical_models: BTreeMap<String, ThinkingCapabilities>,
+    unqualified_models: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,8 @@ struct ApiProvider {
 
 #[derive(Debug, Deserialize)]
 struct ApiModel {
+    #[serde(default)]
+    id: String,
     reasoning: Option<bool>,
     #[serde(default)]
     reasoning_options: Vec<ReasoningOption>,
@@ -54,18 +57,23 @@ struct ApiModel {
 enum ReasoningOption {
     Effort {
         #[serde(default)]
-        values: Vec<String>,
+        values: Vec<Option<String>>,
     },
     Toggle,
     BudgetTokens {
         #[serde(rename = "min")]
-        _min: Option<u64>,
+        _min: Option<i64>,
         #[serde(rename = "max")]
-        _max: Option<u64>,
+        _max: Option<i64>,
     },
 }
 
 impl ModelsDevCatalog {
+    #[cfg(test)]
+    pub(crate) fn from_json(content: &[u8]) -> Result<Self> {
+        Self::parse(content)
+    }
+
     pub async fn load(
         cache_directory: &Path,
     ) -> (Self, Vec<ModelsDevProviderAlias>, ModelsDevLoad) {
@@ -89,17 +97,20 @@ impl ModelsDevCatalog {
         self.models
             .get(&(provider_id.to_owned(), model_id.to_owned()))
             .cloned()
-            .or_else(|| {
-                let providers = self.model_providers.get(model_id)?;
-                (providers.len() == 1)
-                    .then(|| {
-                        let provider_id = providers.first()?;
-                        self.models
-                            .get(&(provider_id.clone(), model_id.to_owned()))
-                            .cloned()
-                    })
-                    .flatten()
-            })
+            .or_else(|| self.unique_model_capabilities(model_id))
+    }
+
+    fn unique_model_capabilities(&self, model_id: &str) -> Option<ThinkingCapabilities> {
+        let matches = self.unqualified_models.get(model_id).or_else(|| {
+            model_id
+                .rsplit_once('/')
+                .and_then(|(_, id)| self.unqualified_models.get(id))
+        })?;
+        let mut capabilities = matches
+            .iter()
+            .filter_map(|canonical_id| self.canonical_models.get(canonical_id));
+        let first = capabilities.next()?.clone();
+        Some(capabilities.fold(first, merge_capabilities))
     }
 
     pub fn provider_aliases(content: &[u8]) -> Result<Vec<ModelsDevProviderAlias>> {
@@ -121,12 +132,20 @@ impl ModelsDevCatalog {
         for (provider_key, provider) in api {
             let provider_id = provider.id.unwrap_or(provider_key);
             for (model_id, model) in provider.models {
+                let model_aliases = model_aliases(&model_id, &model.id);
                 let capabilities = capabilities_from_model(model);
+                let canonical_id = canonical_model_id(&provider_id, &model_id);
+                for alias in model_aliases {
+                    catalog
+                        .unqualified_models
+                        .entry(alias)
+                        .or_default()
+                        .insert(canonical_id.clone());
+                }
                 catalog
-                    .model_providers
-                    .entry(model_id.clone())
-                    .or_default()
-                    .insert(provider_id.clone());
+                    .canonical_models
+                    .entry(canonical_id)
+                    .or_insert_with(|| capabilities.clone());
                 catalog
                     .models
                     .insert((provider_id.clone(), model_id), capabilities);
@@ -134,6 +153,58 @@ impl ModelsDevCatalog {
         }
         Ok(catalog)
     }
+}
+
+fn canonical_model_id(provider_id: &str, model_id: &str) -> String {
+    model_id
+        .contains('/')
+        .then(|| model_id.to_owned())
+        .unwrap_or_else(|| format!("{provider_id}/{model_id}"))
+}
+
+fn model_aliases(model_key: &str, model_id: &str) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    for value in [model_key, model_id] {
+        aliases.insert(value.to_owned());
+        if let Some((_, unqualified)) = value.rsplit_once('/') {
+            aliases.insert(unqualified.to_owned());
+        }
+    }
+    aliases
+}
+
+fn merge_capabilities(
+    mut merged: ThinkingCapabilities,
+    candidate: &ThinkingCapabilities,
+) -> ThinkingCapabilities {
+    if !candidate.supports_reasoning_effort {
+        return merged;
+    }
+    if !merged.supports_reasoning_effort {
+        return candidate.clone();
+    }
+
+    merged.supported.extend(candidate.supported.iter().copied());
+    merged.supported.sort_unstable();
+    merged.supported.dedup();
+    merged
+        .reasoning_effort_map
+        .extend(candidate.reasoning_effort_map.clone());
+    merged.min_level = merged
+        .supported
+        .iter()
+        .copied()
+        .find(|level| *level != ThinkingLevel::Off)
+        .unwrap_or(ThinkingLevel::Off);
+    merged.max_level = merged
+        .supported
+        .iter()
+        .copied()
+        .rev()
+        .find(|level| *level != ThinkingLevel::Off)
+        .unwrap_or(ThinkingLevel::Off);
+    merged.supports_interleaved_thinking |= candidate.supports_interleaved_thinking;
+    merged
 }
 
 async fn refresh(cache_path: &Path) -> Result<(ModelsDevCatalog, Vec<ModelsDevProviderAlias>)> {
@@ -223,7 +294,7 @@ fn capabilities_from_model(model: ApiModel) -> ThinkingCapabilities {
 
     let mut supported = vec![ThinkingLevel::Off];
     let mut map = BTreeMap::new();
-    for value in values {
+    for value in values.into_iter().flatten() {
         let Some(level) = parse_effort_level(&value) else {
             continue;
         };
@@ -330,7 +401,58 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_a_globally_unique_model_id_only() {
+    fn accepts_negative_budget_token_sentinels() {
+        ModelsDevCatalog::parse(
+            br#"{
+                "nvidia": {
+                    "models": {
+                        "reasoning-model": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "budget_tokens", "min": -1, "max": 32768}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ignores_null_effort_values() {
+        let catalog = ModelsDevCatalog::parse(
+            br#"{
+                "sarvam": {
+                    "models": {
+                        "reasoning-model": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": [null, "low", "medium", "high"]}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            catalog
+                .capabilities("sarvam", "reasoning-model")
+                .unwrap()
+                .available_levels(),
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High
+            ]
+        );
+    }
+
+    #[test]
+    fn falls_back_when_matching_model_capabilities_agree() {
         let catalog = ModelsDevCatalog::parse(
             br#"{
                 "one": {"models": {"unique": {"reasoning": false}}},
@@ -341,7 +463,183 @@ mod tests {
         .unwrap();
 
         assert!(catalog.capabilities("gateway", "unique").is_some());
-        assert!(catalog.capabilities("gateway", "shared").is_none());
+        assert_eq!(
+            catalog
+                .capabilities("gateway", "shared")
+                .unwrap()
+                .available_levels(),
+            vec![ThinkingLevel::Off]
+        );
+    }
+
+    #[test]
+    fn resolves_namespaced_model_ids_when_capabilities_agree() {
+        let catalog = ModelsDevCatalog::parse(
+            br#"{
+                "one": {
+                    "models": {
+                        "openai/gpt-5.4-mini": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}
+                            ]
+                        }
+                    }
+                },
+                "two": {
+                    "models": {
+                        "openai/gpt-5.4-mini": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            catalog
+                .capabilities("gateway", "gpt-5.4-mini")
+                .unwrap()
+                .available_levels(),
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh
+            ]
+        );
+    }
+
+    #[test]
+    fn resolves_namespaced_model_id_despite_provider_specific_variants() {
+        let catalog = ModelsDevCatalog::parse(
+            br#"{
+                "limited": {
+                    "models": {
+                        "gpt-5.4-mini": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["low", "medium", "high"]}
+                            ]
+                        }
+                    }
+                },
+                "one": {
+                    "models": {
+                        "openai/gpt-5.4-mini": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}
+                            ]
+                        }
+                    }
+                },
+                "two": {
+                    "models": {
+                        "openai/gpt-5.4-mini": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            catalog
+                .capabilities("gateway", "openai/gpt-5.4-mini")
+                .unwrap()
+                .max_level,
+            ThinkingLevel::XHigh
+        );
+    }
+
+    #[test]
+    fn merges_namespaced_model_capabilities() {
+        let catalog = ModelsDevCatalog::parse(
+            br#"{
+                "one": {
+                    "models": {
+                        "vendor-a/gpt-5.4-mini": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["low", "medium", "high"]}
+                            ]
+                        }
+                    }
+                },
+                "two": {
+                    "models": {
+                        "vendor-b/gpt-5.4-mini": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["low", "medium", "high", "xhigh"]}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            catalog
+                .capabilities("gateway", "gpt-5.4-mini")
+                .unwrap()
+                .available_levels(),
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh
+            ]
+        );
+    }
+
+    #[test]
+    fn merges_direct_and_namespaced_provider_variants() {
+        let catalog = ModelsDevCatalog::parse(
+            br#"{
+                "limited": {
+                    "models": {
+                        "gpt-5.4-mini": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["minimal", "low", "medium", "high"]}
+                            ]
+                        }
+                    }
+                },
+                "extended": {
+                    "models": {
+                        "openai/gpt-5.4-mini": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["none", "low", "medium", "high", "xhigh", "max"]}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            catalog
+                .capabilities("gateway", "gpt-5.4-mini")
+                .unwrap()
+                .available_levels(),
+            ThinkingLevel::ALL
+        );
     }
 
     #[test]

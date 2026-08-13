@@ -1098,6 +1098,69 @@ max = "max"
         );
     }
 
+    #[test]
+    fn custom_provider_uses_namespaced_models_dev_capabilities() {
+        let mut catalog = super::ProviderCatalog {
+            models_dev: crate::provider::ModelsDevCatalog::from_json(
+                br#"{
+                    "gateway-one": {
+                        "models": {
+                            "openai/gpt-5.4-mini": {
+                                "reasoning": true,
+                                "reasoning_options": [
+                                    {"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}
+                                ]
+                            }
+                        }
+                    },
+                    "gateway-two": {
+                        "models": {
+                            "openai/gpt-5.4-mini": {
+                                "reasoning": true,
+                                "reasoning_options": [
+                                    {"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}
+                                ]
+                            }
+                        }
+                    }
+                }"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        catalog.providers.push(super::ProviderConfig {
+            id: "custom".to_owned(),
+            display_name: "Custom".to_owned(),
+            base_url: "https://example.com/v1".to_owned(),
+            api_key: super::SecretValue::new("secret".to_owned()),
+            openai_api: crate::provider::OpenAiApi::Responses,
+            thinking: None,
+            compat: None,
+            models: vec![super::ModelConfig {
+                id: "gpt-5.4-mini".to_owned(),
+                display_name: "GPT-5.4 mini".to_owned(),
+                thinking: None,
+                compat: None,
+            }],
+        });
+
+        assert_eq!(
+            catalog
+                .thinking_capabilities(&super::ModelRef {
+                    provider_id: "custom".to_owned(),
+                    model_id: "gpt-5.4-mini".to_owned(),
+                })
+                .available_levels(),
+            vec![
+                crate::provider::ThinkingLevel::Off,
+                crate::provider::ThinkingLevel::Low,
+                crate::provider::ThinkingLevel::Medium,
+                crate::provider::ThinkingLevel::High,
+                crate::provider::ThinkingLevel::XHigh
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn relative_session_directory_is_resolved_from_project() {
         let _environment = EnvGuard::clear();

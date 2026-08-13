@@ -4741,6 +4741,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn model_picker_renders_models_dev_namespaced_thinking_levels() {
+        let mut app = configured_app();
+        app.providers.models_dev = crate::provider::ModelsDevCatalog::from_json(
+            br#"{
+                "gateway-one": {
+                    "models": {
+                        "openai/gpt-5.4-mini": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}
+                            ]
+                        }
+                    }
+                },
+                "gateway-two": {
+                    "models": {
+                        "openai/gpt-5.4-mini": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        app.providers.providers[0].models.push(ModelConfig {
+            id: "gpt-5.4-mini".to_owned(),
+            display_name: "GPT-5.4 mini".to_owned(),
+            thinking: None,
+            compat: None,
+        });
+        app.open_model_picker();
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+
+        assert!(screen.contains("GPT-5.4 mini"));
+        assert!(screen.contains("think off/low/medium/high/xhigh"));
+    }
+
+    #[test]
+    fn model_picker_renders_merged_xhigh_and_max_levels() {
+        let mut app = configured_app();
+        app.providers.models_dev = crate::provider::ModelsDevCatalog::from_json(
+            br#"{
+                "limited": {
+                    "models": {
+                        "gpt-5.6-sol": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["low", "medium", "high"]}
+                            ]
+                        }
+                    }
+                },
+                "extended": {
+                    "models": {
+                        "openai/gpt-5.6-sol": {
+                            "reasoning": true,
+                            "reasoning_options": [
+                                {"type": "effort", "values": ["none", "low", "medium", "high", "xhigh", "max"]}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        app.providers.providers[0].models.push(ModelConfig {
+            id: "gpt-5.6-sol".to_owned(),
+            display_name: "GPT-5.6 Sol".to_owned(),
+            thinking: None,
+            compat: None,
+        });
+        app.open_model_picker();
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+
+        assert!(screen.contains("GPT-5.6 Sol"));
+        assert!(screen.contains("think off/low/medium/high/xhigh/max"));
+    }
+
     #[tokio::test]
     async fn model_switch_persists_and_updates_agent_status_without_touching_transcript() {
         let root = std::env::temp_dir().join(format!(
