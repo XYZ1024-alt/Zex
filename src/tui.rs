@@ -445,6 +445,7 @@ where
         tokio::select! {
             _ = redraw.tick() => {
                 dirty |= app.expire_toast(Instant::now());
+                dirty |= app.busy;
                 if dirty {
                     terminal
                         .draw(|frame| render(frame, app))
@@ -928,8 +929,10 @@ fn handle_key_event(
             return InputAction::None;
         }
         KeyCode::Esc => {
-            return if app.cancel_ui_layer() || turn_active {
+            return if app.cancel_ui_layer() {
                 InputAction::None
+            } else if turn_active {
+                InputAction::Interrupt
             } else {
                 InputAction::Quit
             };
@@ -1421,6 +1424,7 @@ struct App {
     help_selected: usize,
     status: Status,
     busy: bool,
+    turn_started: Option<Instant>,
     scroll_top: usize,
     max_scroll: usize,
     transcript_page_height: usize,
@@ -1469,6 +1473,7 @@ impl App {
             help_selected: 0,
             status: Status::Idle,
             busy: false,
+            turn_started: None,
             scroll_top: 0,
             max_scroll: 0,
             transcript_page_height: 1,
@@ -1592,6 +1597,7 @@ impl App {
         self.help_open = false;
         self.input_focused = false;
         self.busy = true;
+        self.turn_started = Some(Instant::now());
         self.status = Status::Thinking;
         self.scroll_to_bottom();
     }
@@ -1602,6 +1608,7 @@ impl App {
 
     fn finish_turn(&mut self, status: Status) {
         self.busy = false;
+        self.turn_started = None;
         self.active_tools.clear();
         self.status = status;
     }
@@ -3129,8 +3136,58 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         let completion = align_with_footer_input(regions.completion, regions.footer);
         render_completion(frame, completion, app);
     }
+    render_working_line(frame, regions.working, app);
     render_footer(frame, regions.footer, app);
     render_keymap(frame, regions.keymap, app);
+}
+
+fn render_working_line(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.is_empty() || !app.busy {
+        return;
+    }
+    let area = content_area(area);
+    if area.is_empty() {
+        return;
+    }
+    const FULL: &str = "Working... (Esc)";
+    const COMPACT: &str = "Working...";
+    let text = if area.width as usize >= FULL.chars().count() + 2 {
+        FULL
+    } else {
+        COMPACT
+    };
+    let elapsed = app
+        .turn_started
+        .map(|started| started.elapsed().as_secs_f32())
+        .unwrap_or(0.0);
+    frame.render_widget(
+        Paragraph::new(working_shimmer_line(text, elapsed)),
+        area,
+    );
+}
+
+fn working_shimmer_line(text: &str, elapsed_secs: f32) -> Line<'static> {
+    const BAND: f32 = 4.0;
+    const PERIOD_SECS: f32 = 1.0;
+    let len = text.chars().count() as f32;
+    let progress = (elapsed_secs % PERIOD_SECS) / PERIOD_SECS;
+    let center = progress * (len + BAND * 2.0) - BAND;
+    let spans = text
+        .chars()
+        .enumerate()
+        .map(|(index, ch)| {
+            let distance = (index as f32 - center).abs();
+            let style = if distance > BAND / 2.0 {
+                Style::default().fg(DIM)
+            } else if distance <= 1.0 {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(ACCENT)
+            };
+            Span::styled(ch.to_string(), style)
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -4076,12 +4133,14 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 struct UiRegions {
     transcript: Rect,
     completion: Rect,
+    working: Rect,
     footer: Rect,
     keymap: Rect,
 }
 
 fn ui_regions(area: Rect, app: &App) -> UiRegions {
     let keymap_height = u16::from(area.height >= 3);
+    let working_height = u16::from(app.busy && area.height >= 8);
     let requested_input_rows = if app.busy || app.page_open() {
         1
     } else {
@@ -4096,18 +4155,23 @@ fn ui_regions(area: Rect, app: &App) -> UiRegions {
     let preferred_footer_height = (requested_input_rows as u16).saturating_add(3);
     let footer_height = if area.height
         >= keymap_height
+            .saturating_add(working_height)
             .saturating_add(MIN_TRANSCRIPT_HEIGHT)
             .saturating_add(4)
     {
         preferred_footer_height.min(
             area.height
                 .saturating_sub(keymap_height)
+                .saturating_sub(working_height)
                 .saturating_sub(MIN_TRANSCRIPT_HEIGHT),
         )
     } else {
-        area.height.saturating_sub(keymap_height).min(3)
+        area.height
+            .saturating_sub(keymap_height)
+            .saturating_sub(working_height)
+            .min(3)
     };
-    let fixed_height = footer_height + keymap_height;
+    let fixed_height = footer_height + keymap_height + working_height;
     let remaining = area.height.saturating_sub(fixed_height);
     let transcript_reserve = MIN_TRANSCRIPT_HEIGHT.min(remaining);
     let completion_width = footer_input_width(area.width);
@@ -4115,11 +4179,12 @@ fn ui_regions(area: Rect, app: &App) -> UiRegions {
         completion_height(app, completion_width).min(remaining.saturating_sub(transcript_reserve));
     let transcript_height = remaining.saturating_sub(completion_height);
 
-    let [transcript, completion, footer, keymap] = Layout::default()
+    let [transcript, completion, working, footer, keymap] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(transcript_height),
             Constraint::Length(completion_height),
+            Constraint::Length(working_height),
             Constraint::Length(footer_height),
             Constraint::Length(keymap_height),
         ])
@@ -4128,6 +4193,7 @@ fn ui_regions(area: Rect, app: &App) -> UiRegions {
     UiRegions {
         transcript,
         completion,
+        working,
         footer,
         keymap,
     }
@@ -4961,7 +5027,7 @@ fn append_thinking_lines(
     hovered: bool,
     width: usize,
 ) {
-    let fold = if thinking.expanded { "▾" } else { "▸" };
+    let fold = if thinking.expanded { "▼" } else { "▶" };
     let rail_color = if selected { ACCENT } else { MUTED };
     let header_style = if selected {
         Style::default().bg(SURFACE_RAISED)
@@ -4978,7 +5044,7 @@ fn append_thinking_lines(
     let mut header = vec![
         Span::styled(format!("{marker} "), Style::default().fg(rail_color)),
         Span::styled(
-            pad_display("think", 8),
+            pad_display("thinking", 8),
             Style::default()
                 .fg(TEXT_STRONG)
                 .add_modifier(Modifier::BOLD),
@@ -5037,7 +5103,7 @@ fn append_tool_lines(
     hovered: bool,
     width: usize,
 ) {
-    let fold = if tool.expanded { "▾" } else { "▸" };
+    let fold = if tool.expanded { "▼" } else { "▶" };
     let subject = tool_subject(tool);
     let elapsed = tool_elapsed(tool);
     let rail_color = if selected { ACCENT } else { MUTED };
@@ -5503,9 +5569,9 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ))
     } else if app.busy {
         let text = if area.width >= 72 {
-            "Ctrl+C stop · wheel/PgUp/PgDn scroll · Ctrl+O all cards"
+            "Esc stop · wheel/PgUp/PgDn scroll · Ctrl+O all cards"
         } else {
-            "Ctrl+C stop · PgUp/PgDn scroll"
+            "Esc stop · PgUp/PgDn scroll"
         };
         Line::from(Span::styled(text, Style::default().fg(DIM)))
     } else {
@@ -6767,7 +6833,8 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let thinking = format!("{}", terminal.backend());
         assert!(thinking.contains("thinking"));
-        assert!(thinking.contains("Ctrl+C stop"));
+        assert!(thinking.contains("Working..."));
+        assert!(thinking.contains("Esc stop"));
 
         app.apply_agent_event(AgentEvent::ToolStart {
             call_id: "call-running".to_owned(),
@@ -6783,7 +6850,7 @@ mod tests {
                 .lines()
                 .any(|row| row.contains("read") && row.contains("Cargo.toml"))
         );
-        assert!(running.contains("Ctrl+C stop"));
+        assert!(running.contains("Esc stop"));
     }
 
     #[test]
@@ -8858,7 +8925,8 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
-        assert!(screen.contains("Ctrl+C stop"));
+        assert!(screen.contains("Working..."));
+        assert!(screen.contains("Esc stop"));
         assert!(screen.lines().any(|row| {
             row.contains("bash") && row.contains("git status") && row.contains("running")
         }));
