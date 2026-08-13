@@ -53,7 +53,7 @@ const MAX_INPUT_HISTORY: usize = 100;
 const MIN_TRANSCRIPT_HEIGHT: u16 = 2;
 const HORIZONTAL_GUTTER: u16 = 2;
 const MAX_INPUT_ROWS: usize = 5;
-const INPUT_HORIZONTAL_PADDING: u16 = 3;
+const INPUT_HORIZONTAL_PADDING: u16 = 4;
 const INPUT_VERTICAL_PADDING: u16 = 1;
 const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
@@ -71,12 +71,10 @@ const ACCENT_PRIMARY: Color = Color::Rgb(122, 162, 247); // #7AA2F7
 const ACCENT_SECONDARY: Color = Color::Rgb(187, 154, 247); // #BB9AF7
 const OK: Color = Color::Rgb(158, 206, 106); // #9ECE6A
 const BAD: Color = Color::Rgb(219, 75, 75); // #DB4B4B
-const LANDING_LOGO_ROWS: [&str; 5] = [
-    "█████ █████ ██ ██",
-    "   ██ ██     ███ ",
-    "  ██  ████    █  ",
-    " ██   ██     ███ ",
-    "█████ █████ ██ ██",
+const LANDING_LOGO_ROWS: [&str; 3] = [
+    "██████    ██████    ██  ██",
+    "   ██     ████       ████ ",
+    "██████    ██████    ██  ██",
 ];
 const LANDING_LOGO_DARK: Color = Color::Rgb(82, 82, 82);
 
@@ -900,6 +898,16 @@ fn handle_key_event(
         };
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+        if !turn_active {
+            app.help_open = true;
+            app.help_selected = 0;
+            app.input_focused = false;
+            app.completion.dismissed = true;
+        }
+        return InputAction::None;
+    }
+
     if app.session_picker_open() && !turn_active {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => app.select_session(true),
@@ -1108,25 +1116,6 @@ enum Status {
     RunningTool,
     Cancelling,
     Error,
-}
-
-impl Status {
-    fn color(self) -> Color {
-        match self {
-            Self::Idle => OK,
-            Self::Thinking | Self::RunningTool | Self::Cancelling => ACCENT_PRIMARY,
-            Self::Error => BAD,
-        }
-    }
-
-    fn symbol(self) -> &'static str {
-        match self {
-            Self::Idle => "●",
-            Self::Thinking | Self::RunningTool => "◌",
-            Self::Cancelling => "◍",
-            Self::Error => "×",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3406,9 +3395,7 @@ use render::{
 };
 
 #[cfg(test)]
-use render::{
-    align_with_footer_input, input_metrics, landing_regions, ui_regions, working_shimmer_line,
-};
+use render::{align_with_footer_input, input_metrics, landing_regions, ui_regions};
 
 struct TerminalSession {
     terminal: DefaultTerminal,

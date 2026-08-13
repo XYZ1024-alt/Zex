@@ -4,7 +4,7 @@ pub(super) fn append_tool_lines(
     lines: &mut Vec<Line<'static>>,
     tool: &ToolEntry,
     selected: bool,
-    hovered: bool,
+    _hovered: bool,
     width: usize,
 ) {
     let marker = tool_marker(tool);
@@ -15,28 +15,18 @@ pub(super) fn append_tool_lines(
     } else {
         tool_result_color(tool)
     };
-    let header_style = if selected {
-        Style::default().bg(SURFACE_RAISED)
-    } else if hovered {
-        Style::default().bg(SURFACE_HOVER)
-    } else {
-        Style::default().bg(SURFACE)
-    };
     let result = tool_result(tool);
     let duration = format_duration(elapsed);
-    lines.push(
-        tool_header_line(
-            marker,
-            &tool.name,
-            &subject,
-            &result,
-            &duration,
-            marker_color,
-            tool_result_color(tool),
-            width,
-        )
-        .style(header_style),
-    );
+    lines.push(tool_header_line(
+        marker,
+        &tool.name,
+        &subject,
+        &result,
+        &duration,
+        marker_color,
+        tool_result_color(tool),
+        width,
+    ));
 
     if tool.expanded {
         let rail_style = Style::default().fg(marker_color);
@@ -44,7 +34,6 @@ pub(super) fn append_tool_lines(
         let body_style = Style::default().fg(TEXT);
         let added_style = Style::default().fg(OK);
         let removed_style = Style::default().fg(BAD);
-        let card_bg = Style::default().bg(SURFACE);
         let failed = tool_result_color(tool) == BAD;
         let arguments = serde_json::from_str::<Value>(&tool.arguments).ok();
         let param_key = match tool.name.as_str() {
@@ -73,7 +62,7 @@ pub(super) fn append_tool_lines(
         let mut push = |spans: Vec<Span<'static>>| {
             let mut row = vec![Span::styled("  │ ", rail_style)];
             row.extend(spans);
-            lines.push(Line::from(row).style(card_bg));
+            lines.push(Line::from(row));
         };
 
         if edit_diff.is_some() {
@@ -154,13 +143,10 @@ pub(super) fn append_tool_lines(
         } else {
             format!("timeout {}", format_duration(tool.timeout))
         };
-        lines.push(
-            Line::from(vec![
-                Span::styled("  └ ", rail_style),
-                Span::styled(footer, label_style),
-            ])
-            .style(card_bg),
-        );
+        lines.push(Line::from(vec![
+            Span::styled("  └ ", rail_style),
+            Span::styled(footer, label_style),
+        ]));
     }
 }
 

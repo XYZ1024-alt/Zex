@@ -9,7 +9,6 @@ use super::{
     SCROLL_STEP, SURFACE, SURFACE_RAISED, Status, TEXT_DIM, ThinkingEntry, ToolStatus,
     TranscriptEntry, command_specs, handle_key_event, handle_mouse_event, handle_terminal_event,
     input_metrics, landing_regions, render, sanitize_terminal_text, truncate_chars, ui_regions,
-    working_shimmer_line,
 };
 use crate::agent::{AgentEvent, Message, MessageRole};
 use crate::config::{ModelConfig, ModelRef, ProviderCatalog, ProviderConfig, SecretValue};
@@ -250,7 +249,6 @@ fn statusline_prefers_model_think_and_context_as_width_shrinks() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let narrow = format!("{}", terminal.backend());
-    assert!(narrow.contains("gpt-5.6-sol"));
     assert!(narrow.contains("high"));
     assert!(narrow.contains("49.1%/120K"));
     assert!(!narrow.contains("feature/statusline-polish"));
@@ -272,7 +270,7 @@ fn thinking_statusline_hides_stale_rate_and_keeps_input_frame_empty() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
     let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 100, 18), &app);
-    assert!(screen.contains("thinking"));
+    assert!(screen.contains("Working"));
     assert!(!screen.contains("42.7 tok/s"));
     assert!(!screen.contains("processing turn"));
     assert_eq!(
@@ -690,11 +688,11 @@ fn empty_state_centers_the_zex_card_and_keeps_status_quiet() {
 
     assert!(screen.contains(LANDING_LOGO_ROWS[0]));
     assert!(!screen.contains("Z  E  X"));
-    assert!(screen.contains("Ask anything..."));
+    assert!(screen.contains("Ask anything…"));
     assert!(screen.contains("Enter send"));
     assert!(screen.contains("/ actions"));
     assert!(screen.contains("gpt-5"));
-    assert!(screen.contains("ZEX / high"));
+    assert!(screen.contains("ZEX · high"));
     assert!(!screen.contains("25.0%/120Kc"));
     assert!(screen.contains("D:/workspaces/zex"));
     assert!(screen.contains(env!("CARGO_PKG_VERSION")));
@@ -705,27 +703,27 @@ fn empty_state_centers_the_zex_card_and_keeps_status_quiet() {
     assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
     assert!(regions.card.y > 4);
     assert!(regions.card.bottom() < regions.status.y);
-    assert_eq!(regions.card.width, 55);
-    assert_eq!(regions.card.height, 5);
+    assert_eq!(regions.card.width, 65);
+    assert_eq!(regions.card.height, 8);
     assert_eq!(
         terminal.backend().buffer()[(regions.card.x, regions.card.y)].symbol(),
-        "▌"
+        " "
     );
     assert_eq!(
         style_at(&terminal, regions.card.x + 1, regions.card.y).bg,
         Some(SURFACE)
     );
     assert_eq!(
-        terminal.backend().buffer()[(regions.card.x + 4, regions.card.y)].symbol(),
-        " "
+        terminal.backend().buffer()[(regions.card.x + 3, regions.card.y + 1)].symbol(),
+        "━"
     );
     assert_eq!(
         terminal.backend().buffer()[(regions.card.x + 4, regions.card.y + 1)].symbol(),
-        " "
+        "━"
     );
     assert_eq!(
         style_at(&terminal, regions.card.x + 4, regions.card.bottom() - 2).fg,
-        Some(ACCENT_PRIMARY)
+        Some(super::TEXT_STRONG)
     );
     let logo_x = regions.brand.x
         + regions
@@ -735,7 +733,7 @@ fn empty_state_centers_the_zex_card_and_keeps_status_quiet() {
             / 2;
     assert_eq!(
         style_at(&terminal, logo_x, regions.brand.y).fg,
-        Some(super::TEXT_STRONG)
+        Some(LANDING_LOGO_DARK)
     );
     let logo_end = style_at(
         &terminal,
@@ -745,11 +743,11 @@ fn empty_state_centers_the_zex_card_and_keeps_status_quiet() {
     .fg;
     assert_ne!(logo_end, Some(super::TEXT_STRONG));
     assert_ne!(logo_end, Some(LANDING_LOGO_DARK));
-    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let version = format!("ZEX {}", env!("CARGO_PKG_VERSION"));
     let version_x = 100 - version.chars().count() as u16 - super::HORIZONTAL_GUTTER;
     assert_eq!(
         terminal.backend().buffer()[(version_x, regions.status.y)].symbol(),
-        "v"
+        "Z"
     );
 }
 
@@ -761,8 +759,8 @@ fn empty_input_keeps_the_cursor_cell_clear_for_ime_preedit() {
 
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
-    let editor_x = regions.card.x + 4;
-    let editor_y = regions.card.y + 1;
+    let editor_x = regions.card.x + 3;
+    let editor_y = regions.card.y + 3;
 
     terminal
         .backend_mut()
@@ -784,8 +782,8 @@ fn typed_input_starts_at_the_empty_editor_cursor_origin() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
     let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
-    let editor_x = regions.card.x + 4;
-    let editor_y = regions.card.y + 1;
+    let editor_x = regions.card.x + 3;
+    let editor_y = regions.card.y + 3;
 
     assert!(screen.contains("hello"));
     assert!(!screen.contains("Ask anything..."));
@@ -813,6 +811,97 @@ fn empty_layout_remains_composed_across_terminal_sizes() {
         assert!(regions.status.bottom() <= area.bottom());
         assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
     }
+}
+
+#[test]
+fn work_content_uses_contiguous_panel_backgrounds() {
+    let mut app = app();
+    app.apply_agent_event(AgentEvent::MessageDelta {
+        role: MessageRole::User,
+        delta: "Inspect this repository".to_owned(),
+    });
+    app.apply_agent_event(AgentEvent::MessageDelta {
+        role: MessageRole::Assistant,
+        delta: "I will check the project.\n- read the manifest\n- summarize it".to_owned(),
+    });
+    app.apply_agent_event(AgentEvent::ToolStart {
+        call_id: "call-panel".to_owned(),
+        name: "read".to_owned(),
+        arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+        timeout: Duration::from_secs(30),
+    });
+    app.apply_agent_event(AgentEvent::ToolEnd {
+        call_id: "call-panel".to_owned(),
+        name: "read".to_owned(),
+        output: "line one\nline two".to_owned(),
+        is_error: false,
+        elapsed: Duration::from_millis(8),
+    });
+    let TranscriptEntry::Tool(tool) = &mut app.transcript[2] else {
+        panic!("expected tool");
+    };
+    tool.expanded = true;
+
+    let backend = TestBackend::new(96, 28);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let screen = format!("{}", terminal.backend());
+
+    for needle in [
+        "Inspect this repository",
+        "I will check the project.",
+        "line one",
+    ] {
+        let row = screen
+            .lines()
+            .position(|line| line.contains(needle))
+            .expect("content row should be visible") as u16;
+        let background = style_at(&terminal, super::HORIZONTAL_GUTTER + 4, row).bg;
+        assert!(matches!(background, Some(SURFACE | SURFACE_RAISED)));
+        for x in super::HORIZONTAL_GUTTER..96 - super::HORIZONTAL_GUTTER {
+            assert_eq!(
+                style_at(&terminal, x, row).bg,
+                background,
+                "panel background broke at x={x}, row={row}"
+            );
+        }
+    }
+}
+
+#[test]
+fn footer_is_a_full_input_band_in_idle_and_busy_states() {
+    let mut app = app();
+    app.transcript.push(TranscriptEntry::Message {
+        role: MessageRole::Assistant,
+        content: "Ready.".to_owned(),
+    });
+    let area = ratatui::layout::Rect::new(0, 0, 100, 20);
+    let backend = TestBackend::new(area.width, area.height);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let idle_regions = ui_regions(area, &app);
+    for y in idle_regions.footer.y + 1..idle_regions.footer.bottom() {
+        for x in super::HORIZONTAL_GUTTER..area.width - super::HORIZONTAL_GUTTER {
+            assert_eq!(style_at(&terminal, x, y).bg, Some(SURFACE_RAISED));
+        }
+    }
+    let idle = format!("{}", terminal.backend());
+    assert!(idle.contains("ZEX"));
+    assert!(idle.contains("test-model"));
+    assert!(idle.contains("Ctrl+P commands"));
+
+    app.start_turn();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let busy = format!("{}", terminal.backend());
+    let busy_regions = ui_regions(area, &app);
+    for y in busy_regions.footer.y + 1..busy_regions.footer.bottom() {
+        for x in super::HORIZONTAL_GUTTER..area.width - super::HORIZONTAL_GUTTER {
+            assert_eq!(style_at(&terminal, x, y).bg, Some(SURFACE_RAISED));
+        }
+    }
+    assert!(busy.contains("Esc interrupt"));
+    assert!(busy.contains("Working"));
 }
 
 #[test]
@@ -887,10 +976,10 @@ fn first_turn_switches_to_a_top_anchored_work_timeline() {
         .position(|row| row.contains("Inspect the project"))
         .expect("message should be visible") as u16;
     assert!(!app.landing_visible());
-    assert!(!screen.contains("Ask anything..."));
-    assert!(screen.contains("thinking"));
+    assert!(!screen.contains("Ask anything…"));
+    assert!(screen.contains("Working"));
     assert!(!screen.contains(LANDING_LOGO_ROWS[0]));
-    assert_eq!(message_row, regions.transcript.y);
+    assert_eq!(message_row, regions.transcript.y + 1);
 }
 
 #[test]
@@ -911,7 +1000,7 @@ fn clearing_the_timeline_restores_the_landing_layout() {
     assert!(app.landing_visible());
     assert!(screen.contains(LANDING_LOGO_ROWS[0]));
     assert!(!screen.contains("Z  E  X"));
-    assert!(screen.contains("Ask anything..."));
+    assert!(screen.contains("Ask anything…"));
     assert!(!screen.contains("Inspect the project"));
 }
 
@@ -998,15 +1087,14 @@ fn idle_thinking_and_running_states_are_clear_in_the_footer() {
 
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let idle = format!("{}", terminal.backend());
-    assert!(idle.contains("idle"));
+    assert!(idle.contains("test-model"));
     assert!(idle.contains("Enter send"));
 
     app.start_turn();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let thinking = format!("{}", terminal.backend());
-    assert!(thinking.contains("thinking"));
-    assert!(thinking.contains("Working..."));
-    assert!(thinking.contains("Esc stop"));
+    assert!(thinking.contains("Working"));
+    assert!(thinking.contains("Esc interrupt"));
 
     app.apply_agent_event(AgentEvent::ToolStart {
         call_id: "call-running".to_owned(),
@@ -1022,7 +1110,7 @@ fn idle_thinking_and_running_states_are_clear_in_the_footer() {
             .lines()
             .any(|row| row.contains("read") && row.contains("Cargo.toml"))
     );
-    assert!(running.contains("Esc stop"));
+    assert!(running.contains("Esc interrupt"));
 }
 
 #[test]
@@ -1047,7 +1135,7 @@ fn multiline_input_scrolls_inside_the_stable_footer() {
         assert_eq!(
             terminal.backend().buffer()[(multiline.footer.x + super::HORIZONTAL_GUTTER, y,)]
                 .symbol(),
-            "│"
+            "▎"
         );
     }
 }
@@ -1079,7 +1167,7 @@ fn completion_panel_aligns_with_footer_and_highlights_selection() {
             regions.footer.y + 1,
         )]
             .symbol(),
-        "│"
+        "▎"
     );
     let selected_row = regions.completion.y + 1;
     assert!(
@@ -1321,7 +1409,7 @@ fn completed_turn_status_precedes_the_final_answer() {
     );
     assert!(user_row < tool_row);
     assert!(status_row < answer_row);
-    assert_eq!(answer_row, status_row + 2);
+    assert_eq!(answer_row, status_row + 3);
     assert!(screen.contains("1 tool"));
     assert!(screen.contains("1.2k"));
 }
@@ -1350,7 +1438,7 @@ fn active_turn_renders_running_status_without_system_feed_rows() {
             .lines()
             .any(|row| row.contains("running") && row.contains("1 tool"))
     );
-    assert_eq!(screen.matches("Working...").count(), 1);
+    assert_eq!(screen.matches("Working").count(), 1);
 }
 
 #[test]
@@ -1609,28 +1697,6 @@ fn failed_bash_card_shows_command_and_stderr_sections() {
     assert!(!expanded.contains("stdout:"));
     assert!(!expanded.contains("timeout_seconds"));
     assert!(!expanded.contains('{'));
-}
-
-#[test]
-fn working_shimmer_sweeps_primary_with_a_secondary_tail() {
-    let line = working_shimmer_line("Working... (Esc)", 0.6);
-    let colors: Vec<_> = line.spans.iter().map(|span| span.style.fg).collect();
-    assert!(colors.contains(&Some(ACCENT_PRIMARY)));
-    assert!(colors.contains(&Some(TEXT_DIM)));
-    assert!(
-        colors.iter().any(|color| {
-            matches!(
-                color,
-                Some(Color::Rgb(r, g, b))
-                    if *r > 122 && *r < 187 && *g >= 154 && *g < 162 && *b == 247
-            )
-        }),
-        "tail should blend toward the secondary accent: {colors:?}"
-    );
-
-    let later = working_shimmer_line("Working... (Esc)", 0.7);
-    let later_colors: Vec<_> = later.spans.iter().map(|span| span.style.fg).collect();
-    assert_ne!(colors, later_colors, "the band must move over time");
 }
 
 #[test]
@@ -2629,7 +2695,7 @@ fn resume_picker_renders_short_id_time_preview_count_and_empty_state() {
 }
 
 #[test]
-fn resumed_session_id_is_visible_in_the_footer() {
+fn resumed_session_id_does_not_compete_with_the_input_band() {
     let mut app = app();
     app.session_id = Some("20260812-121500-cafebabe".to_owned());
     app.transcript.push(TranscriptEntry::Message {
@@ -2642,7 +2708,8 @@ fn resumed_session_id_is_visible_in_the_footer() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
 
-    assert!(screen.contains("cafebabe"));
+    assert!(!screen.contains("cafebabe"));
+    assert!(screen.contains("test-model"));
 }
 
 #[test]
@@ -3305,8 +3372,7 @@ fn footer_updates_model_thinking_session_and_status_without_feed_rows() {
 
     assert!(screen.contains("gpt-5"));
     assert!(screen.contains("max"));
-    assert!(screen.contains("cafebabe"));
-    assert!(screen.contains("tool"));
+    assert!(!screen.contains("cafebabe"));
     assert_eq!(app.transcript.len(), transcript_len);
 }
 
@@ -3785,8 +3851,8 @@ fn busy_state_lives_in_the_footer_without_feed_noise() {
 
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
-    assert!(screen.contains("Working..."));
-    assert!(screen.contains("Esc stop"));
+    assert!(screen.contains("Working"));
+    assert!(screen.contains("Esc interrupt"));
     assert!(screen.lines().any(|row| {
         row.contains("bash") && row.contains("git status") && row.contains("running")
     }));
