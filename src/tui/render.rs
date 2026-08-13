@@ -31,6 +31,9 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_working_line(frame, regions.working, app);
     render_footer(frame, regions.footer, app);
     render_keymap(frame, regions.keymap, app);
+    if app.output_panel_open() {
+        render_output_panel(frame, area, app);
+    }
 }
 
 fn render_working_line(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1165,6 +1168,148 @@ fn horizontal_inset(area: Rect, amount: u16) -> Rect {
     }
 }
 
+fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let width = (u32::from(area.width) * u32::from(width_percent) / 100)
+        .clamp(1, u32::from(area.width)) as u16;
+    let height = (u32::from(area.height) * u32::from(height_percent) / 100)
+        .clamp(1, u32::from(area.height)) as u16;
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    )
+}
+
+fn render_output_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    if area.is_empty() {
+        return;
+    }
+    frame
+        .buffer_mut()
+        .set_style(area, Style::default().fg(TEXT_DIM).bg(BACKGROUND));
+
+    let panel_area = centered_rect(area, 84, 82);
+    if panel_area.width < 4 || panel_area.height < 4 {
+        return;
+    }
+    app.register_hit(panel_area, HitTarget::OutputPanel);
+    frame.render_widget(Clear, panel_area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT_PRIMARY))
+            .style(Style::default().bg(SURFACE_RAISED)),
+        panel_area,
+    );
+
+    let inner = Rect::new(
+        panel_area.x + 1,
+        panel_area.y + 1,
+        panel_area.width - 2,
+        panel_area.height - 2,
+    );
+    let [header, content, footer] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+    app.register_hit(
+        Rect::new(header.right().saturating_sub(3), header.y, 3, 1),
+        HitTarget::OutputClose,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "ZEX / ",
+                Style::default()
+                    .fg(ACCENT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("assistant output", Style::default().fg(TEXT_STRONG)),
+        ]))
+        .style(Style::default().bg(SURFACE_RAISED)),
+        header,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "[×]",
+            Style::default()
+                .fg(if app.hovered(&HitTarget::OutputClose) {
+                    TEXT_STRONG
+                } else {
+                    ACCENT_PRIMARY
+                })
+                .bg(SURFACE_RAISED)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Right),
+        header,
+    );
+
+    let (entry_index, requested_scroll) = app
+        .output_panel
+        .map(|panel| (panel.entry_index, panel.scroll_top))
+        .unwrap_or((usize::MAX, 0));
+    let Some(TranscriptEntry::Message {
+        role: MessageRole::Assistant,
+        content: output,
+    }) = app.transcript.get(entry_index)
+    else {
+        return;
+    };
+    let mut lines = Vec::new();
+    append_markdown_lines(
+        &mut lines,
+        output,
+        MessageRole::Assistant,
+        true,
+        content.width.saturating_sub(2) as usize,
+    );
+    let paragraph = Paragraph::new(Text::from(lines))
+        .style(Style::default().fg(TEXT).bg(SURFACE))
+        .wrap(Wrap { trim: false });
+    let line_count = paragraph.line_count(content.width.max(1));
+    let page_height = content.height as usize;
+    let max_scroll = line_count.saturating_sub(page_height);
+    let scroll_top = requested_scroll.min(max_scroll);
+    if let Some(panel) = &mut app.output_panel {
+        panel.page_height = page_height;
+        panel.max_scroll = max_scroll;
+        panel.scroll_top = scroll_top;
+    }
+    frame.render_widget(
+        paragraph.scroll((scroll_top.min(u16::MAX as usize) as u16, 0)),
+        content,
+    );
+
+    let position = if max_scroll == 0 {
+        "full output".to_owned()
+    } else {
+        format!(
+            "{}–{} / {}",
+            scroll_top.saturating_add(1),
+            scroll_top.saturating_add(page_height).min(line_count),
+            line_count
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "↑↓ read · PgUp/PgDn jump · Space page · Esc timeline",
+                Style::default().fg(TEXT_DIM),
+            ),
+            Span::styled(format!("  {position}"), Style::default().fg(TEXT_FAINT)),
+        ]))
+        .style(Style::default().bg(SURFACE_RAISED)),
+        footer,
+    );
+}
+
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.is_empty() {
         app.transcript_page_height = 0;
@@ -1226,6 +1371,21 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         app.register_hit(
             Rect::new(area.x, y, area.width, 1),
             HitTarget::ToolOutput(index),
+        );
+    }
+    for (index, start_line, end_line) in transcript.response_lines {
+        let visible_start = start_line.max(app.scroll_top);
+        let visible_end = end_line.min(app.scroll_top.saturating_add(area.height as usize));
+        if visible_start >= visible_end {
+            continue;
+        }
+        let y = area.y.saturating_add(
+            u16::try_from(visible_start.saturating_sub(app.scroll_top)).unwrap_or(u16::MAX),
+        );
+        let height = u16::try_from(visible_end.saturating_sub(visible_start)).unwrap_or(u16::MAX);
+        app.register_hit(
+            Rect::new(area.x, y, area.width, height),
+            HitTarget::Response(index),
         );
     }
 
@@ -1683,23 +1843,44 @@ struct TranscriptRender {
     text: Text<'static>,
     card_lines: Vec<(usize, usize)>,
     output_lines: Vec<(usize, usize)>,
+    response_lines: Vec<(usize, usize, usize)>,
 }
 
 fn transcript_text(app: &App, width: usize) -> TranscriptRender {
     let mut lines = Vec::new();
     let mut card_lines = Vec::new();
     let mut output_lines = Vec::new();
+    let mut response_lines = Vec::new();
     for (index, entry) in app.transcript.iter().enumerate() {
         let next = app.transcript.get(index + 1);
         match entry {
             TranscriptEntry::Message { role, content } => {
-                let final_answer = *role == MessageRole::Assistant
-                    && index > 0
-                    && matches!(
-                        app.transcript.get(index - 1),
-                        Some(TranscriptEntry::Turn(_))
-                    );
-                append_markdown_lines(&mut lines, content, *role, final_answer, width);
+                let final_answer = app.is_final_answer(index);
+                if final_answer {
+                    let start_line = lines.len();
+                    let selected = app.selected_entry == Some(index);
+                    let hovered = app.hovered(&HitTarget::Response(index));
+                    append_markdown_lines(&mut lines, content, *role, final_answer, width);
+                    if selected || hovered {
+                        let background = if selected {
+                            SURFACE_RAISED
+                        } else {
+                            SURFACE_HOVER
+                        };
+                        for line in &mut lines[start_line..] {
+                            line.style = line.style.bg(background);
+                            if selected {
+                                if let Some(rail) = line.spans.first_mut() {
+                                    rail.content = "▌ ".into();
+                                    rail.style = rail.style.fg(ACCENT_PRIMARY);
+                                }
+                            }
+                        }
+                    }
+                    response_lines.push((index, start_line, lines.len()));
+                } else {
+                    append_markdown_lines(&mut lines, content, *role, final_answer, width);
+                }
             }
             TranscriptEntry::Thinking(thinking) => {
                 if app.show_thinking {
@@ -1718,7 +1899,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                         thinking,
                         status,
                         level,
-                        app.selected_card == Some(index),
+                        app.selected_entry == Some(index),
                         app.hovered(&HitTarget::Card(index)),
                         width,
                     );
@@ -1729,7 +1910,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                 append_tool_lines(
                     &mut lines,
                     tool,
-                    app.selected_card == Some(index),
+                    app.selected_entry == Some(index),
                     app.hovered(&HitTarget::Card(index)),
                     width,
                 );
@@ -1789,6 +1970,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
         text: Text::from(lines),
         card_lines,
         output_lines,
+        response_lines,
     }
 }
 
@@ -2516,10 +2698,12 @@ fn render_input_buffer(
     }
 
     let cursor_y = metrics.cursor_row.saturating_sub(vertical_scroll) as u16;
-    frame.set_cursor_position((
-        editor_area.x + metrics.cursor_column.min(editor_width - 1) as u16,
-        editor_area.y + cursor_y.min(editor_area.height.saturating_sub(1)),
-    ));
+    if app.input_focused && !app.output_panel_open() {
+        frame.set_cursor_position((
+            editor_area.x + metrics.cursor_column.min(editor_width - 1) as u16,
+            editor_area.y + cursor_y.min(editor_area.height.saturating_sub(1)),
+        ));
+    }
 }
 
 fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2571,11 +2755,16 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "Esc stop · PgUp/PgDn scroll"
         };
         Line::from(Span::styled(text, Style::default().fg(TEXT_FAINT)))
+    } else if !app.input_focused && app.selected_entry.is_some() {
+        Line::from(Span::styled(
+            "Tab browse · Enter open/toggle · Space compose · Esc clear",
+            Style::default().fg(TEXT_FAINT),
+        ))
     } else {
         let text = if area.width >= 92 {
-            "Enter send · Shift+Enter newline · wheel scroll · Ctrl+O cards · / commands"
+            "Enter send · Shift+Enter newline · Tab browse · wheel scroll · / commands"
         } else {
-            "Enter send · wheel scroll · / commands"
+            "Enter send · Tab browse · / commands"
         };
         Line::from(Span::styled(text, Style::default().fg(TEXT_FAINT)))
     };

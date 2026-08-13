@@ -613,6 +613,21 @@ fn handle_terminal_event(
 
 fn handle_mouse_event(mouse: MouseEvent, app: &mut App, turn_active: bool) -> InputAction {
     let target = app.hit_target_at(mouse.column, mouse.row);
+    if app.output_panel_open() {
+        match mouse.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                app.hovered = target;
+            }
+            MouseEventKind::ScrollUp => app.scroll_output_lines_up(SCROLL_STEP),
+            MouseEventKind::ScrollDown => app.scroll_output_lines_down(SCROLL_STEP),
+            MouseEventKind::Down(MouseButton::Left) if target == Some(HitTarget::OutputClose) => {
+                app.close_output_panel();
+            }
+            _ => {}
+        }
+        return InputAction::None;
+    }
+
     match mouse.kind {
         MouseEventKind::Moved | MouseEventKind::Drag(_) => {
             app.hovered = target;
@@ -650,8 +665,16 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App, turn_active: bool) -> In
                 Some(HitTarget::ToolOutput(index)) => {
                     app.armed_click = None;
                     app.input_focused = false;
-                    app.selected_card = Some(index);
+                    app.selected_entry = Some(index);
                     app.toggle_selected_tool_output();
+                    InputAction::None
+                }
+                Some(HitTarget::Response(index)) => {
+                    app.input_focused = false;
+                    app.selected_entry = Some(index);
+                    if repeated {
+                        app.open_selected_output();
+                    }
                     InputAction::None
                 }
                 Some(HitTarget::Completion(index)) => {
@@ -750,6 +773,20 @@ fn handle_key_event(
         };
     }
 
+    if app.output_panel_open() {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => app.scroll_output_lines_up(1),
+            KeyCode::Down | KeyCode::Char('j') => app.scroll_output_lines_down(1),
+            KeyCode::PageUp => app.scroll_output_page_up(),
+            KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_output_page_down(),
+            KeyCode::Home | KeyCode::Char('g') => app.scroll_output_to_top(),
+            KeyCode::End | KeyCode::Char('G') => app.scroll_output_to_bottom(),
+            KeyCode::Esc => app.close_output_panel(),
+            _ => {}
+        }
+        return InputAction::None;
+    }
+
     if app.model_picker_open() && !turn_active {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => app.select_model(true),
@@ -832,7 +869,7 @@ fn handle_key_event(
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
         let can_toggle_output = app
-            .selected_card
+            .selected_entry
             .and_then(|index| app.transcript.get(index))
             .is_some_and(|entry| {
                 matches!(
@@ -940,18 +977,14 @@ fn handle_key_event(
         }
         KeyCode::Tab => {
             if app.input.is_empty() {
-                app.select_tool(false);
+                app.select_timeline_entry(false);
             }
             return InputAction::None;
         }
         KeyCode::BackTab => {
             if app.input.is_empty() {
-                app.select_tool(true);
+                app.select_timeline_entry(true);
             }
-            return InputAction::None;
-        }
-        KeyCode::Char(' ') if app.selected_card.is_some() && app.input.is_empty() => {
-            app.toggle_selected_tool();
             return InputAction::None;
         }
         KeyCode::Esc => {
@@ -970,8 +1003,13 @@ fn handle_key_event(
         return InputAction::None;
     }
 
-    if !app.input_focused && app.selected_card.is_some() && key.code == KeyCode::Enter {
-        app.toggle_selected_tool();
+    if !app.input_focused && key.code == KeyCode::Enter {
+        app.activate_selected_entry();
+        return InputAction::None;
+    }
+
+    if !app.input_focused && key.code == KeyCode::Char(' ') {
+        app.focus_input();
         return InputAction::None;
     }
 
@@ -1129,6 +1167,7 @@ enum HitTarget {
     Transcript,
     Card(usize),
     ToolOutput(usize),
+    Response(usize),
     Completion(usize),
     Session(usize),
     Model(usize),
@@ -1137,6 +1176,8 @@ enum HitTarget {
     Input,
     StatusModel,
     StatusThinking,
+    OutputPanel,
+    OutputClose,
 }
 
 impl HitTarget {
@@ -1148,6 +1189,7 @@ impl HitTarget {
                 | Self::Model(_)
                 | Self::Help(_)
                 | Self::Provider { .. }
+                | Self::Response(_)
         )
     }
 }
@@ -1193,6 +1235,14 @@ struct TurnEntry {
     tool_count: usize,
     elapsed: Option<Duration>,
     output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutputPanel {
+    entry_index: usize,
+    scroll_top: usize,
+    max_scroll: usize,
+    page_height: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1460,7 +1510,8 @@ struct App {
     input: InputBuffer,
     active_tools: BTreeMap<String, String>,
     errors: VecDeque<String>,
-    selected_card: Option<usize>,
+    selected_entry: Option<usize>,
+    output_panel: Option<OutputPanel>,
     hovered: Option<HitTarget>,
     armed_click: Option<HitTarget>,
     hit_regions: Vec<HitRegion>,
@@ -1511,7 +1562,8 @@ impl App {
             input: InputBuffer::default(),
             active_tools: BTreeMap::new(),
             errors: VecDeque::new(),
-            selected_card: None,
+            selected_entry: None,
+            output_panel: None,
             hovered: None,
             armed_click: None,
             hit_regions: Vec::new(),
@@ -1875,7 +1927,8 @@ impl App {
         self.transcript.clear();
         self.active_tools.clear();
         self.errors.clear();
-        self.selected_card = None;
+        self.selected_entry = None;
+        self.output_panel = None;
         self.hovered = None;
         self.armed_click = None;
         self.input_focused = true;
@@ -1947,7 +2000,7 @@ impl App {
 
     fn set_show_thinking(&mut self, show_thinking: bool) {
         self.show_thinking = show_thinking;
-        self.selected_card = None;
+        self.selected_entry = None;
         self.show_toast(
             format!(
                 "Thinking cards · {}",
@@ -2020,6 +2073,34 @@ impl App {
         self.scroll_top = self.max_scroll;
     }
 
+    fn is_final_answer(&self, index: usize) -> bool {
+        matches!(
+            self.transcript.get(index),
+            Some(TranscriptEntry::Message {
+                role: MessageRole::Assistant,
+                content,
+            }) if !content.is_empty()
+                && index > 0
+                && matches!(
+                    self.transcript.get(index - 1),
+                    Some(TranscriptEntry::Turn(_))
+                )
+        )
+    }
+
+    fn selectable_entry_indices(&self) -> Vec<usize> {
+        self.transcript
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                TranscriptEntry::Thinking(_) if self.show_thinking => Some(index),
+                TranscriptEntry::Tool(_) => Some(index),
+                TranscriptEntry::Message { .. } if self.is_final_answer(index) => Some(index),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn card_indices(&self) -> Vec<usize> {
         self.transcript
             .iter()
@@ -2032,15 +2113,15 @@ impl App {
             .collect()
     }
 
-    fn select_tool(&mut self, reverse: bool) {
-        let indices = self.card_indices();
+    fn select_timeline_entry(&mut self, reverse: bool) {
+        let indices = self.selectable_entry_indices();
         if indices.is_empty() {
-            self.selected_card = None;
+            self.selected_entry = None;
             return;
         }
 
         let index = self
-            .selected_card
+            .selected_entry
             .and_then(|selected| indices.iter().position(|index| *index == selected));
         let next = match (index, reverse) {
             (Some(0), true) | (None, true) => indices.len() - 1,
@@ -2048,21 +2129,108 @@ impl App {
             (Some(index), false) => (index + 1) % indices.len(),
             (None, false) => 0,
         };
-        self.selected_card = Some(indices[next]);
+        self.selected_entry = Some(indices[next]);
         self.input_focused = false;
     }
 
-    fn toggle_selected_tool(&mut self) {
-        if self.selected_card.is_none() {
-            self.selected_card = self.card_indices().last().copied();
+    fn activate_selected_entry(&mut self) {
+        let Some(selected) = self.selected_entry else {
+            return;
+        };
+        if self.is_final_answer(selected) {
+            self.open_selected_output();
+        } else {
+            self.toggle_card(selected);
         }
-        if let Some(selected) = self.selected_card {
+    }
+
+    fn open_selected_output(&mut self) {
+        let Some(entry_index) = self
+            .selected_entry
+            .filter(|index| self.is_final_answer(*index))
+        else {
+            return;
+        };
+        self.input_focused = false;
+        self.output_panel = Some(OutputPanel {
+            entry_index,
+            scroll_top: 0,
+            max_scroll: 0,
+            page_height: 1,
+        });
+    }
+
+    fn output_panel_open(&self) -> bool {
+        self.output_panel.is_some()
+    }
+
+    fn close_output_panel(&mut self) {
+        self.output_panel = None;
+        self.input_focused = false;
+    }
+
+    fn scroll_output_lines_up(&mut self, lines: usize) {
+        if let Some(panel) = &mut self.output_panel {
+            panel.scroll_top = panel.scroll_top.saturating_sub(lines.max(1));
+        }
+    }
+
+    fn scroll_output_lines_down(&mut self, lines: usize) {
+        if let Some(panel) = &mut self.output_panel {
+            panel.scroll_top = panel
+                .scroll_top
+                .saturating_add(lines.max(1))
+                .min(panel.max_scroll);
+        }
+    }
+
+    fn scroll_output_page_up(&mut self) {
+        let lines = self
+            .output_panel
+            .map_or(1, |panel| panel.page_height.saturating_sub(1).max(1));
+        self.scroll_output_lines_up(lines);
+    }
+
+    fn scroll_output_page_down(&mut self) {
+        let lines = self
+            .output_panel
+            .map_or(1, |panel| panel.page_height.saturating_sub(1).max(1));
+        self.scroll_output_lines_down(lines);
+    }
+
+    fn scroll_output_to_top(&mut self) {
+        if let Some(panel) = &mut self.output_panel {
+            panel.scroll_top = 0;
+        }
+    }
+
+    fn scroll_output_to_bottom(&mut self) {
+        if let Some(panel) = &mut self.output_panel {
+            panel.scroll_top = panel.max_scroll;
+        }
+    }
+
+    #[cfg(test)]
+    fn toggle_selected_tool(&mut self) {
+        if self
+            .selected_entry
+            .and_then(|index| self.transcript.get(index))
+            .is_none_or(|entry| {
+                !matches!(
+                    entry,
+                    TranscriptEntry::Thinking(_) | TranscriptEntry::Tool(_)
+                )
+            })
+        {
+            self.selected_entry = self.card_indices().last().copied();
+        }
+        if let Some(selected) = self.selected_entry {
             self.toggle_card(selected);
         }
     }
 
     fn toggle_card(&mut self, index: usize) {
-        self.selected_card = Some(index);
+        self.selected_entry = Some(index);
         self.input_focused = false;
         match self.transcript.get_mut(index) {
             Some(TranscriptEntry::Thinking(thinking)) => {
@@ -2108,7 +2276,7 @@ impl App {
     }
 
     fn toggle_selected_tool_output(&mut self) {
-        let Some(selected) = self.selected_card else {
+        let Some(selected) = self.selected_entry else {
             return;
         };
         let Some(TranscriptEntry::Tool(tool)) = self.transcript.get_mut(selected) else {
@@ -2131,6 +2299,10 @@ impl App {
     }
 
     fn cancel_ui_layer(&mut self) -> bool {
+        if self.output_panel_open() {
+            self.close_output_panel();
+            return true;
+        }
         if self.provider_editor_open() {
             self.request_provider_exit();
             return true;
@@ -2151,7 +2323,7 @@ impl App {
             self.dismiss_help();
             return true;
         }
-        if let Some(selected) = self.selected_card {
+        if let Some(selected) = self.selected_entry {
             match self.transcript.get_mut(selected) {
                 Some(TranscriptEntry::Thinking(thinking)) if thinking.expanded => {
                     thinking.expanded = false;
@@ -2164,7 +2336,7 @@ impl App {
                 }
                 _ => {}
             }
-            self.selected_card = None;
+            self.selected_entry = None;
             return true;
         }
         if let Some(TranscriptEntry::Error { expanded, .. }) = self
@@ -2414,7 +2586,7 @@ impl App {
     fn prepare_input_edit(&mut self) {
         self.dismiss_help();
         self.input_focused = true;
-        self.selected_card = None;
+        self.selected_entry = None;
         self.reset_history_navigation();
     }
 
@@ -2430,7 +2602,7 @@ impl App {
         self.dismiss_session_picker();
         self.dismiss_help();
         self.input_focused = true;
-        self.selected_card = None;
+        self.selected_entry = None;
         self.reset_history_navigation();
     }
 

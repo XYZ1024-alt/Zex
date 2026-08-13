@@ -1212,7 +1212,7 @@ fn thinking_is_a_folded_card_in_the_single_timeline() {
         .expect("thinking row should be visible") as u16;
     assert!((0..100).any(|x| style_at(&terminal, x, thinking_row).bg == Some(SURFACE)));
 
-    app.select_tool(false);
+    app.select_timeline_entry(false);
     app.toggle_selected_tool();
     let TranscriptEntry::Thinking(thinking) = &app.transcript[0] else {
         panic!("expected thinking entry");
@@ -1997,6 +1997,351 @@ fn keymap_distinguishes_submit_newline_interrupt_and_exit() {
 }
 
 #[test]
+fn final_answer_selection_opens_and_closes_the_output_panel() {
+    let mut app = app();
+    app.transcript.extend([
+        TranscriptEntry::Turn(super::TurnEntry {
+            outcome: super::TurnOutcome::Done,
+            model: "test-model".to_owned(),
+            thinking: ThinkingLevel::Medium,
+            tool_count: 0,
+            elapsed: Some(Duration::from_secs(1)),
+            output_tokens: Some(12),
+        }),
+        TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Complete answer.\n```rust\nfn main() {}\n```".to_owned(),
+        },
+    ]);
+
+    assert_eq!(
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Tab,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        ),
+        InputAction::None
+    );
+    assert_eq!(app.selected_entry, Some(1));
+    assert!(!app.input_focused);
+    assert_eq!(
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        ),
+        InputAction::None
+    );
+    assert!(app.output_panel_open());
+    assert_eq!(app.output_panel.as_ref().unwrap().entry_index, 1);
+
+    assert_eq!(
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        ),
+        InputAction::None
+    );
+    assert!(!app.output_panel_open());
+    assert_eq!(app.selected_entry, Some(1));
+    assert!(!app.input_focused);
+}
+
+#[test]
+fn only_final_assistant_answers_are_openable() {
+    let mut app = app();
+    app.transcript.extend([
+        TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Intermediate note.".to_owned(),
+        },
+        TranscriptEntry::Tool(super::ToolEntry {
+            call_id: "tool-1".to_owned(),
+            name: "read".to_owned(),
+            arguments: "{}".to_owned(),
+            output: "contents".to_owned(),
+            status: ToolStatus::Done,
+            expanded: false,
+            show_full_output: false,
+            started_at: None,
+            elapsed: Some(Duration::from_millis(10)),
+            timeout: Duration::from_secs(30),
+        }),
+        TranscriptEntry::Turn(super::TurnEntry {
+            outcome: super::TurnOutcome::Done,
+            model: "test-model".to_owned(),
+            thinking: ThinkingLevel::Medium,
+            tool_count: 1,
+            elapsed: Some(Duration::from_secs(1)),
+            output_tokens: Some(6),
+        }),
+        TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Final answer.".to_owned(),
+        },
+    ]);
+
+    assert!(!app.is_final_answer(0));
+    assert!(app.is_final_answer(3));
+    assert_eq!(app.selectable_entry_indices(), vec![1, 3]);
+}
+
+#[test]
+fn space_focuses_input_from_browse_mode_without_inserting_text() {
+    let mut app = app();
+    app.transcript.extend([
+        TranscriptEntry::Turn(super::TurnEntry {
+            outcome: super::TurnOutcome::Done,
+            model: "test-model".to_owned(),
+            thinking: ThinkingLevel::Medium,
+            tool_count: 0,
+            elapsed: None,
+            output_tokens: None,
+        }),
+        TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Final answer.".to_owned(),
+        },
+    ]);
+    app.selected_entry = Some(1);
+    app.input_focused = false;
+
+    assert_eq!(
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Char(' '),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        ),
+        InputAction::None
+    );
+    assert!(app.input_focused);
+    assert_eq!(app.selected_entry, None);
+    assert!(app.input.is_empty());
+
+    assert_eq!(
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Char(' '),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        ),
+        InputAction::None
+    );
+    assert_eq!(app.input.content, " ");
+}
+
+#[test]
+fn space_does_not_steal_focus_from_busy_or_page_layers() {
+    let mut busy = app();
+    busy.input_focused = false;
+    assert_eq!(
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Char(' '),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut busy,
+            true,
+            false,
+        ),
+        InputAction::None
+    );
+    assert!(!busy.input_focused);
+    assert!(busy.input.is_empty());
+
+    let mut picker = configured_app();
+    picker.open_model_picker();
+    assert!(matches!(
+        handle_key_event(
+            key(
+                crossterm::event::KeyCode::Char(' '),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut picker,
+            false,
+            false,
+        ),
+        InputAction::SwitchModel(_)
+    ));
+    assert!(!picker.input_focused);
+    assert!(picker.input.is_empty());
+}
+
+#[test]
+fn output_panel_owns_space_and_scroll_until_escape() {
+    let mut app = app();
+    app.transcript.extend([
+        TranscriptEntry::Turn(super::TurnEntry {
+            outcome: super::TurnOutcome::Done,
+            model: "test-model".to_owned(),
+            thinking: ThinkingLevel::Medium,
+            tool_count: 0,
+            elapsed: None,
+            output_tokens: None,
+        }),
+        TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: (0..80)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        },
+    ]);
+    app.selected_entry = Some(1);
+    app.open_selected_output();
+
+    let backend = TestBackend::new(90, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let initial = format!("{}", terminal.backend());
+    assert!(initial.contains("ZEX / assistant output"));
+    assert!(initial.contains("Esc timeline"));
+    assert!(initial.contains("line 0"));
+    assert!(app.output_panel.as_ref().unwrap().max_scroll > 0);
+
+    handle_key_event(
+        key(
+            crossterm::event::KeyCode::Char(' '),
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        &mut app,
+        false,
+        false,
+    );
+    assert!(app.output_panel.as_ref().unwrap().scroll_top > 0);
+    assert!(!app.input_focused);
+    assert!(app.input.is_empty());
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let scrolled = format!("{}", terminal.backend());
+    assert!(!scrolled.contains("line 0"));
+}
+
+#[test]
+fn output_panel_mouse_wheel_scrolls_and_close_hit_restores_browse_mode() {
+    let mut app = app();
+    app.transcript.extend([
+        TranscriptEntry::Turn(super::TurnEntry {
+            outcome: super::TurnOutcome::Done,
+            model: "test-model".to_owned(),
+            thinking: ThinkingLevel::Medium,
+            tool_count: 0,
+            elapsed: None,
+            output_tokens: None,
+        }),
+        TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: (0..80)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        },
+    ]);
+    app.selected_entry = Some(1);
+    app.open_selected_output();
+    let backend = TestBackend::new(90, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+    assert_eq!(
+        handle_mouse_event(
+            mouse(crossterm::event::MouseEventKind::ScrollDown, 20, 10),
+            &mut app,
+            false,
+        ),
+        InputAction::None
+    );
+    assert_eq!(app.output_panel.as_ref().unwrap().scroll_top, SCROLL_STEP);
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let close = app
+        .hit_regions
+        .iter()
+        .find(|region| region.target == HitTarget::OutputClose)
+        .expect("output panel registers a close hit area")
+        .area;
+    assert_eq!(
+        handle_mouse_event(
+            mouse(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                close.x,
+                close.y,
+            ),
+            &mut app,
+            false,
+        ),
+        InputAction::None
+    );
+    assert!(!app.output_panel_open());
+    assert_eq!(app.selected_entry, Some(1));
+    assert!(!app.input_focused);
+}
+
+#[test]
+fn clicking_a_final_answer_selects_then_opens_it() {
+    let mut app = app();
+    app.transcript.extend([
+        TranscriptEntry::Turn(super::TurnEntry {
+            outcome: super::TurnOutcome::Done,
+            model: "test-model".to_owned(),
+            thinking: ThinkingLevel::Medium,
+            tool_count: 0,
+            elapsed: None,
+            output_tokens: None,
+        }),
+        TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Open this answer.".to_owned(),
+        },
+    ]);
+    let backend = TestBackend::new(90, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let response = app
+        .hit_regions
+        .iter()
+        .find(|region| region.target == HitTarget::Response(1))
+        .expect("final answer registers a hit area")
+        .area;
+
+    for expected_open in [false, true] {
+        assert_eq!(
+            handle_mouse_event(
+                mouse(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                    response.x,
+                    response.y,
+                ),
+                &mut app,
+                false,
+            ),
+            InputAction::None
+        );
+        assert_eq!(app.output_panel_open(), expected_open);
+    }
+}
+
+#[test]
 fn unbracketed_multiline_paste_keeps_newlines_without_submitting_first_line() {
     let mut app = app();
     let mut burst = KeyBurst::default();
@@ -2079,10 +2424,10 @@ fn tool_selection_and_expansion_are_explicit() {
         arguments: "{}".to_owned(),
         timeout: Duration::from_secs(60),
     });
-    app.select_tool(false);
+    app.select_timeline_entry(false);
     app.toggle_selected_tool();
 
-    assert_eq!(app.selected_card, Some(0));
+    assert_eq!(app.selected_entry, Some(0));
     let TranscriptEntry::Tool(tool) = &app.transcript[0] else {
         panic!("expected tool entry");
     };
