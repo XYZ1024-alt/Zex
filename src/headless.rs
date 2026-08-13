@@ -156,9 +156,10 @@ fn print_event(event: AgentEvent) -> Result<()> {
         AgentEvent::ThinkingNormalized {
             requested,
             clamped,
+            effective,
             provider_value,
         } => eprintln!(
-            "[thinking] requested={requested} clamped={clamped} upstream={}",
+            "[thinking] requested={requested} clamped={clamped} effective={effective} upstream={}",
             provider_value.as_deref().unwrap_or("<omitted>")
         ),
         AgentEvent::ToolStart { name, .. } => println!("\n[tool] {name}"),

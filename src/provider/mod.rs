@@ -1,3 +1,4 @@
+mod models_dev;
 mod openai;
 
 use anyhow::Result;
@@ -14,6 +15,7 @@ use std::{
 use crate::agent::{AssistantMessage, EventSender, Message};
 use crate::config::{ModelConfig, ModelRef, ProviderCatalog};
 
+pub use models_dev::{ModelsDevCatalog, ModelsDevLoad, ModelsDevProviderAlias};
 pub use openai::OpenAiProvider;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -101,6 +103,8 @@ pub enum ThinkingMode {
 pub struct ThinkingConfig {
     pub min_level: ThinkingLevel,
     pub max_level: ThinkingLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported: Option<Vec<ThinkingLevel>>,
     #[serde(default)]
     pub mode: ThinkingMode,
 }
@@ -110,6 +114,7 @@ impl Default for ThinkingConfig {
         Self {
             min_level: ThinkingLevel::Low,
             max_level: ThinkingLevel::High,
+            supported: None,
             mode: ThinkingMode::Effort,
         }
     }
@@ -129,6 +134,7 @@ pub struct ThinkingCompat {
 pub struct ThinkingCapabilities {
     pub min_level: ThinkingLevel,
     pub max_level: ThinkingLevel,
+    pub supported: Vec<ThinkingLevel>,
     pub mode: ThinkingMode,
     pub supports_reasoning_effort: bool,
     pub reasoning_effort_map: BTreeMap<ThinkingLevel, String>,
@@ -140,15 +146,15 @@ impl Default for ThinkingCapabilities {
         Self {
             min_level: ThinkingLevel::Low,
             max_level: ThinkingLevel::High,
+            supported: vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+            ],
             mode: ThinkingMode::Effort,
             supports_reasoning_effort: true,
-            reasoning_effort_map: [
-                (ThinkingLevel::Low, "low".to_owned()),
-                (ThinkingLevel::Medium, "medium".to_owned()),
-                (ThinkingLevel::High, "high".to_owned()),
-            ]
-            .into_iter()
-            .collect(),
+            reasoning_effort_map: default_reasoning_effort_map(),
             supports_interleaved_thinking: false,
         }
     }
@@ -156,13 +162,55 @@ impl Default for ThinkingCapabilities {
 
 impl ThinkingCapabilities {
     pub fn available_levels(&self) -> Vec<ThinkingLevel> {
+        if !self.supports_reasoning_effort {
+            return vec![ThinkingLevel::Off];
+        }
         std::iter::once(ThinkingLevel::Off)
-            .chain(
-                ThinkingLevel::ALL
-                    .into_iter()
-                    .filter(|level| *level >= self.min_level && *level <= self.max_level),
-            )
+            .chain(self.supported.iter().copied().filter(|level| {
+                *level != ThinkingLevel::Off && self.reasoning_effort_map.contains_key(level)
+            }))
             .collect()
+    }
+
+    pub fn summary(&self) -> String {
+        self.available_levels()
+            .into_iter()
+            .map(|level| level.to_string())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    pub(crate) fn from_discovered(
+        supported: Vec<ThinkingLevel>,
+        reasoning_effort_map: BTreeMap<ThinkingLevel, String>,
+        supports_interleaved_thinking: bool,
+    ) -> Self {
+        let supported = normalize_supported_levels(supported);
+        let mut capabilities = Self {
+            min_level: first_enabled_level(&supported).unwrap_or(ThinkingLevel::Off),
+            max_level: last_enabled_level(&supported).unwrap_or(ThinkingLevel::Off),
+            supported,
+            mode: ThinkingMode::Effort,
+            supports_reasoning_effort: true,
+            reasoning_effort_map,
+            supports_interleaved_thinking,
+        };
+        if capabilities.min_level == ThinkingLevel::Off {
+            capabilities.supports_reasoning_effort = false;
+        }
+        capabilities
+    }
+
+    pub(crate) fn disabled(supports_interleaved_thinking: bool) -> Self {
+        Self {
+            min_level: ThinkingLevel::Off,
+            max_level: ThinkingLevel::Off,
+            supported: vec![ThinkingLevel::Off],
+            mode: ThinkingMode::Effort,
+            supports_reasoning_effort: false,
+            reasoning_effort_map: BTreeMap::new(),
+            supports_interleaved_thinking,
+        }
     }
 
     pub(crate) fn apply(
@@ -171,12 +219,42 @@ impl ThinkingCapabilities {
         compat: Option<&ThinkingCompat>,
     ) {
         if let Some(thinking) = thinking {
+            self.supports_reasoning_effort = true;
+            if self.reasoning_effort_map.is_empty() {
+                self.reasoning_effort_map = default_reasoning_effort_map();
+            }
             self.min_level = thinking.min_level;
             self.max_level = thinking.max_level;
+            self.supported = thinking.supported.clone().unwrap_or_else(|| {
+                std::iter::once(ThinkingLevel::Off)
+                    .chain(ThinkingLevel::ALL.into_iter().filter(|level| {
+                        *level != ThinkingLevel::Off
+                            && *level >= thinking.min_level
+                            && *level <= thinking.max_level
+                    }))
+                    .collect()
+            });
+            self.supported = normalize_supported_levels(std::mem::take(&mut self.supported));
             self.mode = thinking.mode;
         }
         if let Some(compat) = compat {
             if let Some(supports_reasoning_effort) = compat.supports_reasoning_effort {
+                if supports_reasoning_effort && !self.supports_reasoning_effort {
+                    if compat.reasoning_effort_map.is_empty() {
+                        let interleaved = self.supports_interleaved_thinking;
+                        *self = Self::default();
+                        self.supports_interleaved_thinking = interleaved;
+                    } else {
+                        self.supported = normalize_supported_levels(
+                            compat.reasoning_effort_map.keys().copied().collect(),
+                        );
+                        self.min_level =
+                            first_enabled_level(&self.supported).unwrap_or(ThinkingLevel::Off);
+                        self.max_level =
+                            last_enabled_level(&self.supported).unwrap_or(ThinkingLevel::Off);
+                        self.reasoning_effort_map.clear();
+                    }
+                }
                 self.supports_reasoning_effort = supports_reasoning_effort;
             }
             self.reasoning_effort_map
@@ -185,6 +263,12 @@ impl ThinkingCapabilities {
                 self.supports_interleaved_thinking = supports_interleaved_thinking;
             }
         }
+        if !self.supports_reasoning_effort {
+            self.min_level = ThinkingLevel::Off;
+            self.max_level = ThinkingLevel::Off;
+            self.supported = vec![ThinkingLevel::Off];
+            self.reasoning_effort_map.clear();
+        }
     }
 }
 
@@ -192,6 +276,7 @@ impl ThinkingCapabilities {
 pub struct NormalizedThinking {
     pub requested: ThinkingLevel,
     pub clamped: ThinkingLevel,
+    pub effective: ThinkingLevel,
     pub provider_value: Option<String>,
 }
 
@@ -203,48 +288,99 @@ pub fn normalize_thinking_level(
         return NormalizedThinking {
             requested,
             clamped: ThinkingLevel::Off,
+            effective: ThinkingLevel::Off,
             provider_value: None,
         };
     }
 
-    let clamped = requested.clamp(capabilities.min_level, capabilities.max_level);
-    let provider_value = capabilities
-        .reasoning_effort_map
-        .get(&clamped)
-        .cloned()
-        .or_else(|| match clamped {
-            ThinkingLevel::Max | ThinkingLevel::XHigh => fallback_levels(clamped)
-                .into_iter()
-                .skip(1)
-                .find_map(|level| capabilities.reasoning_effort_map.get(&level).cloned()),
-            _ => None,
-        });
+    let supported = capabilities
+        .supported
+        .iter()
+        .copied()
+        .filter(|level| *level != ThinkingLevel::Off)
+        .collect::<Vec<_>>();
+    let Some(first_supported) = supported.first().copied() else {
+        return NormalizedThinking {
+            requested,
+            clamped: ThinkingLevel::Off,
+            effective: ThinkingLevel::Off,
+            provider_value: None,
+        };
+    };
+    let bounded = requested.clamp(capabilities.min_level, capabilities.max_level);
+    let clamped = supported
+        .iter()
+        .copied()
+        .rev()
+        .find(|level| *level <= bounded)
+        .unwrap_or(first_supported);
+    for effective in fallback_levels(clamped) {
+        if !supported.contains(&effective) {
+            continue;
+        }
+        if let Some(provider_value) = capabilities.reasoning_effort_map.get(&effective) {
+            return NormalizedThinking {
+                requested,
+                clamped,
+                effective,
+                provider_value: Some(provider_value.clone()),
+            };
+        }
+    }
     NormalizedThinking {
         requested,
         clamped,
-        provider_value,
+        effective: ThinkingLevel::Off,
+        provider_value: None,
     }
 }
 
 fn fallback_levels(level: ThinkingLevel) -> Vec<ThinkingLevel> {
-    let mut levels = vec![level];
     match level {
-        ThinkingLevel::Max => {
-            levels.extend([
-                ThinkingLevel::XHigh,
-                ThinkingLevel::High,
-                ThinkingLevel::Medium,
-                ThinkingLevel::Low,
-            ]);
-        }
-        ThinkingLevel::XHigh => levels.push(ThinkingLevel::High),
+        ThinkingLevel::Max => vec![
+            ThinkingLevel::Max,
+            ThinkingLevel::XHigh,
+            ThinkingLevel::High,
+        ],
+        ThinkingLevel::XHigh => vec![ThinkingLevel::XHigh, ThinkingLevel::High],
         ThinkingLevel::Off
         | ThinkingLevel::Minimal
         | ThinkingLevel::Low
         | ThinkingLevel::Medium
-        | ThinkingLevel::High => {}
+        | ThinkingLevel::High => vec![level],
     }
+}
+
+fn default_reasoning_effort_map() -> BTreeMap<ThinkingLevel, String> {
+    [
+        (ThinkingLevel::Low, "low".to_owned()),
+        (ThinkingLevel::Medium, "medium".to_owned()),
+        (ThinkingLevel::High, "high".to_owned()),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn normalize_supported_levels(levels: Vec<ThinkingLevel>) -> Vec<ThinkingLevel> {
+    ThinkingLevel::ALL
+        .into_iter()
+        .filter(|level| *level == ThinkingLevel::Off || levels.contains(level))
+        .collect()
+}
+
+fn first_enabled_level(levels: &[ThinkingLevel]) -> Option<ThinkingLevel> {
     levels
+        .iter()
+        .copied()
+        .find(|level| *level != ThinkingLevel::Off)
+}
+
+fn last_enabled_level(levels: &[ThinkingLevel]) -> Option<ThinkingLevel> {
+    levels
+        .iter()
+        .copied()
+        .rev()
+        .find(|level| *level != ThinkingLevel::Off)
 }
 
 #[cfg(test)]
@@ -276,12 +412,39 @@ mod thinking_tests {
     }
 
     #[test]
+    fn non_contiguous_capabilities_clamp_without_increasing_depth() {
+        let capabilities = ThinkingCapabilities::from_discovered(
+            vec![ThinkingLevel::Off, ThinkingLevel::High, ThinkingLevel::Max],
+            [
+                (ThinkingLevel::High, "high".to_owned()),
+                (ThinkingLevel::Max, "max".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            false,
+        );
+
+        let below_min = normalize_thinking_level(&capabilities, ThinkingLevel::Medium);
+        assert_eq!(below_min.clamped, ThinkingLevel::High);
+        assert_eq!(below_min.effective, ThinkingLevel::High);
+
+        let gap = normalize_thinking_level(&capabilities, ThinkingLevel::XHigh);
+        assert_eq!(gap.clamped, ThinkingLevel::High);
+        assert_eq!(gap.effective, ThinkingLevel::High);
+        assert_eq!(
+            capabilities.available_levels(),
+            vec![ThinkingLevel::Off, ThinkingLevel::High, ThinkingLevel::Max]
+        );
+    }
+
+    #[test]
     fn custom_map_supports_max_and_falls_back_without_passthrough() {
         let mut capabilities = ThinkingCapabilities::default();
         capabilities.apply(
             Some(&ThinkingConfig {
                 min_level: ThinkingLevel::Minimal,
                 max_level: ThinkingLevel::Max,
+                supported: None,
                 mode: ThinkingMode::Effort,
             }),
             Some(&ThinkingCompat {
@@ -317,12 +480,49 @@ mod thinking_tests {
     }
 
     #[test]
+    fn manual_thinking_reenables_effort_after_discovered_disable() {
+        let mut capabilities = ThinkingCapabilities::disabled(true);
+        capabilities.apply(
+            Some(&ThinkingConfig {
+                min_level: ThinkingLevel::High,
+                max_level: ThinkingLevel::Max,
+                supported: Some(vec![
+                    ThinkingLevel::Off,
+                    ThinkingLevel::High,
+                    ThinkingLevel::Max,
+                ]),
+                mode: ThinkingMode::Effort,
+            }),
+            Some(&ThinkingCompat {
+                supports_reasoning_effort: Some(true),
+                reasoning_effort_map: [
+                    (ThinkingLevel::High, "high".to_owned()),
+                    (ThinkingLevel::Max, "max".to_owned()),
+                ]
+                .into_iter()
+                .collect(),
+                supports_interleaved_thinking: None,
+            }),
+        );
+
+        assert_eq!(
+            capabilities.available_levels(),
+            vec![ThinkingLevel::Off, ThinkingLevel::High, ThinkingLevel::Max]
+        );
+        assert_eq!(
+            normalize_thinking_level(&capabilities, ThinkingLevel::Max).effective,
+            ThinkingLevel::Max
+        );
+    }
+
+    #[test]
     fn provider_defaults_merge_with_model_overrides() {
         let mut capabilities = ThinkingCapabilities::default();
         capabilities.apply(
             Some(&ThinkingConfig {
                 min_level: ThinkingLevel::Low,
                 max_level: ThinkingLevel::XHigh,
+                supported: None,
                 mode: ThinkingMode::Effort,
             }),
             Some(&ThinkingCompat {
@@ -337,6 +537,7 @@ mod thinking_tests {
             Some(&ThinkingConfig {
                 min_level: ThinkingLevel::Minimal,
                 max_level: ThinkingLevel::Max,
+                supported: None,
                 mode: ThinkingMode::Effort,
             }),
             Some(&ThinkingCompat {
@@ -624,6 +825,7 @@ impl Provider for ProviderRegistry {
         let _ = events.send(crate::agent::AgentEvent::ThinkingNormalized {
             requested: normalized.requested,
             clamped: normalized.clamped,
+            effective: normalized.effective,
             provider_value: normalized.provider_value.clone(),
         });
         let request_messages =
@@ -672,6 +874,8 @@ mod tests {
         };
         ProviderCatalog {
             active_model: Some(active_model),
+            models_dev: Default::default(),
+            models_dev_aliases: Vec::new(),
             providers: vec![
                 ProviderConfig {
                     id: "one".to_owned(),
@@ -691,6 +895,7 @@ mod tests {
                         thinking: Some(super::ThinkingConfig {
                             min_level: ThinkingLevel::Low,
                             max_level: ThinkingLevel::Max,
+                            supported: None,
                             mode: super::ThinkingMode::Effort,
                         }),
                         compat: None,
@@ -751,6 +956,7 @@ mod tests {
         updated.providers[1].models[0].thinking = Some(super::ThinkingConfig {
             min_level: ThinkingLevel::Minimal,
             max_level: ThinkingLevel::XHigh,
+            supported: None,
             mode: super::ThinkingMode::Effort,
         });
 

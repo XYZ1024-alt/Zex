@@ -23,6 +23,7 @@ pub enum AgentEvent {
     ThinkingNormalized {
         requested: ThinkingLevel,
         clamped: ThinkingLevel,
+        effective: ThinkingLevel,
         provider_value: Option<String>,
     },
     ToolStart {

@@ -60,6 +60,7 @@ display_name = "GPT-4.1 Mini"
 [providers.models.thinking]
 min_level = "low"
 max_level = "max"
+supported = ["off", "low", "medium", "high", "xhigh", "max"]
 mode = "effort"
 
 [providers.models.compat]
@@ -89,6 +90,8 @@ max = "max"
 | `default_thinking_level` | `medium` | 新会话默认思考强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
 | `hide_thinking_block` | `false` | 是否隐藏 TUI 中默认折叠的思考卡片；隐藏不删除会话数据，也不影响模型实际思考 |
 | `session_dir` | 全局 `sessions` 目录 | 自定义会话目录；相对路径基于项目工作目录 |
+
+Zex 启动时从 `https://models.dev/api.json` 刷新模型思考能力，并把原始响应缓存为全局目录下的 `models-dev-cache.json`。刷新失败时优先使用缓存；缓存也不可用时使用安全默认 `off/low/medium/high`。模型优先按 Provider ID 匹配；自定义 Provider ID 还会用配置的 API base URL 匹配 models.dev Provider；仍无法匹配时，只对全局唯一的模型 ID 使用发现结果。`reasoning_options` 中的 effort 值会映射到本地固定梯子；`reasoning = false` 强制为 `off`。只有 toggle 或 token-budget、但没有 effort 选项的模型不会被误发 `reasoning_effort`。Provider/模型的手动 `[thinking]` 与 `[compat]` 配置始终覆盖 models.dev 数据。
 
 旧的顶层 `api_key`、`model`、`base_url`、`openai_api` 仍会在没有 `providers` 时作为单个 `default` Provider 载入；首次从 `/provider` 保存后会写入新结构并移除这些顶层字段。对应环境变量仅参与这个旧配置迁移路径。
 
@@ -178,7 +181,7 @@ TUI 占满 terminal 工作区，但不铺自定义整屏背景。它保持单列
 
 思考内容优先读取 Provider 的 `reasoning_content`、`reasoning`、`reasoning_details` / `thinking_blocks` 或 Responses API reasoning summary；缺少显式字段时再解析完整的 `<think>...</think>`。思考与 assistant 最终回答、tool call 分开保存，并在单一时间流中显示为默认折叠卡片。`/thinking show|hide` 控制卡片可见性并持久化，隐藏期间数据仍保留，因此再次显示或恢复会话时可重新渲染；该开关独立于 `/think` 的模型思考强度。
 
-Provider 与模型都可声明 `[thinking]`（`min_level`、`max_level`、`mode = "effort"`）和 `[compat]`（`supports_reasoning_effort`、`supports_interleaved_thinking`、`reasoning_effort_map`）。模型设置覆盖 Provider 默认值；缺失能力时使用安全范围 `off/low/medium/high`，因此 `xhigh` 和 `max` 会降级到 `high`，不会原样发送未知值。工具调用轮次仅在目标模型声明支持 interleaved thinking 时回传 reasoning；最终回答及不支持该能力的模型历史会在请求层剥离 reasoning，但会话中的可查看内容仍保留。
+Provider 与模型都可声明 `[thinking]`（`min_level`、`max_level`、可选精确 `supported`、`mode = "effort"`）和 `[compat]`（`supports_reasoning_effort`、`supports_interleaved_thinking`、`reasoning_effort_map`）。合并优先级为安全默认 → models.dev → Provider 手动配置 → 模型手动配置。缺失能力时使用安全范围 `off/low/medium/high`，因此 `xhigh` 和 `max` 会降级到 `high`，不会原样发送未知值。工具调用轮次仅在目标模型声明支持 interleaved thinking 时回传 reasoning；最终回答及不支持该能力的模型历史会在请求层剥离 reasoning，但会话中的可查看内容仍保留。
 
 思考和 tool 卡片都使用近黑 surface 和细 accent rail。tool 标题突出工具名；`bash` 显示 `$ command`。默认态只显示标题、running/done/failed/interrupted、耗时和一行结果摘要；无输出的成功命令显示 `Completed`。`exit_code`、stdout/stderr 全文、timeout 和参数只在展开后出现，`Ctrl-O` 展开或折叠当前卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 只在状态变化、输入、新事件或 toast 过期时按固定帧率差分重绘。
 
@@ -207,7 +210,7 @@ TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册�
 | --- | --- |
 | `/help` | 打开有限高度的命令面板；Esc 关闭，不写入对话时间流 |
 | `/model` | 用主区轻量列表选择已配置模型；Enter 立即切换并持久化，Esc/q 取消 |
-| `/provider` | 打开双栏 Provider 配置页，管理 Provider、端点、密钥及模型列表 |
+| `/provider` | 打开双栏 Provider 配置页，管理 Provider、端点、密钥及模型列表；选中 Provider 后按 `f` 从其 OpenAI-compatible `/models` 接口导入模型 |
 | `/clear` | 清空当前 TUI/REPL 上下文；TUI 同时清空对话视图。不删除磁盘会话，下一条普通消息创建新会话 |
 | `/sessions` | 查看保存的会话；复用 `SessionStore::list` 列出 ID、更新时间、消息数和预览 |
 | `/resume [id]` | 无参数时打开历史会话选择列表；有参数时直接恢复指定会话。只恢复消息，不改变当前模型 |
@@ -397,7 +400,7 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 
 10. 验证内置搜索：在 TUI 或非 TTY REPL 中要求模型“必须用 `grep` 搜索 `Cargo.toml` 中的 `name`，再用 `glob` 查找 `src/**/*.rs`”。预期出现两个内置 tool 事件，不调用 `rg`/`fd`，并且 `.gitignore` 中排除的路径不出现在结果里。
 
-11. 验证配置命令：输入 `/provider`，新增或编辑 Provider 和模型后按 `Ctrl-S` 保存；退出后输入 `/model`，用 Up/Down 或 j/k 选择另一个模型并按 Enter。预期配置页与模型页都替换主区、不写入对话 feed；状态栏立即更新，项目 `.zex/config.toml` 持久化 `providers` 与 `active_model`。输入 `/resume` 恢复历史会话后，当前模型保持不变。
+11. 验证配置命令：输入 `/provider`，配置 Provider 的 base URL 和 API Key 后按 `f` 请求 `${base_url}/models`；预期保留已有模型及其手动 thinking/compat 设置，只按 ID 导入新模型。新增或编辑完成后按 `Ctrl-S` 保存；退出后输入 `/model`，用 Up/Down 或 j/k 选择另一个模型并按 Enter。预期配置页与模型页都替换主区、不写入对话 feed；状态栏立即更新，项目 `.zex/config.toml` 持久化 `providers` 与 `active_model`。输入 `/resume` 恢复历史会话后，当前模型保持不变。
 
 12. 验证 `/compact` 前后上下文变化：
 

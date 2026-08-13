@@ -91,7 +91,7 @@ where
             &self.provider.thinking_capabilities(&self.model),
             self.thinking_level,
         )
-        .clamped
+        .effective
     }
 
     pub fn thinking_preference(&self) -> ThinkingLevel {

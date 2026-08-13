@@ -92,6 +92,65 @@ impl OpenAiProvider {
             .context("failed to read provider response body")?;
         parse_response_body(&body, &content_type, self.api, events)
     }
+
+    pub async fn list_models(
+        base_url: &str,
+        api_key: &str,
+        request_timeout: Duration,
+    ) -> Result<Vec<String>> {
+        if api_key.trim().is_empty() {
+            bail!("Provider API key is required before fetching models");
+        }
+        let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
+        let client = Client::builder()
+            .timeout(request_timeout)
+            .build()
+            .context("failed to build the model discovery HTTP client")?;
+        let response = client
+            .get(&endpoint)
+            .bearer_auth(api_key)
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch models from {endpoint}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("<failed to read response body: {error}>"));
+            bail!("Provider model discovery returned {status}: {body}");
+        }
+        let body = response
+            .bytes()
+            .await
+            .context("failed to read Provider model discovery response")?;
+        parse_models_response(&body)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    #[serde(default)]
+    data: Vec<ModelsResponseItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsResponseItem {
+    id: String,
+}
+
+fn parse_models_response(body: &[u8]) -> Result<Vec<String>> {
+    let response: ModelsResponse =
+        serde_json::from_slice(body).context("Provider model discovery returned invalid JSON")?;
+    let mut models = response
+        .data
+        .into_iter()
+        .map(|model| model.id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    Ok(models)
 }
 
 impl Provider for OpenAiProvider {
@@ -1125,6 +1184,29 @@ mod tests {
         provider::{OpenAiApi, ThinkingLevel, ToolDefinition},
     };
 
+    #[test]
+    fn parses_and_normalizes_model_list_response() {
+        assert_eq!(
+            super::parse_models_response(
+                br#"{"data":[{"id":"gpt-z"},{"id":" gpt-a "},{"id":"gpt-z"},{"id":""}]}"#,
+            )
+            .unwrap(),
+            vec!["gpt-a", "gpt-z"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_model_list_response() {
+        let error =
+            super::parse_models_response(br#"{"data":[{"name":"missing-id"}]}"#).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Provider model discovery returned invalid JSON")
+        );
+    }
+
     use super::{
         ChatProviderState, ResponsesRequest, ToolCallAccumulator, consume_sse_line, finish_message,
         parse_response_body,
@@ -1408,6 +1490,7 @@ data: [DONE]
         let thinking = crate::provider::NormalizedThinking {
             requested: ThinkingLevel::Off,
             clamped: ThinkingLevel::Off,
+            effective: ThinkingLevel::Off,
             provider_value: None,
         };
         let request = serde_json::to_value(super::ChatRequest::new(
@@ -1480,6 +1563,7 @@ data: [DONE]
         let thinking = crate::provider::NormalizedThinking {
             requested: ThinkingLevel::Off,
             clamped: ThinkingLevel::Off,
+            effective: ThinkingLevel::Off,
             provider_value: None,
         };
         let request = serde_json::to_value(ResponsesRequest::new(
@@ -1508,6 +1592,7 @@ data: [DONE]
         let high = crate::provider::NormalizedThinking {
             requested: ThinkingLevel::Max,
             clamped: ThinkingLevel::High,
+            effective: ThinkingLevel::High,
             provider_value: Some("high".to_owned()),
         };
         let responses =
@@ -1517,6 +1602,7 @@ data: [DONE]
         let low = crate::provider::NormalizedThinking {
             requested: ThinkingLevel::Low,
             clamped: ThinkingLevel::Low,
+            effective: ThinkingLevel::Low,
             provider_value: Some("low".to_owned()),
         };
         let chat =
@@ -1602,6 +1688,42 @@ data: [DONE]
             AgentEvent::MessageDelta {
                 role: MessageRole::Assistant,
                 delta: "Done.".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_direct_thinking_before_think_tag_fallback() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let message = parse_response_body(
+            br#"{
+                "choices": [{
+                    "message": {
+                        "content": "<think>fallback</think>Final",
+                        "thinking": "Explicit",
+                        "tool_calls": []
+                    }
+                }]
+            }"#,
+            "application/json",
+            OpenAiApi::ChatCompletions,
+            &events,
+        )
+        .unwrap();
+
+        assert_eq!(message.thinking.as_deref(), Some("Explicit"));
+        assert_eq!(message.content, "Final");
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::ThinkingDelta {
+                delta: "Explicit".to_owned(),
+            }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentEvent::MessageDelta {
+                role: MessageRole::Assistant,
+                delta: "Final".to_owned(),
             }
         );
     }

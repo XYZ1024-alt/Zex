@@ -9,7 +9,8 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::{
-    OpenAiApi, ThinkingCapabilities, ThinkingCompat, ThinkingConfig, ThinkingLevel,
+    ModelsDevCatalog, ModelsDevLoad, ModelsDevProviderAlias, OpenAiApi, ThinkingCapabilities,
+    ThinkingCompat, ThinkingConfig, ThinkingLevel,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -97,6 +98,10 @@ pub struct ProviderCatalog {
     pub active_model: Option<ModelRef>,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    #[serde(skip)]
+    pub models_dev: ModelsDevCatalog,
+    #[serde(skip)]
+    pub models_dev_aliases: Vec<ModelsDevProviderAlias>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +124,7 @@ impl ProviderCatalog {
                     },
                     provider_name: provider.display_name.clone(),
                     model_name: model.display_name.clone(),
-                    thinking: Self::resolved_thinking(provider, model),
+                    thinking: self.resolved_thinking(provider, model),
                 })
             })
             .collect()
@@ -146,15 +151,40 @@ impl ProviderCatalog {
 
     pub fn thinking_capabilities(&self, target: &ModelRef) -> ThinkingCapabilities {
         self.model(target)
-            .map(|(provider, model)| Self::resolved_thinking(provider, model))
+            .map(|(provider, model)| self.resolved_thinking(provider, model))
             .unwrap_or_default()
     }
 
-    fn resolved_thinking(provider: &ProviderConfig, model: &ModelConfig) -> ThinkingCapabilities {
-        let mut capabilities = ThinkingCapabilities::default();
+    fn resolved_thinking(
+        &self,
+        provider: &ProviderConfig,
+        model: &ModelConfig,
+    ) -> ThinkingCapabilities {
+        let discovered = self
+            .models_dev
+            .capabilities(&provider.id, &model.id)
+            .or_else(|| {
+                self.matched_models_dev_provider(provider)
+                    .and_then(|provider_id| self.models_dev.capabilities(provider_id, &model.id))
+            });
+        let mut capabilities = discovered.unwrap_or_default();
         capabilities.apply(provider.thinking.as_ref(), provider.compat.as_ref());
         capabilities.apply(model.thinking.as_ref(), model.compat.as_ref());
         capabilities
+    }
+
+    fn matched_models_dev_provider<'a>(&'a self, provider: &ProviderConfig) -> Option<&'a str> {
+        let configured_api = normalize_api_url(&provider.base_url)?;
+        self.models_dev_aliases
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .api
+                    .as_deref()
+                    .and_then(normalize_api_url)
+                    .is_some_and(|api| api == configured_api)
+            })
+            .map(|candidate| candidate.id.as_str())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -242,6 +272,32 @@ fn validate_thinking(
                 thinking.max_level
             );
         }
+        if let Some(supported) = &thinking.supported {
+            if supported.is_empty() {
+                bail!("{owner} thinking.supported must not be empty");
+            }
+            if supported.iter().any(|level| {
+                *level != ThinkingLevel::Off
+                    && (*level < thinking.min_level || *level > thinking.max_level)
+            }) {
+                bail!(
+                    "{owner} thinking.supported levels must be between {} and {}",
+                    thinking.min_level,
+                    thinking.max_level
+                );
+            }
+            let unique = supported
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            if unique.len() != supported.len() {
+                bail!("{owner} thinking.supported must not contain duplicates");
+            }
+            if !supported.contains(&thinking.min_level) || !supported.contains(&thinking.max_level)
+            {
+                bail!("{owner} thinking.supported must contain min_level and max_level");
+            }
+        }
     }
     if let Some(compat) = compat {
         for (level, value) in &compat.reasoning_effort_map {
@@ -250,6 +306,16 @@ fn validate_thinking(
             }
             if value.trim().is_empty() {
                 bail!("{owner} reasoning_effort_map value for {level} must not be empty");
+            }
+            if let Some(thinking) = thinking
+                && (level < &thinking.min_level
+                    || level > &thinking.max_level
+                    || thinking
+                        .supported
+                        .as_ref()
+                        .is_some_and(|supported| !supported.contains(level)))
+            {
+                bail!("{owner} reasoning_effort_map contains unsupported level {level}");
             }
         }
     }
@@ -309,6 +375,8 @@ impl Config {
         let mut providers = ProviderCatalog {
             active_model: file.active_model,
             providers: file.providers,
+            models_dev: ModelsDevCatalog::default(),
+            models_dev_aliases: Vec::new(),
         };
         if providers.providers.is_empty()
             && let (Some(api_key), Some(model)) = (legacy_api_key, legacy_model)
@@ -332,6 +400,19 @@ impl Config {
                 provider_id: "default".to_owned(),
                 model_id: model,
             });
+        }
+        let (models_dev, models_dev_aliases, models_dev_load) =
+            ModelsDevCatalog::load(global_config_dir).await;
+        providers.models_dev = models_dev;
+        providers.models_dev_aliases = models_dev_aliases;
+        match models_dev_load {
+            ModelsDevLoad::Cached => {
+                eprintln!("Zex: models.dev refresh failed; using cached model capabilities");
+            }
+            ModelsDevLoad::Unavailable => {
+                eprintln!("Zex: models.dev capabilities unavailable; using safe defaults");
+            }
+            ModelsDevLoad::Refreshed => {}
         }
         providers.validate()?;
         let active_model = providers.active_model.clone();
@@ -645,6 +726,15 @@ fn non_empty_file_value(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
 
+fn normalize_api_url(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    (!value.is_empty()).then(|| value.to_ascii_lowercase())
+}
+
 fn positive(name: &str, value: usize) -> Result<usize> {
     if value == 0 {
         bail!("{name} must be greater than zero");
@@ -870,6 +960,8 @@ hide_thinking_block = true
         };
         let catalog = super::ProviderCatalog {
             active_model: Some(active_model.clone()),
+            models_dev: Default::default(),
+            models_dev_aliases: Vec::new(),
             providers: vec![super::ProviderConfig {
                 id: "openai".to_owned(),
                 display_name: "OpenAI".to_owned(),
@@ -884,6 +976,7 @@ hide_thinking_block = true
                     thinking: Some(crate::provider::ThinkingConfig {
                         min_level: crate::provider::ThinkingLevel::Low,
                         max_level: crate::provider::ThinkingLevel::Max,
+                        supported: None,
                         mode: crate::provider::ThinkingMode::Effort,
                     }),
                     compat: None,
@@ -976,6 +1069,33 @@ max = "max"
             Some("max")
         );
         tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[test]
+    fn provider_base_url_can_match_models_dev_provider() {
+        let mut catalog = super::ProviderCatalog {
+            models_dev: crate::provider::ModelsDevCatalog::default(),
+            models_dev_aliases: vec![crate::provider::ModelsDevProviderAlias {
+                id: "openai".to_owned(),
+                api: Some("https://api.openai.com/v1".to_owned()),
+            }],
+            ..Default::default()
+        };
+        catalog.providers.push(super::ProviderConfig {
+            id: "gateway".to_owned(),
+            display_name: "Gateway".to_owned(),
+            base_url: "https://api.openai.com/v1/".to_owned(),
+            api_key: super::SecretValue::new("secret".to_owned()),
+            openai_api: crate::provider::OpenAiApi::Responses,
+            thinking: None,
+            compat: None,
+            models: Vec::new(),
+        });
+
+        assert_eq!(
+            catalog.matched_models_dev_provider(&catalog.providers[0]),
+            Some("openai")
+        );
     }
 
     #[tokio::test]

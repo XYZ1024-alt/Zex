@@ -55,6 +55,7 @@ const HORIZONTAL_GUTTER: u16 = 1;
 const INPUT_PROMPT: &str = "› ";
 const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
+const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 const SURFACE: Color = Color::Rgb(20, 23, 28);
 const SURFACE_RAISED: Color = Color::Rgb(27, 31, 37);
@@ -204,6 +205,18 @@ async fn run_loop(
                             .await
                             {
                                 app.record_error(format!("{error:#}"));
+                            }
+                        }
+                        InputAction::FetchProviderModels(provider) => {
+                            match crate::provider::OpenAiProvider::list_models(
+                                &provider.base_url,
+                                provider.api_key.expose(),
+                                MODEL_DISCOVERY_TIMEOUT,
+                            )
+                            .await
+                            {
+                                Ok(models) => app.merge_discovered_models(&provider.id, models),
+                                Err(error) => app.record_error(format!("{error:#}")),
                             }
                         }
                         InputAction::Resume(requested_id) => {
@@ -489,6 +502,7 @@ where
                         | InputAction::Resume(_)
                         | InputAction::SwitchModel(_)
                         | InputAction::SaveProviders(_)
+                        | InputAction::FetchProviderModels(_)
                         | InputAction::Submit(_) => {}
                     },
                     Some(Err(error)) => {
@@ -516,6 +530,7 @@ enum InputAction {
     Resume(String),
     SwitchModel(ModelRef),
     SaveProviders(ProviderCatalog),
+    FetchProviderModels(ProviderConfig),
     Submit(String),
 }
 
@@ -669,6 +684,11 @@ fn handle_key_event(
             KeyCode::Char('t') => app.cycle_selected_model_thinking_level(),
             KeyCode::Char('m') => app.cycle_selected_model_thinking_min_level(),
             KeyCode::Char('r') => app.cycle_selected_model_reasoning_map(),
+            KeyCode::Char('f') => {
+                if let Some(provider) = app.selected_provider_to_fetch() {
+                    return InputAction::FetchProviderModels(provider);
+                }
+            }
             KeyCode::Char('n') => app.new_provider_item(),
             KeyCode::Char('d') => app.request_provider_delete(),
             KeyCode::Esc | KeyCode::Char('q') => app.request_provider_exit(),
@@ -1387,10 +1407,12 @@ impl App {
                 }
             }
             AgentEvent::ThinkingNormalized {
-                requested, clamped, ..
+                requested,
+                effective,
+                ..
             } => {
                 self.thinking_preference = requested;
-                self.thinking_level = (clamped != ThinkingLevel::Off).then_some(clamped);
+                self.thinking_level = Some(effective);
             }
             AgentEvent::ToolStart {
                 call_id,
@@ -2196,6 +2218,7 @@ impl App {
             if thinking.max_level < thinking.min_level {
                 thinking.max_level = thinking.min_level;
             }
+            thinking.supported = None;
         }
     }
 
@@ -2219,6 +2242,7 @@ impl App {
                 next = ThinkingLevel::Minimal;
             }
             thinking.min_level = next;
+            thinking.supported = None;
         }
     }
 
@@ -2252,6 +2276,62 @@ impl App {
                 .entry(level)
                 .or_insert_with(|| level.to_string());
         }
+    }
+
+    fn selected_provider_to_fetch(&mut self) -> Option<ProviderConfig> {
+        self.commit_provider_field();
+        let editor = self.provider_editor.as_ref()?;
+        editor.selected_provider().cloned()
+    }
+
+    fn merge_discovered_models(&mut self, provider_id: &str, models: Vec<String>) {
+        let Some(editor) = &mut self.provider_editor else {
+            return;
+        };
+        let Some(provider_index) = editor
+            .draft
+            .providers
+            .iter()
+            .position(|provider| provider.id == provider_id)
+        else {
+            self.show_toast(
+                "Provider changed before model discovery completed".to_owned(),
+                ToastTone::Neutral,
+            );
+            return;
+        };
+        let provider = &mut editor.draft.providers[provider_index];
+        let existing = provider
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let imported = models
+            .into_iter()
+            .filter(|model_id| !existing.contains(model_id.as_str()))
+            .map(|model_id| ModelConfig {
+                display_name: model_id.clone(),
+                id: model_id,
+                thinking: None,
+                compat: None,
+            })
+            .collect::<Vec<_>>();
+        let imported_count = imported.len();
+        provider.models.extend(imported);
+        provider
+            .models
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        editor.provider_selected = provider_index;
+        editor.pane = ProviderPane::Models;
+        editor.model_selected = provider.models.len().saturating_sub(imported_count.max(1));
+        self.show_toast(
+            if imported_count == 0 {
+                "Models refreshed · no new models".to_owned()
+            } else {
+                format!("Models fetched · imported {imported_count}")
+            },
+            ToastTone::Success,
+        );
     }
 
     fn new_provider_item(&mut self) {
@@ -2962,10 +3042,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
             };
             let marker = if selected { "›" } else { " " };
             let current_marker = if current { "●" } else { " " };
-            let thinking = format!(
-                "{}–{}",
-                choice.thinking.min_level, choice.thinking.max_level
-            );
+            let thinking = choice.thinking.summary();
             lines.push(
                 Line::from(vec![
                     Span::styled(
@@ -3153,13 +3230,11 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 provider_id: provider.id.clone(),
                 model_id: model.id.clone(),
             });
-            let thinking = format!("{}–{}", capabilities.min_level, capabilities.max_level);
+            let thinking = capabilities.summary();
             let map = capabilities
                 .reasoning_effort_map
                 .iter()
-                .filter(|(level, _)| {
-                    **level >= capabilities.min_level && **level <= capabilities.max_level
-                })
+                .filter(|(level, _)| capabilities.supported.contains(level))
                 .map(|(level, value)| format!("{level}:{value}"))
                 .collect::<Vec<_>>()
                 .join(",");
@@ -4082,7 +4157,7 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else if app.provider_editor_is_editing() {
             "Enter apply field · Esc cancel · Ctrl+S save"
         } else {
-            "Tab pane · ↑↓/jk select · Enter name · i ID · Space thinking · m/t min/max · r fill map · n new · d delete · Ctrl+S save · Esc exit"
+            "Tab pane · ↑↓/jk select · f fetch models · Enter name · i ID · Space thinking · m/t min/max · r fill map · n new · d delete · Ctrl+S save · Esc exit"
         };
         Line::from(Span::styled(text, Style::default().fg(DIM)))
     } else if app.session_picker_open() {
@@ -4369,6 +4444,8 @@ mod tests {
         };
         let providers = ProviderCatalog {
             active_model: Some(active_model.clone()),
+            models_dev: Default::default(),
+            models_dev_aliases: Vec::new(),
             providers: vec![ProviderConfig {
                 id: "openai".to_owned(),
                 display_name: "OpenAI".to_owned(),
@@ -4384,6 +4461,7 @@ mod tests {
                         thinking: Some(crate::provider::ThinkingConfig {
                             min_level: ThinkingLevel::Low,
                             max_level: ThinkingLevel::Max,
+                            supported: None,
                             mode: crate::provider::ThinkingMode::Effort,
                         }),
                         compat: None,
@@ -4500,6 +4578,23 @@ mod tests {
     }
 
     #[test]
+    fn thinking_normalization_updates_effective_status_without_changing_visibility() {
+        let mut app = configured_app();
+        app.show_thinking = false;
+
+        app.apply_agent_event(AgentEvent::ThinkingNormalized {
+            requested: ThinkingLevel::Max,
+            clamped: ThinkingLevel::Max,
+            effective: ThinkingLevel::High,
+            provider_value: Some("high".to_owned()),
+        });
+
+        assert_eq!(app.thinking_preference, ThinkingLevel::Max);
+        assert_eq!(app.thinking_level, Some(ThinkingLevel::High));
+        assert!(!app.show_thinking);
+    }
+
+    #[test]
     fn model_picker_and_provider_editor_replace_the_main_area() {
         let mut app = configured_app();
         app.open_model_picker();
@@ -4573,6 +4668,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_editor_fetch_action_uses_current_draft_credentials() {
+        let mut app = configured_app();
+        app.open_provider_editor();
+
+        let action = handle_key_event(
+            key(
+                crossterm::event::KeyCode::Char('f'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut app,
+            false,
+            false,
+        );
+
+        assert!(matches!(
+            action,
+            InputAction::FetchProviderModels(provider)
+                if provider.id == "openai"
+                    && provider.base_url == "https://api.openai.com/v1"
+                    && provider.api_key.expose() == "secret"
+        ));
+    }
+
+    #[test]
+    fn discovered_models_merge_without_overwriting_existing_configuration() {
+        let mut app = configured_app();
+        app.open_provider_editor();
+
+        app.merge_discovered_models(
+            "openai",
+            vec![
+                "gpt-5".to_owned(),
+                "gpt-new".to_owned(),
+                "gpt-4.1-mini".to_owned(),
+            ],
+        );
+
+        let provider = &app.provider_editor.as_ref().unwrap().draft.providers[0];
+        assert_eq!(
+            provider
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-4.1-mini", "gpt-5", "gpt-new"]
+        );
+        let existing = provider
+            .models
+            .iter()
+            .find(|model| model.id == "gpt-5")
+            .unwrap();
+        assert_eq!(
+            existing
+                .thinking
+                .as_ref()
+                .map(|thinking| thinking.max_level),
+            Some(ThinkingLevel::Max)
+        );
+        let imported = provider
+            .models
+            .iter()
+            .find(|model| model.id == "gpt-new")
+            .unwrap();
+        assert_eq!(imported.display_name, "gpt-new");
+        assert!(imported.thinking.is_none());
+        assert!(imported.compat.is_none());
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.message.as_str()),
+            Some("Models fetched · imported 1")
+        );
+    }
+
     #[tokio::test]
     async fn model_switch_persists_and_updates_agent_status_without_touching_transcript() {
         let root = std::env::temp_dir().join(format!(
@@ -4639,6 +4807,7 @@ mod tests {
             thinking: Some(crate::provider::ThinkingConfig {
                 min_level: ThinkingLevel::Minimal,
                 max_level: ThinkingLevel::Medium,
+                supported: None,
                 mode: crate::provider::ThinkingMode::Effort,
             }),
             compat: None,
