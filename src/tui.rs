@@ -57,17 +57,18 @@ const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-const BACKGROUND: Color = Color::Rgb(9, 12, 15);
-const SURFACE: Color = Color::Rgb(18, 22, 26);
-const SURFACE_HOVER: Color = Color::Rgb(21, 26, 31);
-const SURFACE_RAISED: Color = Color::Rgb(25, 30, 35);
-const TEXT: Color = Color::Rgb(194, 202, 209);
-const TEXT_STRONG: Color = Color::Rgb(232, 236, 239);
-const DIM: Color = Color::Rgb(103, 114, 123);
-const MUTED: Color = Color::Rgb(55, 64, 72);
-const ACCENT: Color = Color::Rgb(98, 164, 178);
-const SUCCESS: Color = Color::Rgb(126, 139, 147);
-const ERROR: Color = Color::Rgb(187, 105, 113);
+const BACKGROUND: Color = Color::Rgb(20, 20, 20); // #141414
+const SURFACE: Color = Color::Rgb(27, 27, 27);
+const SURFACE_HOVER: Color = Color::Rgb(34, 34, 34);
+const SURFACE_RAISED: Color = Color::Rgb(41, 41, 41);
+const TEXT: Color = Color::Rgb(243, 243, 243); // #F3F3F3
+const TEXT_STRONG: Color = TEXT;
+const TEXT_DIM: Color = Color::Rgb(160, 160, 160); // #A0A0A0
+const TEXT_FAINT: Color = Color::Rgb(120, 120, 120); // #787878
+const ACCENT_PRIMARY: Color = Color::Rgb(122, 162, 247); // #7AA2F7
+const ACCENT_SECONDARY: Color = Color::Rgb(187, 154, 247); // #BB9AF7
+const OK: Color = Color::Rgb(158, 206, 106); // #9ECE6A
+const BAD: Color = Color::Rgb(219, 75, 75); // #DB4B4B
 
 pub fn is_available() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
@@ -820,7 +821,22 @@ fn handle_key_event(
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-        app.toggle_all_cards();
+        let can_toggle_output = app
+            .selected_card
+            .and_then(|index| app.transcript.get(index))
+            .is_some_and(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::Tool(tool)
+                        if tool.expanded
+                            && tool_detail_line_count(tool) > TOOL_OUTPUT_PREVIEW_LINES
+                )
+            });
+        if can_toggle_output {
+            app.toggle_selected_tool_output();
+        } else {
+            app.toggle_all_cards();
+        }
         return InputAction::None;
     }
 
@@ -1049,9 +1065,9 @@ enum Status {
 impl Status {
     fn color(self) -> Color {
         match self {
-            Self::Idle => SUCCESS,
-            Self::Thinking | Self::RunningTool | Self::Cancelling => ACCENT,
-            Self::Error => ERROR,
+            Self::Idle => OK,
+            Self::Thinking | Self::RunningTool | Self::Cancelling => ACCENT_PRIMARY,
+            Self::Error => BAD,
         }
     }
 
@@ -1085,9 +1101,9 @@ impl ToolStatus {
 
     fn color(self) -> Color {
         match self {
-            Self::Running | Self::Cancelled => ACCENT,
-            Self::Done => SUCCESS,
-            Self::Failed => ERROR,
+            Self::Running | Self::Cancelled => ACCENT_PRIMARY,
+            Self::Done => OK,
+            Self::Failed => BAD,
         }
     }
 }
@@ -1152,6 +1168,23 @@ struct ThinkingEntry {
     expanded: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnOutcome {
+    Done,
+    Failed,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnEntry {
+    outcome: TurnOutcome,
+    model: String,
+    thinking: ThinkingLevel,
+    tool_count: usize,
+    elapsed: Option<Duration>,
+    output_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TranscriptEntry {
     Message {
@@ -1165,6 +1198,7 @@ enum TranscriptEntry {
         detail: String,
         expanded: bool,
     },
+    Turn(TurnEntry),
     Sessions(Vec<crate::session::SessionSummary>),
 }
 
@@ -1192,8 +1226,8 @@ impl Toast {
 
     fn color(&self) -> Color {
         match self.tone {
-            ToastTone::Neutral => ACCENT,
-            ToastTone::Success => SUCCESS,
+            ToastTone::Neutral => ACCENT_PRIMARY,
+            ToastTone::Success => OK,
         }
     }
 }
@@ -1425,6 +1459,8 @@ struct App {
     status: Status,
     busy: bool,
     turn_started: Option<Instant>,
+    turn_tool_count: usize,
+    turn_output_tokens: u64,
     scroll_top: usize,
     max_scroll: usize,
     transcript_page_height: usize,
@@ -1474,6 +1510,8 @@ impl App {
             status: Status::Idle,
             busy: false,
             turn_started: None,
+            turn_tool_count: 0,
+            turn_output_tokens: 0,
             scroll_top: 0,
             max_scroll: 0,
             transcript_page_height: 1,
@@ -1502,13 +1540,19 @@ impl App {
             provider_editor: None,
         };
 
+        let mut restored_turn_open = false;
+        let mut restored_tool_count = 0;
         for message in messages {
             match message {
                 Message::System { .. } => {}
-                Message::User { content } => app.transcript.push(TranscriptEntry::Message {
-                    role: MessageRole::User,
-                    content: content.clone(),
-                }),
+                Message::User { content } => {
+                    restored_turn_open = true;
+                    restored_tool_count = 0;
+                    app.transcript.push(TranscriptEntry::Message {
+                        role: MessageRole::User,
+                        content: content.clone(),
+                    });
+                }
                 Message::Assistant {
                     content,
                     thinking,
@@ -1524,18 +1568,30 @@ impl App {
                                 expanded: false,
                             }));
                     }
+                    let completes_turn = restored_turn_open && tool_calls.is_empty();
+                    if completes_turn {
+                        app.transcript.push(TranscriptEntry::Turn(TurnEntry {
+                            outcome: TurnOutcome::Done,
+                            model: app.model.clone(),
+                            thinking: app.thinking_level.unwrap_or(app.thinking_preference),
+                            tool_count: restored_tool_count,
+                            elapsed: None,
+                            output_tokens: None,
+                        }));
+                    }
                     if !content.is_empty() {
                         app.transcript.push(TranscriptEntry::Message {
                             role: MessageRole::Assistant,
                             content: content.clone(),
                         });
                     }
+                    restored_tool_count = restored_tool_count.saturating_add(tool_calls.len());
                     app.transcript.extend(tool_calls.iter().map(|call| {
                         TranscriptEntry::Tool(ToolEntry {
                             call_id: call.id.clone(),
                             name: call.name.clone(),
                             arguments: truncate_chars(
-                                &format_json(&call.arguments),
+                                &sanitize_terminal_text(&format_json(&call.arguments)),
                                 MAX_TOOL_ARGUMENT_CHARS,
                             ),
                             output: String::new(),
@@ -1547,13 +1603,16 @@ impl App {
                             timeout: app.default_tool_timeout,
                         })
                     }));
+                    if completes_turn {
+                        restored_turn_open = false;
+                    }
                 }
                 Message::Tool {
                     tool_call_id,
                     content,
                 } => {
                     if let Some(tool) = app.find_tool_mut(tool_call_id) {
-                        tool.output.clone_from(content);
+                        tool.output = sanitize_terminal_text(content);
                         tool.status = if content.starts_with("tool error:") {
                             ToolStatus::Failed
                         } else {
@@ -1598,6 +1657,8 @@ impl App {
         self.input_focused = false;
         self.busy = true;
         self.turn_started = Some(Instant::now());
+        self.turn_tool_count = 0;
+        self.turn_output_tokens = 0;
         self.status = Status::Thinking;
         self.scroll_to_bottom();
     }
@@ -1607,8 +1668,44 @@ impl App {
     }
 
     fn finish_turn(&mut self, status: Status) {
+        let outcome = if status == Status::Error {
+            TurnOutcome::Failed
+        } else {
+            TurnOutcome::Done
+        };
+        self.finish_turn_with_outcome(status, outcome);
+    }
+
+    fn finish_turn_with_outcome(&mut self, status: Status, outcome: TurnOutcome) {
+        let elapsed = self.turn_started.take().map(|started| started.elapsed());
+        if elapsed.is_some() {
+            let turn = TranscriptEntry::Turn(TurnEntry {
+                outcome,
+                model: self.model.clone(),
+                thinking: self.thinking_level.unwrap_or(self.thinking_preference),
+                tool_count: self.turn_tool_count,
+                elapsed,
+                output_tokens: (self.turn_output_tokens > 0).then_some(self.turn_output_tokens),
+            });
+            let insert_before_answer = self.transcript.last().is_some_and(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::Message {
+                        role: MessageRole::Assistant,
+                        ..
+                    }
+                )
+            });
+            let insert_at = if insert_before_answer {
+                self.transcript.len().saturating_sub(1)
+            } else {
+                self.transcript.len()
+            };
+            self.transcript.insert(insert_at, turn);
+        }
         self.busy = false;
-        self.turn_started = None;
+        self.turn_tool_count = 0;
+        self.turn_output_tokens = 0;
         self.active_tools.clear();
         self.status = status;
     }
@@ -1642,11 +1739,15 @@ impl App {
                 timeout,
             } => {
                 self.active_tools.insert(call_id.clone(), name.clone());
+                self.turn_tool_count = self.turn_tool_count.saturating_add(1);
                 self.status = Status::RunningTool;
                 self.transcript.push(TranscriptEntry::Tool(ToolEntry {
                     call_id,
                     name,
-                    arguments: truncate_chars(&format_json(&arguments), MAX_TOOL_ARGUMENT_CHARS),
+                    arguments: truncate_chars(
+                        &sanitize_terminal_text(&format_json(&arguments)),
+                        MAX_TOOL_ARGUMENT_CHARS,
+                    ),
                     output: String::new(),
                     status: ToolStatus::Running,
                     expanded: false,
@@ -1663,6 +1764,7 @@ impl App {
                 is_error,
                 elapsed,
             } => {
+                let output = sanitize_terminal_text(&output);
                 let status = if is_error {
                     ToolStatus::Failed
                 } else {
@@ -1704,6 +1806,7 @@ impl App {
                 output_tokens,
                 elapsed,
             } => {
+                self.turn_output_tokens = self.turn_output_tokens.saturating_add(output_tokens);
                 self.tokens_per_second = (elapsed > Duration::ZERO)
                     .then(|| output_tokens as f64 / elapsed.as_secs_f64())
                     .filter(|rate| rate.is_finite());
@@ -1718,7 +1821,7 @@ impl App {
                         tool.started_at = None;
                     }
                 }
-                self.finish_turn(Status::Idle);
+                self.finish_turn_with_outcome(Status::Idle, TurnOutcome::Stopped);
                 self.show_toast("Turn interrupted".to_owned(), ToastTone::Neutral);
             }
             AgentEvent::TurnEnd => self.finish_turn(Status::Idle),
@@ -1768,6 +1871,10 @@ impl App {
         self.input_focused = true;
         self.help_selected = 0;
         self.status = Status::Idle;
+        self.busy = false;
+        self.turn_started = None;
+        self.turn_tool_count = 0;
+        self.turn_output_tokens = 0;
         self.toast = None;
         self.help_open = false;
         self.session_picker = None;
@@ -1805,6 +1912,7 @@ impl App {
     }
 
     fn record_error(&mut self, message: String) {
+        let message = sanitize_terminal_text(&message);
         if !self.remember_error(&message) {
             return;
         }
@@ -1996,7 +2104,7 @@ impl App {
         let Some(TranscriptEntry::Tool(tool)) = self.transcript.get_mut(selected) else {
             return;
         };
-        if tool.expanded && tool_output_line_count(&tool.output) > TOOL_OUTPUT_PREVIEW_LINES {
+        if tool.expanded && tool_detail_line_count(tool) > TOOL_OUTPUT_PREVIEW_LINES {
             tool.show_full_output = !tool.show_full_output;
         }
     }
@@ -3160,15 +3268,21 @@ fn render_working_line(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .turn_started
         .map(|started| started.elapsed().as_secs_f32())
         .unwrap_or(0.0);
-    frame.render_widget(
-        Paragraph::new(working_shimmer_line(text, elapsed)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(working_shimmer_line(text, elapsed)), area);
+}
+
+fn lerp_color(from: Color, to: Color, t: f32) -> Color {
+    let (Color::Rgb(fr, fg, fb), Color::Rgb(tr, tg, tb)) = (from, to) else {
+        return if t < 0.5 { from } else { to };
+    };
+    let t = t.clamp(0.0, 1.0);
+    let blend = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color::Rgb(blend(fr, tr), blend(fg, tg), blend(fb, tb))
 }
 
 fn working_shimmer_line(text: &str, elapsed_secs: f32) -> Line<'static> {
-    const BAND: f32 = 4.0;
-    const PERIOD_SECS: f32 = 1.0;
+    const BAND: f32 = 5.0;
+    const PERIOD_SECS: f32 = 1.2;
     let len = text.chars().count() as f32;
     let progress = (elapsed_secs % PERIOD_SECS) / PERIOD_SECS;
     let center = progress * (len + BAND * 2.0) - BAND;
@@ -3176,13 +3290,20 @@ fn working_shimmer_line(text: &str, elapsed_secs: f32) -> Line<'static> {
         .chars()
         .enumerate()
         .map(|(index, ch)| {
-            let distance = (index as f32 - center).abs();
-            let style = if distance > BAND / 2.0 {
-                Style::default().fg(DIM)
-            } else if distance <= 1.0 {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            let distance = index as f32 - center;
+            let style = if distance.abs() > BAND / 2.0 {
+                Style::default().fg(TEXT_DIM)
+            } else if distance.abs() <= 1.0 {
+                Style::default()
+                    .fg(ACCENT_PRIMARY)
+                    .add_modifier(Modifier::BOLD)
+            } else if distance > 0.0 {
+                // leading edge: solid primary
+                Style::default().fg(ACCENT_PRIMARY)
             } else {
-                Style::default().fg(ACCENT)
+                // trailing edge: ease from primary toward secondary
+                let t = (distance.abs() - 1.0) / (BAND / 2.0 - 1.0);
+                Style::default().fg(lerp_color(ACCENT_PRIMARY, ACCENT_SECONDARY, t))
             };
             Span::styled(ch.to_string(), style)
         })
@@ -3203,7 +3324,6 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         frame,
         Rect::new(area.x, area.y, area.width, status_height),
         app,
-        false,
     );
     let input = Rect::new(
         area.x,
@@ -3219,43 +3339,42 @@ enum StatuslineLayout {
     Full,
     WithoutIdentifier,
     ShortPath,
-    ShortContext,
-    WithoutSpeed,
     WithoutGit,
-    Core,
+    WithoutPath,
+    WithoutSpeed,
     PointState,
-    ContextOnly,
+    WithoutState,
+    WithoutBrand,
+    ShortContext,
 }
 
-struct StatuslineFields<'a> {
-    model: &'a str,
-    thinking: &'a str,
-    cwd: &'a str,
-    project: &'a str,
-    git: Option<&'a str>,
-    short_git: Option<&'a str>,
-    identifier: Option<&'a str>,
+const STATUSLINE_LADDER: [StatuslineLayout; 10] = [
+    StatuslineLayout::Full,
+    StatuslineLayout::WithoutIdentifier,
+    StatuslineLayout::ShortPath,
+    StatuslineLayout::WithoutGit,
+    StatuslineLayout::WithoutPath,
+    StatuslineLayout::WithoutSpeed,
+    StatuslineLayout::PointState,
+    StatuslineLayout::WithoutState,
+    StatuslineLayout::WithoutBrand,
+    StatuslineLayout::ShortContext,
+];
+
+struct StatuslineInputs {
+    model: String,
+    thinking: &'static str,
+    cwd: String,
+    project: String,
+    git: Option<String>,
+    identifier: Option<String>,
+    speed: Option<String>,
+    context: String,
+    short_context: String,
+    state: String,
 }
 
-fn render_statusline(frame: &mut Frame<'_>, area: Rect, app: &mut App, subdued: bool) {
-    if area.is_empty() {
-        return;
-    }
-    register_statusline_hits(app, area);
-    frame.render_widget(
-        Paragraph::new(statusline_line(app, area.width as usize, subdued))
-            .style(Style::default().bg(BACKGROUND))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn statusline_line(app: &App, width: usize, subdued: bool) -> Line<'static> {
-    if width == 0 {
-        return Line::default();
-    }
-    let model = model_short_name(&app.model);
-    let thinking = thinking_short_name(app.thinking_level.unwrap_or(app.thinking_preference));
+fn statusline_inputs(app: &App) -> StatuslineInputs {
     let cwd = app.working_dir.display().to_string();
     let project = app
         .working_dir
@@ -3264,150 +3383,181 @@ fn statusline_line(app: &App, width: usize, subdued: bool) -> Line<'static> {
         .filter(|name| !name.is_empty())
         .unwrap_or(cwd.as_str())
         .to_owned();
-    let git = app.git_status.as_ref().map(git_status_label);
-    let short_git = app.git_status.as_ref().map(|git| {
-        let dirty = dirty_suffix(git.dirty_count);
-        format!("{}{}", truncate_inline(&git.branch, 14), dirty)
-    });
-    let identifier = app
-        .session_id
-        .as_deref()
-        .map(short_session_id)
-        .or_else(|| app.git_status.as_ref().map(|git| git.commit.as_str()))
-        .map(str::to_owned);
-    let context = context_label(app);
-    let speed = (!app.busy)
-        .then_some(app.tokens_per_second)
-        .flatten()
-        .map(|rate| format!("{rate:.1} tok/s"));
-    let state = format!(
-        "{} {}",
-        app.status.symbol(),
-        statusline_state_label(app.status)
-    );
-    let fields = StatuslineFields {
-        model: &model,
-        thinking,
-        cwd: &cwd,
-        project: &project,
-        git: git.as_deref(),
-        short_git: short_git.as_deref(),
-        identifier: identifier.as_deref(),
-    };
-
-    let layouts = [
-        StatuslineLayout::Full,
-        StatuslineLayout::WithoutIdentifier,
-        StatuslineLayout::ShortPath,
-        StatuslineLayout::ShortContext,
-        StatuslineLayout::WithoutSpeed,
-        StatuslineLayout::WithoutGit,
-        StatuslineLayout::Core,
-        StatuslineLayout::PointState,
-        StatuslineLayout::ContextOnly,
-    ];
-    for layout in layouts {
-        let left = statusline_left_parts(layout, &fields);
-        let right = statusline_right_parts(
-            layout,
-            speed.as_deref(),
-            &context,
-            &state,
+    let percent = app.context_chars as f64 * 100.0 / app.max_context_chars.max(1) as f64;
+    StatuslineInputs {
+        model: model_short_name(&app.model),
+        thinking: thinking_short_name(app.thinking_level.unwrap_or(app.thinking_preference)),
+        cwd,
+        project,
+        git: app.git_status.as_ref().map(git_status_label),
+        identifier: app
+            .session_id
+            .as_deref()
+            .map(short_session_id)
+            .or_else(|| app.git_status.as_ref().map(|git| git.commit.as_str()))
+            .map(str::to_owned),
+        speed: (!app.busy)
+            .then_some(app.tokens_per_second)
+            .flatten()
+            .map(|rate| format!("{rate:.1} tok/s")),
+        context: format!(
+            "ctx {percent:.1}%/{}",
+            format_char_budget(app.max_context_chars)
+        ),
+        short_context: format!("{percent:.1}%"),
+        state: format!(
+            "{} {}",
             app.status.symbol(),
-        );
+            statusline_state_label(app.status)
+        ),
+    }
+}
+
+fn render_statusline(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    if area.is_empty() {
+        return;
+    }
+    register_statusline_hits(app, area);
+    frame.render_widget(
+        Paragraph::new(statusline_line(app, area.width as usize))
+            .style(Style::default().bg(BACKGROUND))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn statusline_line(app: &App, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+    let inputs = statusline_inputs(app);
+    for layout in STATUSLINE_LADDER {
+        let left = statusline_left_parts(layout, &inputs);
+        let right = statusline_right_parts(layout, &inputs, app.status.symbol());
         if statusline_parts_width(&left, &right) <= width {
-            return styled_statusline(left, right, width, app.status, subdued);
+            return styled_statusline(layout, left, right, width, app.status);
         }
     }
 
-    compact_statusline(&model, thinking, &context, width, subdued)
+    compact_statusline(&inputs.model, inputs.thinking, &inputs.context, width)
 }
 
 fn register_statusline_hits(app: &mut App, area: Rect) {
     if area.width == 0 {
         return;
     }
-    let model = model_short_name(&app.model);
-    let thinking = thinking_short_name(app.thinking_level.unwrap_or(app.thinking_preference));
-    let separator_width = UnicodeWidthStr::width("  ·  ") as u16;
-    let model_x = area
-        .x
-        .saturating_add(UnicodeWidthStr::width("ZEX") as u16)
-        .saturating_add(separator_width);
+    let width = area.width as usize;
+    let inputs = statusline_inputs(app);
+    let wide_separator = UnicodeWidthStr::width("  ·  ") as u16;
+    let mut separator_width = wide_separator;
+    let mut has_brand = true;
+    let mut model = inputs.model.clone();
+    let mut fitted = false;
+    for layout in STATUSLINE_LADDER {
+        let left = statusline_left_parts(layout, &inputs);
+        let right = statusline_right_parts(layout, &inputs, app.status.symbol());
+        if statusline_parts_width(&left, &right) <= width {
+            has_brand = !matches!(
+                layout,
+                StatuslineLayout::WithoutBrand | StatuslineLayout::ShortContext
+            );
+            fitted = true;
+            break;
+        }
+    }
+    if !fitted {
+        separator_width = UnicodeWidthStr::width(" · ") as u16;
+        let fixed = UnicodeWidthStr::width("ZEX")
+            + UnicodeWidthStr::width(inputs.thinking)
+            + UnicodeWidthStr::width(inputs.context.as_str())
+            + UnicodeWidthStr::width(" · ") * 3;
+        model = truncate_inline(&inputs.model, width.saturating_sub(fixed).max(1));
+    }
+    let mut x = area.x;
+    if has_brand {
+        x = x
+            .saturating_add(UnicodeWidthStr::width("ZEX") as u16)
+            .saturating_add(separator_width);
+    }
     let model_width =
-        (UnicodeWidthStr::width(model.as_str()) as u16).min(area.right().saturating_sub(model_x));
-    let thinking_x = model_x
+        (UnicodeWidthStr::width(model.as_str()) as u16).min(area.right().saturating_sub(x));
+    app.register_hit(Rect::new(x, area.y, model_width, 1), HitTarget::StatusModel);
+    let thinking_x = x
         .saturating_add(model_width)
         .saturating_add(separator_width);
-    let thinking_width =
-        (UnicodeWidthStr::width(thinking) as u16).min(area.right().saturating_sub(thinking_x));
-    app.register_hit(
-        Rect::new(model_x, area.y, model_width, 1),
-        HitTarget::StatusModel,
-    );
+    let thinking_width = (UnicodeWidthStr::width(inputs.thinking) as u16)
+        .min(area.right().saturating_sub(thinking_x));
     app.register_hit(
         Rect::new(thinking_x, area.y, thinking_width, 1),
         HitTarget::StatusThinking,
     );
 }
 
-fn statusline_left_parts(layout: StatuslineLayout, fields: &StatuslineFields<'_>) -> Vec<String> {
-    let mut parts = vec![
-        "ZEX".to_owned(),
-        fields.model.to_owned(),
-        fields.thinking.to_owned(),
-    ];
+fn statusline_left_parts(layout: StatuslineLayout, inputs: &StatuslineInputs) -> Vec<String> {
+    let mut parts = Vec::new();
+    if !matches!(
+        layout,
+        StatuslineLayout::WithoutBrand | StatuslineLayout::ShortContext
+    ) {
+        parts.push("ZEX".to_owned());
+    }
+    parts.push(inputs.model.clone());
+    parts.push(inputs.thinking.to_owned());
     match layout {
         StatuslineLayout::Full => {
-            parts.push(fields.cwd.to_owned());
-            parts.extend(fields.git.map(str::to_owned));
-            parts.extend(fields.identifier.map(str::to_owned));
+            parts.push(inputs.cwd.clone());
+            parts.extend(inputs.git.clone());
+            parts.extend(inputs.identifier.clone());
         }
         StatuslineLayout::WithoutIdentifier => {
-            parts.push(fields.cwd.to_owned());
-            parts.extend(fields.git.map(str::to_owned));
+            parts.push(inputs.cwd.clone());
+            parts.extend(inputs.git.clone());
         }
         StatuslineLayout::ShortPath => {
-            parts.push(fields.project.to_owned());
-            parts.extend(fields.git.map(str::to_owned));
+            parts.push(inputs.project.clone());
+            parts.extend(inputs.git.clone());
         }
-        StatuslineLayout::ShortContext | StatuslineLayout::WithoutSpeed => {
-            parts.push(fields.project.to_owned());
-            parts.extend(fields.short_git.map(str::to_owned));
-        }
-        StatuslineLayout::WithoutGit => parts.push(fields.project.to_owned()),
-        StatuslineLayout::Core | StatuslineLayout::PointState | StatuslineLayout::ContextOnly => {}
+        StatuslineLayout::WithoutGit => parts.push(inputs.project.clone()),
+        _ => {}
     }
     parts
 }
 
+/// Right side parts as `(text, is_state)`; the state flag keeps the status
+/// color on the state field even when it is no longer the last part.
 fn statusline_right_parts(
     layout: StatuslineLayout,
-    speed: Option<&str>,
-    context: &str,
-    state: &str,
+    inputs: &StatuslineInputs,
     state_symbol: &str,
-) -> Vec<String> {
+) -> Vec<(String, bool)> {
     let mut parts = Vec::new();
     if matches!(
         layout,
         StatuslineLayout::Full
             | StatuslineLayout::WithoutIdentifier
             | StatuslineLayout::ShortPath
-            | StatuslineLayout::ShortContext
+            | StatuslineLayout::WithoutGit
+            | StatuslineLayout::WithoutPath
     ) {
-        parts.extend(speed.map(str::to_owned));
+        parts.extend(inputs.speed.clone().map(|speed| (speed, false)));
     }
-    parts.push(context.to_owned());
+    let context = if matches!(layout, StatuslineLayout::ShortContext) {
+        inputs.short_context.clone()
+    } else {
+        inputs.context.clone()
+    };
+    parts.push((context, false));
     match layout {
-        StatuslineLayout::PointState => parts.push(state_symbol.to_owned()),
-        StatuslineLayout::ContextOnly => {}
-        _ => parts.push(state.to_owned()),
+        StatuslineLayout::PointState => parts.push((state_symbol.to_owned(), true)),
+        StatuslineLayout::WithoutState
+        | StatuslineLayout::WithoutBrand
+        | StatuslineLayout::ShortContext => {}
+        _ => parts.push((inputs.state.clone(), true)),
     }
     parts
 }
 
-fn statusline_parts_width(left: &[String], right: &[String]) -> usize {
+fn statusline_parts_width(left: &[String], right: &[(String, bool)]) -> usize {
     let separator_width = UnicodeWidthStr::width("  ·  ");
     let left_width = left
         .iter()
@@ -3416,100 +3566,93 @@ fn statusline_parts_width(left: &[String], right: &[String]) -> usize {
         + separator_width.saturating_mul(left.len().saturating_sub(1));
     let right_width = right
         .iter()
-        .map(|part| UnicodeWidthStr::width(part.as_str()))
+        .map(|(part, _)| UnicodeWidthStr::width(part.as_str()))
         .sum::<usize>()
         + separator_width.saturating_mul(right.len().saturating_sub(1));
     left_width + right_width + usize::from(!left.is_empty() && !right.is_empty()) * 2
 }
 
 fn styled_statusline(
+    layout: StatuslineLayout,
     left: Vec<String>,
-    right: Vec<String>,
+    right: Vec<(String, bool)>,
     width: usize,
     status: Status,
-    subdued: bool,
 ) -> Line<'static> {
     let content_width = statusline_parts_width(&left, &right);
     let spacer = width.saturating_sub(content_width);
-    let strong = if subdued { TEXT } else { TEXT_STRONG };
-    let secondary = if subdued { MUTED } else { DIM };
-    let separator = if subdued {
-        MUTED
-    } else {
-        Color::Rgb(72, 82, 90)
-    };
+    let has_brand = !matches!(
+        layout,
+        StatuslineLayout::WithoutBrand | StatuslineLayout::ShortContext
+    );
+    let model_index = usize::from(has_brand);
+    let separator = Color::Rgb(82, 82, 82);
     let mut spans = Vec::new();
     for (index, part) in left.into_iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled("  ·  ", Style::default().fg(separator)));
         }
-        let style = match index {
-            0 => Style::default()
-                .fg(if subdued { DIM } else { ACCENT })
-                .add_modifier(Modifier::BOLD),
-            1 | 2 => Style::default()
-                .fg(strong)
-                .add_modifier(Modifier::UNDERLINED),
-            _ => Style::default().fg(secondary),
+        let style = if has_brand && index == 0 {
+            Style::default()
+                .fg(TEXT_STRONG)
+                .add_modifier(Modifier::BOLD)
+        } else if index == model_index || index == model_index + 1 {
+            Style::default()
+                .fg(ACCENT_PRIMARY)
+                .add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(TEXT_DIM)
         };
         spans.push(Span::styled(part, style));
     }
     if !spans.is_empty() && !right.is_empty() {
         spans.push(Span::raw(" ".repeat(spacer.saturating_add(2))));
     }
-    let right_len = right.len();
-    for (index, part) in right.into_iter().enumerate() {
+    for (index, (part, is_state)) in right.into_iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled("  ·  ", Style::default().fg(separator)));
         }
-        let style = if index + 1 == right_len {
-            Style::default().fg(if subdued { DIM } else { status.color() })
+        let style = if is_state {
+            Style::default().fg(status.color())
         } else {
-            Style::default().fg(secondary)
+            Style::default().fg(TEXT_DIM)
         };
         spans.push(Span::styled(part, style));
     }
     Line::from(spans)
 }
 
-fn compact_statusline(
-    model: &str,
-    thinking: &str,
-    context: &str,
-    width: usize,
-    subdued: bool,
-) -> Line<'static> {
+fn compact_statusline(model: &str, thinking: &str, context: &str, width: usize) -> Line<'static> {
     let separator = " · ";
     let fixed = UnicodeWidthStr::width("ZEX")
         + UnicodeWidthStr::width(thinking)
         + UnicodeWidthStr::width(context)
         + UnicodeWidthStr::width(separator) * 3;
     let model = truncate_inline(model, width.saturating_sub(fixed).max(1));
-    let strong = if subdued { TEXT } else { TEXT_STRONG };
-    let separator_style = Style::default().fg(if subdued { MUTED } else { DIM });
+    let separator_style = Style::default().fg(TEXT_DIM);
     Line::from(vec![
         Span::styled(
             "ZEX",
             Style::default()
-                .fg(if subdued { DIM } else { ACCENT })
+                .fg(TEXT_STRONG)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(separator, separator_style),
         Span::styled(
             model,
             Style::default()
-                .fg(strong)
+                .fg(ACCENT_PRIMARY)
                 .add_modifier(Modifier::UNDERLINED),
         ),
         Span::styled(separator, separator_style),
         Span::styled(
             thinking.to_owned(),
             Style::default()
-                .fg(strong)
+                .fg(ACCENT_PRIMARY)
                 .add_modifier(Modifier::UNDERLINED),
         ),
         Span::styled(separator, separator_style),
-        Span::styled(context.to_owned(), Style::default().fg(DIM)),
+        Span::styled(context.to_owned(), Style::default().fg(TEXT_DIM)),
     ])
 }
 
@@ -3541,14 +3684,6 @@ fn dirty_suffix(count: usize) -> String {
     } else {
         format!(" *{count}")
     }
-}
-
-fn context_label(app: &App) -> String {
-    let percent = app.context_chars as f64 * 100.0 / app.max_context_chars.max(1) as f64;
-    format!(
-        "{percent:.1}%/{}",
-        format_char_budget(app.max_context_chars)
-    )
 }
 
 fn format_char_budget(chars: usize) -> String {
@@ -3597,7 +3732,7 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
                 } else {
                     "  ↑↓ select · Enter resume · Esc cancel"
                 },
-                Style::default().fg(DIM),
+                Style::default().fg(TEXT_DIM),
             ),
         ]),
         Line::default(),
@@ -3606,7 +3741,7 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
     if picker.sessions.is_empty() {
         lines.push(Line::from(Span::styled(
             "No saved sessions",
-            Style::default().fg(DIM),
+            Style::default().fg(TEXT_DIM),
         )));
     } else {
         let start = picker
@@ -3631,7 +3766,7 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
                 BACKGROUND
             };
             let foreground = TEXT_STRONG;
-            let secondary = if selected { TEXT } else { DIM };
+            let secondary = if selected { TEXT } else { TEXT_DIM };
             let marker = if selected { "▌" } else { " " };
             let timestamp = format_session_time(session.updated_at);
             let metadata = format!(
@@ -3716,7 +3851,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     .fg(TEXT_STRONG)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  Current: ", Style::default().fg(DIM)),
+            Span::styled("  Current: ", Style::default().fg(TEXT_DIM)),
             Span::styled(current, Style::default().fg(TEXT)),
         ]),
         Line::default(),
@@ -3730,7 +3865,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             )),
             Line::from(Span::styled(
                 "Add a Provider and at least one model with /provider.",
-                Style::default().fg(DIM),
+                Style::default().fg(TEXT_DIM),
             )),
         ]);
     } else {
@@ -3743,7 +3878,9 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 provider = &choice.provider_name;
                 lines.push(Line::from(Span::styled(
                     provider.to_owned(),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(ACCENT_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
                 )));
             }
             let target = HitTarget::Model(index);
@@ -3768,11 +3905,11 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     Span::styled(
                         format!("{marker} {current_marker} "),
                         Style::default().fg(if selected {
-                            ACCENT
+                            ACCENT_PRIMARY
                         } else if current {
-                            SUCCESS
+                            OK
                         } else {
-                            MUTED
+                            TEXT_FAINT
                         }),
                     ),
                     Span::styled(
@@ -3781,27 +3918,30 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     ),
                     Span::styled(
                         pad_display(&single_line(&choice.target.model_id, 28), 30),
-                        Style::default().fg(DIM),
+                        Style::default().fg(TEXT_DIM),
                     ),
-                    Span::styled(format!("think {thinking}"), Style::default().fg(DIM)),
+                    Span::styled(format!("think {thinking}"), Style::default().fg(TEXT_DIM)),
                 ])
             } else {
                 Line::from(vec![
                     Span::styled(
                         format!("{marker} {current_marker} "),
                         Style::default().fg(if selected {
-                            ACCENT
+                            ACCENT_PRIMARY
                         } else if current {
-                            SUCCESS
+                            OK
                         } else {
-                            MUTED
+                            TEXT_FAINT
                         }),
                     ),
                     Span::styled(
                         single_line(&choice.model_name, area.width.saturating_sub(18) as usize),
                         Style::default().fg(TEXT_STRONG),
                     ),
-                    Span::styled(format!(" · think {thinking}"), Style::default().fg(DIM)),
+                    Span::styled(
+                        format!(" · think {thinking}"),
+                        Style::default().fg(TEXT_DIM),
+                    ),
                 ])
             };
             lines.push(row.style(Style::default().bg(background)));
@@ -3847,9 +3987,9 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         area.height,
     );
     let left_style = if editor.pane == ProviderPane::Providers {
-        Style::default().fg(ACCENT)
+        Style::default().fg(ACCENT_PRIMARY)
     } else {
-        Style::default().fg(MUTED)
+        Style::default().fg(TEXT_FAINT)
     };
     let mut provider_lines = vec![
         Line::from(Span::styled(
@@ -3863,11 +4003,11 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if editor.draft.providers.is_empty() {
         provider_lines.push(Line::from(Span::styled(
             "No Providers configured",
-            Style::default().fg(DIM),
+            Style::default().fg(TEXT_DIM),
         )));
         provider_lines.push(Line::from(Span::styled(
             "Press n to add one.",
-            Style::default().fg(DIM),
+            Style::default().fg(TEXT_DIM),
         )));
     } else {
         for (index, provider) in editor.draft.providers.iter().enumerate() {
@@ -3882,7 +4022,7 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Line::from(vec![
                     Span::styled(
                         if selected { "▌ " } else { "  " },
-                        Style::default().fg(ACCENT),
+                        Style::default().fg(ACCENT_PRIMARY),
                     ),
                     Span::styled(
                         single_line(
@@ -3931,7 +4071,7 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Line::default(),
                 Line::from(Span::styled(
                     "Create a Provider to configure its endpoint and models.",
-                    Style::default().fg(DIM),
+                    Style::default().fg(TEXT_DIM),
                 )),
             ]),
             right,
@@ -3969,7 +4109,11 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let mut lines = vec![Line::from(Span::styled(
         "Provider details",
         Style::default()
-            .fg(if detail_active { ACCENT } else { TEXT_STRONG })
+            .fg(if detail_active {
+                ACCENT_PRIMARY
+            } else {
+                TEXT_STRONG
+            })
             .add_modifier(Modifier::BOLD),
     ))];
     for (index, (label, value)) in fields.into_iter().enumerate() {
@@ -3984,7 +4128,7 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Line::from(vec![
                 Span::styled(
                     format!("{} {:<10}", if selected { "▌" } else { " " }, label),
-                    Style::default().fg(if selected { ACCENT } else { DIM }),
+                    Style::default().fg(if selected { ACCENT_PRIMARY } else { TEXT_DIM }),
                 ),
                 Span::styled(single_line(&value, 70), Style::default().fg(TEXT_STRONG)),
             ])
@@ -4002,14 +4146,18 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Line::from(Span::styled(
             "Models",
             Style::default()
-                .fg(if model_active { ACCENT } else { TEXT_STRONG })
+                .fg(if model_active {
+                    ACCENT_PRIMARY
+                } else {
+                    TEXT_STRONG
+                })
                 .add_modifier(Modifier::BOLD),
         )),
     ]);
     if provider.models.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No models · focus Models and press n",
-            Style::default().fg(DIM),
+            Style::default().fg(TEXT_DIM),
         )));
     } else {
         for (index, model) in provider.models.iter().enumerate() {
@@ -4036,7 +4184,7 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Line::from(vec![
                     Span::styled(
                         if selected { "▌ " } else { "  " },
-                        Style::default().fg(ACCENT),
+                        Style::default().fg(ACCENT_PRIMARY),
                     ),
                     Span::styled(
                         pad_display(&single_line(&model.display_name, 28), 30),
@@ -4044,11 +4192,11 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     ),
                     Span::styled(
                         pad_display(&single_line(&model.id, 24), 26),
-                        Style::default().fg(DIM),
+                        Style::default().fg(TEXT_DIM),
                     ),
                     Span::styled(
                         format!("think {thinking}  map {map}"),
-                        Style::default().fg(DIM),
+                        Style::default().fg(TEXT_DIM),
                     ),
                 ])
                 .style(Style::default().bg(if selected || armed {
@@ -4066,7 +4214,9 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Line::default(),
             Line::from(Span::styled(
                 "Edit value",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(ACCENT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 if matches!(
@@ -4081,7 +4231,7 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             )),
             Line::from(Span::styled(
                 "Enter apply field · Esc cancel",
-                Style::default().fg(DIM),
+                Style::default().fg(TEXT_DIM),
             )),
         ]);
     }
@@ -4093,11 +4243,11 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     ProviderDialog::Delete(_) => "Delete selected item?",
                     ProviderDialog::Discard => "Discard unsaved changes?",
                 },
-                Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
+                Style::default().fg(BAD).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 "Enter/y confirm · Esc/n cancel",
-                Style::default().fg(DIM),
+                Style::default().fg(TEXT_DIM),
             )),
         ]);
     }
@@ -4152,12 +4302,12 @@ fn ui_regions(area: Rect, app: &App) -> UiRegions {
         .total_rows
         .clamp(1, MAX_INPUT_ROWS)
     };
-    let preferred_footer_height = (requested_input_rows as u16).saturating_add(3);
+    let preferred_footer_height = (requested_input_rows as u16).saturating_add(1);
     let footer_height = if area.height
         >= keymap_height
             .saturating_add(working_height)
             .saturating_add(MIN_TRANSCRIPT_HEIGHT)
-            .saturating_add(4)
+            .saturating_add(2)
     {
         preferred_footer_height.min(
             area.height
@@ -4169,7 +4319,7 @@ fn ui_regions(area: Rect, app: &App) -> UiRegions {
         area.height
             .saturating_sub(keymap_height)
             .saturating_sub(working_height)
-            .min(3)
+            .min(2)
     };
     let fixed_height = footer_height + keymap_height + working_height;
     let remaining = area.height.saturating_sub(fixed_height);
@@ -4296,7 +4446,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let width = indicator.chars().count().min(area.width as usize) as u16;
         let x = area.right().saturating_sub(width);
         frame.render_widget(
-            Paragraph::new(indicator).style(Style::default().fg(DIM)),
+            Paragraph::new(indicator).style(Style::default().fg(TEXT_DIM)),
             Rect::new(x, area.y, width, 1),
         );
     }
@@ -4333,15 +4483,16 @@ fn landing_regions(area: Rect, app: &App) -> LandingRegions {
         area.width,
         area.height.saturating_sub(status_height),
     );
+    let card_width = landing_card_width(area.width);
     let input_rows = input_metrics(
         &app.input.content,
         app.input.cursor,
-        area.width.saturating_sub(12).clamp(1, 72) as usize,
+        card_width.saturating_sub(4).max(1) as usize,
     )
     .total_rows
     .clamp(1, MAX_INPUT_ROWS) as u16;
     let card_height = match stage.height {
-        9.. => input_rows.saturating_add(2).max(3),
+        9.. => input_rows.saturating_add(1).max(2),
         5..=8 => 3,
         1..=4 => 1,
         _ => 0,
@@ -4358,12 +4509,6 @@ fn landing_regions(area: Rect, app: &App) -> LandingRegions {
     let hint_gap = u16::from(hint_height > 0 && stage.height >= 10);
     let group_height = brand_height + brand_gap + card_height + hint_gap + hint_height;
     let group_y = stage.y + stage.height.saturating_sub(group_height) / 2;
-    let card_margin = if area.width >= 24 { 4 } else { 1 };
-    let card_width = area
-        .width
-        .saturating_sub(card_margin * 2)
-        .min(76)
-        .max(u16::from(area.width > 0));
     let card_x = area.x + area.width.saturating_sub(card_width) / 2;
     let brand = Rect::new(area.x, group_y, area.width, brand_height);
     let card_y = brand.bottom().saturating_add(brand_gap);
@@ -4390,25 +4535,12 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let regions = landing_regions(area, app);
 
     if !regions.brand.is_empty() {
-        let brand = if area.width >= 12 {
-            Line::from(vec![
-                Span::styled(
-                    "Z  E  ",
-                    Style::default()
-                        .fg(TEXT_STRONG)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "X",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-            ])
-        } else {
-            Line::from(Span::styled(
-                "ZEX",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ))
-        };
+        let brand = Line::from(Span::styled(
+            "ZEX",
+            Style::default()
+                .fg(TEXT_STRONG)
+                .add_modifier(Modifier::BOLD),
+        ));
         frame.render_widget(
             Paragraph::new(brand).alignment(Alignment::Center),
             regions.brand,
@@ -4426,7 +4558,7 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             "Enter send  ·  /"
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(hint, Style::default().fg(MUTED)))
+            Paragraph::new(Span::styled(hint, Style::default().fg(TEXT_FAINT)))
                 .alignment(Alignment::Center),
             regions.hint,
         );
@@ -4448,11 +4580,71 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
+fn landing_card_width(width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    let max_width = width.saturating_sub(2).max(1);
+    let target = (u32::from(width) * 3 / 5) as u16;
+    target.clamp(max_width.min(24), max_width.min(72))
+}
+
 fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.is_empty() {
         return;
     }
-    render_input_frame(frame, area, app);
+    app.register_hit(area, HitTarget::Input);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::NONE)
+            .style(Style::default().bg(SURFACE)),
+        area,
+    );
+    if area.width <= 3 || area.height == 0 {
+        return;
+    }
+    let inner_rows = area.height;
+    for row in 0..inner_rows {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "▌",
+                Style::default().fg(ACCENT_PRIMARY).bg(SURFACE),
+            )),
+            Rect::new(area.x, area.y + row, 1, 1),
+        );
+    }
+    let model_row = u16::from(inner_rows >= 2);
+    let editor_area = Rect::new(
+        area.x + 3,
+        area.y,
+        area.width.saturating_sub(4),
+        inner_rows - model_row,
+    );
+    if model_row == 1 {
+        let model = model_short_name(&app.model);
+        let thinking = thinking_short_name(app.thinking_level.unwrap_or(app.thinking_preference));
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("{model}  ·  {thinking}"),
+                Style::default().fg(TEXT_DIM).bg(SURFACE),
+            ))
+            .style(Style::default().bg(SURFACE)),
+            Rect::new(editor_area.x, editor_area.bottom(), editor_area.width, 1),
+        );
+    }
+    if !editor_area.is_empty() {
+        render_input_buffer(
+            frame,
+            editor_area,
+            app,
+            "",
+            Some(Line::from(Span::styled(
+                "ask anything…",
+                Style::default().fg(TEXT_FAINT).bg(SURFACE),
+            ))),
+            SURFACE,
+        );
+    }
 }
 
 fn render_landing_status(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -4463,7 +4655,19 @@ fn render_landing_status(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.is_empty() {
         return;
     }
-    render_statusline(frame, area, app, true);
+    let label = truncate_inline(
+        &format!(
+            "{}  ·  Zex v{}",
+            app.working_dir.display(),
+            env!("CARGO_PKG_VERSION")
+        ),
+        area.width as usize,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(label, Style::default().fg(TEXT_FAINT)))
+            .style(Style::default().bg(BACKGROUND)),
+        area,
+    );
 }
 
 fn completion_height(app: &App, width: u16) -> u16 {
@@ -4536,7 +4740,7 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     Modifier::empty()
                 });
             let marker_style = Style::default()
-                .fg(if selected { ACCENT } else { MUTED })
+                .fg(if selected { ACCENT_PRIMARY } else { TEXT_FAINT })
                 .bg(if selected || armed {
                     SURFACE_RAISED
                 } else if hovered {
@@ -4544,16 +4748,15 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 } else {
                     SURFACE
                 });
-            let description_style =
-                Style::default()
-                    .fg(if selected { TEXT } else { DIM })
-                    .bg(if selected || armed {
-                        SURFACE_RAISED
-                    } else if hovered {
-                        SURFACE_HOVER
-                    } else {
-                        SURFACE
-                    });
+            let description_style = Style::default()
+                .fg(if selected { TEXT } else { TEXT_DIM })
+                .bg(if selected || armed {
+                    SURFACE_RAISED
+                } else if hovered {
+                    SURFACE_HOVER
+                } else {
+                    SURFACE
+                });
             let row_style = Style::default().bg(if selected || armed {
                 SURFACE_RAISED
             } else if hovered {
@@ -4582,7 +4785,7 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .collect::<Vec<_>>();
     let inner = Block::default()
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(MUTED))
+        .border_style(Style::default().fg(TEXT_FAINT))
         .padding(ratatui::widgets::Padding::horizontal(1))
         .inner(area);
     for index in 0..matches.len().min(inner.height as usize) {
@@ -4601,7 +4804,7 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .block(
                 Block::default()
                     .borders(Borders::TOP)
-                    .border_style(Style::default().fg(MUTED))
+                    .border_style(Style::default().fg(TEXT_FAINT))
                     .padding(ratatui::widgets::Padding::horizontal(1)),
             )
             .style(Style::default().bg(SURFACE))
@@ -4623,7 +4826,13 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
     for (index, entry) in app.transcript.iter().enumerate() {
         match entry {
             TranscriptEntry::Message { role, content } => {
-                append_markdown_lines(&mut lines, content, *role, width);
+                let final_answer = *role == MessageRole::Assistant
+                    && index > 0
+                    && matches!(
+                        app.transcript.get(index - 1),
+                        Some(TranscriptEntry::Turn(_))
+                    );
+                append_markdown_lines(&mut lines, content, *role, final_answer, width);
                 lines.push(Line::default());
             }
             TranscriptEntry::Thinking(thinking) => {
@@ -4658,8 +4867,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                     app.hovered(&HitTarget::Card(index)),
                     width,
                 );
-                if tool.expanded && tool_output_line_count(&tool.output) > TOOL_OUTPUT_PREVIEW_LINES
-                {
+                if tool.expanded && tool_output_body(tool).len() > TOOL_OUTPUT_PREVIEW_LINES {
                     output_lines.push((index, lines.len().saturating_sub(2)));
                 }
             }
@@ -4669,7 +4877,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                 expanded,
             } => {
                 lines.push(Line::from(vec![
-                    Span::styled("  × ", Style::default().fg(ERROR)),
+                    Span::styled("  × ", Style::default().fg(BAD)),
                     Span::styled(
                         summary.clone(),
                         Style::default()
@@ -4682,17 +4890,21 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                         } else {
                             "  Ctrl+E details"
                         },
-                        Style::default().fg(DIM),
+                        Style::default().fg(TEXT_DIM),
                     ),
                 ]));
                 if *expanded {
                     for source_line in detail.lines() {
                         lines.push(Line::from(vec![
-                            Span::styled("    │ ", Style::default().fg(MUTED)),
-                            Span::styled(source_line.to_owned(), Style::default().fg(DIM)),
+                            Span::styled("    │ ", Style::default().fg(TEXT_FAINT)),
+                            Span::styled(source_line.to_owned(), Style::default().fg(TEXT_DIM)),
                         ]));
                     }
                 }
+                lines.push(Line::default());
+            }
+            TranscriptEntry::Turn(turn) => {
+                append_turn_line(&mut lines, turn, width);
                 lines.push(Line::default());
             }
             TranscriptEntry::Sessions(sessions) => {
@@ -4700,6 +4912,10 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                 lines.push(Line::default());
             }
         }
+    }
+    if app.busy {
+        append_running_turn_line(&mut lines, app, width);
+        lines.push(Line::default());
     }
 
     TranscriptRender {
@@ -4742,7 +4958,7 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         ),
         Span::styled(
             "  ↑↓ select · Enter run · Esc close",
-            Style::default().fg(DIM),
+            Style::default().fg(TEXT_DIM),
         ),
     ])];
     lines.extend(command_specs().iter().enumerate().map(|(index, command)| {
@@ -4760,21 +4976,29 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         let marker = if selected { "▌ " } else { "  " };
         if wide {
             Line::from(vec![
-                Span::styled(marker, Style::default().fg(ACCENT)),
+                Span::styled(marker, Style::default().fg(ACCENT_PRIMARY)),
                 Span::styled(
                     format!("{:<usage_width$}", command.usage),
-                    Style::default().fg(if selected { TEXT_STRONG } else { ACCENT }),
+                    Style::default().fg(if selected {
+                        TEXT_STRONG
+                    } else {
+                        ACCENT_PRIMARY
+                    }),
                 ),
                 Span::raw("  "),
-                Span::styled(command.description, Style::default().fg(DIM)),
+                Span::styled(command.description, Style::default().fg(TEXT_DIM)),
             ])
             .style(Style::default().bg(background))
         } else {
             Line::from(vec![
-                Span::styled(marker, Style::default().fg(ACCENT)),
+                Span::styled(marker, Style::default().fg(ACCENT_PRIMARY)),
                 Span::styled(
                     command.usage,
-                    Style::default().fg(if selected { TEXT_STRONG } else { ACCENT }),
+                    Style::default().fg(if selected {
+                        TEXT_STRONG
+                    } else {
+                        ACCENT_PRIMARY
+                    }),
                 ),
             ])
             .style(Style::default().bg(background))
@@ -4789,8 +5013,8 @@ fn append_session_lines(
 ) {
     if sessions.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("  · ", Style::default().fg(ACCENT)),
-            Span::styled("No saved sessions.", Style::default().fg(DIM)),
+            Span::styled("  · ", Style::default().fg(ACCENT_PRIMARY)),
+            Span::styled("No saved sessions.", Style::default().fg(TEXT_DIM)),
         ]));
         return;
     }
@@ -4804,7 +5028,9 @@ fn append_session_lines(
     for session in sessions {
         lines.push(Line::from(Span::styled(
             format!("  {}", session.id),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(ACCENT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
             format!(
@@ -4813,8 +5039,97 @@ fn append_session_lines(
                 if session.message_count == 1 { "" } else { "s" },
                 session.preview
             ),
-            Style::default().fg(DIM),
+            Style::default().fg(TEXT_DIM),
         )));
+    }
+}
+
+fn append_turn_line(lines: &mut Vec<Line<'static>>, turn: &TurnEntry, width: usize) {
+    let (marker, label, color) = match turn.outcome {
+        TurnOutcome::Done => ("✔", "turn done", OK),
+        TurnOutcome::Failed => ("✗", "turn failed", BAD),
+        TurnOutcome::Stopped => ("×", "turn stopped", TEXT_DIM),
+    };
+    let mut details = vec![
+        model_short_name(&turn.model),
+        thinking_short_name(turn.thinking).to_owned(),
+        format!(
+            "{} tool{}",
+            turn.tool_count,
+            if turn.tool_count == 1 { "" } else { "s" }
+        ),
+    ];
+    if let Some(elapsed) = turn.elapsed {
+        details.push(format_turn_duration(elapsed));
+    }
+    if let Some(tokens) = turn.output_tokens {
+        details.push(format_compact_count(tokens));
+    }
+    let prefix = format!("{marker} {label}   ");
+    let details = details.join("  ·  ");
+    let details_width = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+    lines.push(Line::from(vec![
+        Span::styled(
+            prefix,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            truncate_display(&details, details_width),
+            Style::default().fg(TEXT_DIM),
+        ),
+    ]));
+}
+
+fn append_running_turn_line(lines: &mut Vec<Line<'static>>, app: &App, width: usize) {
+    let elapsed = app
+        .turn_started
+        .map(|started| format_turn_duration(started.elapsed()))
+        .unwrap_or_else(|| "0s".to_owned());
+    let details = [
+        model_short_name(&app.model),
+        thinking_short_name(app.thinking_level.unwrap_or(app.thinking_preference)).to_owned(),
+        format!(
+            "{} tool{}",
+            app.turn_tool_count,
+            if app.turn_tool_count == 1 { "" } else { "s" }
+        ),
+        elapsed,
+    ]
+    .join("  ·  ");
+    let prefix = "… running     ";
+    let details_width = width.saturating_sub(UnicodeWidthStr::width(prefix));
+    lines.push(Line::from(vec![
+        Span::styled(
+            prefix,
+            Style::default()
+                .fg(ACCENT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            truncate_display(&details, details_width),
+            Style::default().fg(TEXT_DIM),
+        ),
+    ]));
+}
+
+fn format_turn_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn format_compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
     }
 }
 
@@ -4822,6 +5137,7 @@ fn append_markdown_lines(
     lines: &mut Vec<Line<'static>>,
     content: &str,
     role: MessageRole,
+    final_answer: bool,
     width: usize,
 ) {
     let base_color = match role {
@@ -4837,28 +5153,28 @@ fn append_markdown_lines(
             in_code_block = !in_code_block;
             let language = trimmed.trim_start_matches('`').trim();
             if in_code_block {
-                let rail = message_rail(role, &mut first_visual_line);
+                let rail = message_rail(role, final_answer, &mut first_visual_line);
                 lines.push(
                     Line::from(vec![
                         Span::styled(rail, Style::default().fg(message_rail_color(role))),
-                        Span::styled("▌ ", Style::default().fg(ACCENT)),
+                        Span::styled("▌ ", Style::default().fg(TEXT_DIM)),
                         Span::styled(
                             if language.is_empty() {
                                 "code".to_owned()
                             } else {
                                 language.to_owned()
                             },
-                            Style::default().fg(DIM),
+                            Style::default().fg(TEXT_DIM),
                         ),
                     ])
                     .style(Style::default().bg(SURFACE)),
                 );
             } else {
-                let rail = message_rail(role, &mut first_visual_line);
+                let rail = message_rail(role, final_answer, &mut first_visual_line);
                 lines.push(
                     Line::from(vec![
                         Span::styled(rail, Style::default().fg(message_rail_color(role))),
-                        Span::styled("▌", Style::default().fg(MUTED)),
+                        Span::styled("▌", Style::default().fg(TEXT_FAINT)),
                     ])
                     .style(Style::default().bg(SURFACE)),
                 );
@@ -4868,11 +5184,11 @@ fn append_markdown_lines(
         if in_code_block {
             let content_width = width.saturating_sub(4).max(1);
             for segment in wrap_display_hard(source_line, content_width) {
-                let rail = message_rail(role, &mut first_visual_line);
+                let rail = message_rail(role, final_answer, &mut first_visual_line);
                 lines.push(
                     Line::from(vec![
                         Span::styled(rail, Style::default().fg(message_rail_color(role))),
-                        Span::styled("▌ ", Style::default().fg(ACCENT)),
+                        Span::styled("▌ ", Style::default().fg(TEXT_DIM)),
                         Span::styled(segment, Style::default().fg(TEXT_STRONG)),
                     ])
                     .style(Style::default().bg(SURFACE)),
@@ -4885,6 +5201,7 @@ fn append_markdown_lines(
                 lines,
                 heading,
                 role,
+                final_answer,
                 &mut first_visual_line,
                 width,
                 Style::default()
@@ -4899,6 +5216,7 @@ fn append_markdown_lines(
                 lines,
                 heading,
                 role,
+                final_answer,
                 &mut first_visual_line,
                 width,
                 Style::default()
@@ -4929,9 +5247,17 @@ fn append_markdown_lines(
                 base_color,
             );
         } else if let Some(quote) = trimmed.strip_prefix("> ") {
-            append_output_block_lines(lines, quote, "│ ", role, &mut first_visual_line, width, DIM);
+            append_output_block_lines(
+                lines,
+                quote,
+                "│ ",
+                role,
+                &mut first_visual_line,
+                width,
+                TEXT_DIM,
+            );
         } else if source_line.is_empty() {
-            let rail = message_rail(role, &mut first_visual_line);
+            let rail = message_rail(role, final_answer, &mut first_visual_line);
             lines.push(Line::from(Span::styled(
                 rail,
                 Style::default().fg(message_rail_color(role)),
@@ -4941,6 +5267,7 @@ fn append_markdown_lines(
                 lines,
                 source_line,
                 role,
+                final_answer,
                 &mut first_visual_line,
                 width,
                 Style::default().fg(base_color),
@@ -4949,12 +5276,17 @@ fn append_markdown_lines(
     }
 }
 
-fn message_rail(role: MessageRole, first_visual_line: &mut bool) -> &'static str {
-    let rail = match (role, *first_visual_line) {
-        (MessageRole::User, true) => "▎ ",
-        (MessageRole::User, false) => "│ ",
-        (MessageRole::Assistant, true) => "│ ",
-        (MessageRole::Assistant, false) => "  ",
+fn message_rail(
+    role: MessageRole,
+    final_answer: bool,
+    first_visual_line: &mut bool,
+) -> &'static str {
+    let rail = match (role, final_answer, *first_visual_line) {
+        (MessageRole::Assistant, true, _) => "  ",
+        (MessageRole::User, _, true) => "│ ",
+        (MessageRole::User, _, false) => "│ ",
+        (MessageRole::Assistant, false, true) => "• ",
+        (MessageRole::Assistant, false, false) => "  ",
     };
     *first_visual_line = false;
     rail
@@ -4962,8 +5294,8 @@ fn message_rail(role: MessageRole, first_visual_line: &mut bool) -> &'static str
 
 fn message_rail_color(role: MessageRole) -> Color {
     match role {
-        MessageRole::User => ACCENT,
-        MessageRole::Assistant => MUTED,
+        MessageRole::User => ACCENT_PRIMARY,
+        MessageRole::Assistant => TEXT_FAINT,
     }
 }
 
@@ -4971,12 +5303,13 @@ fn append_wrapped_message_lines(
     lines: &mut Vec<Line<'static>>,
     content: &str,
     role: MessageRole,
+    final_answer: bool,
     first_visual_line: &mut bool,
     width: usize,
     content_style: Style,
 ) {
     for segment in wrap_display_words(content, width.saturating_sub(2).max(1)) {
-        let rail = message_rail(role, first_visual_line);
+        let rail = message_rail(role, final_answer, first_visual_line);
         lines.push(Line::from(vec![
             Span::styled(rail, Style::default().fg(message_rail_color(role))),
             Span::styled(segment, content_style),
@@ -4999,22 +5332,19 @@ fn append_output_block_lines(
         .into_iter()
         .enumerate()
     {
-        let rail = message_rail(role, first_visual_line);
-        lines.push(
-            Line::from(vec![
-                Span::styled(rail, Style::default().fg(message_rail_color(role))),
-                Span::styled(
-                    if index == 0 {
-                        marker.to_owned()
-                    } else {
-                        " ".repeat(marker_width)
-                    },
-                    Style::default().fg(ACCENT),
-                ),
-                Span::styled(segment, Style::default().fg(content_color)),
-            ])
-            .style(Style::default().bg(SURFACE)),
-        );
+        let rail = message_rail(role, false, first_visual_line);
+        lines.push(Line::from(vec![
+            Span::styled(rail, Style::default().fg(message_rail_color(role))),
+            Span::styled(
+                if index == 0 {
+                    marker.to_owned()
+                } else {
+                    " ".repeat(marker_width)
+                },
+                Style::default().fg(TEXT_DIM),
+            ),
+            Span::styled(segment, Style::default().fg(content_color)),
+        ]));
     }
 }
 
@@ -5028,7 +5358,11 @@ fn append_thinking_lines(
     width: usize,
 ) {
     let fold = if thinking.expanded { "▼" } else { "▶" };
-    let rail_color = if selected { ACCENT } else { MUTED };
+    let rail_color = if selected {
+        ACCENT_PRIMARY
+    } else {
+        ACCENT_SECONDARY
+    };
     let header_style = if selected {
         Style::default().bg(SURFACE_RAISED)
     } else if hovered {
@@ -5037,8 +5371,8 @@ fn append_thinking_lines(
         Style::default().bg(SURFACE)
     };
     let (state, state_color) = match status {
-        ThinkingStatus::Active => ("active", ACCENT),
-        ThinkingStatus::Done => ("done", DIM),
+        ThinkingStatus::Active => ("…", ACCENT_PRIMARY),
+        ThinkingStatus::Done => ("done", TEXT_DIM),
     };
     let marker = fold;
     let mut header = vec![
@@ -5046,24 +5380,27 @@ fn append_thinking_lines(
         Span::styled(
             pad_display("thinking", 8),
             Style::default()
-                .fg(TEXT_STRONG)
+                .fg(ACCENT_SECONDARY)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ", Style::default().fg(MUTED)),
-        Span::styled(pad_display(&level.to_string(), 7), Style::default().fg(DIM)),
-        Span::styled("  ", Style::default().fg(MUTED)),
+        Span::styled("  ", Style::default().fg(TEXT_FAINT)),
+        Span::styled(
+            pad_display(&level.to_string(), 7),
+            Style::default().fg(TEXT_DIM),
+        ),
+        Span::styled("  ", Style::default().fg(TEXT_FAINT)),
         Span::styled(state, Style::default().fg(state_color)),
     ];
     if !thinking.expanded {
         let used = 2 + 8 + 2 + 7 + 2 + UnicodeWidthStr::width(state) + 2;
         header.extend([
-            Span::styled("  ", Style::default().fg(MUTED)),
+            Span::styled("  ", Style::default().fg(TEXT_FAINT)),
             Span::styled(
                 truncate_display(
                     &single_line(&thinking.content, 240),
                     width.saturating_sub(used),
                 ),
-                Style::default().fg(DIM),
+                Style::default().fg(TEXT_DIM),
             ),
         ]);
     }
@@ -5074,7 +5411,7 @@ fn append_thinking_lines(
             lines.push(
                 Line::from(vec![
                     Span::styled("  │ ", Style::default().fg(rail_color)),
-                    Span::styled(line.to_owned(), Style::default().fg(DIM)),
+                    Span::styled(line.to_owned(), Style::default().fg(TEXT_DIM)),
                 ])
                 .style(Style::default().bg(SURFACE)),
             );
@@ -5087,7 +5424,7 @@ fn append_thinking_lines(
                         "{} lines · Ctrl+O collapse",
                         thinking.content.lines().count().max(1)
                     ),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(TEXT_FAINT),
                 ),
             ])
             .style(Style::default().bg(SURFACE)),
@@ -5103,10 +5440,14 @@ fn append_tool_lines(
     hovered: bool,
     width: usize,
 ) {
-    let fold = if tool.expanded { "▼" } else { "▶" };
+    let marker = tool_marker(tool);
     let subject = tool_subject(tool);
     let elapsed = tool_elapsed(tool);
-    let rail_color = if selected { ACCENT } else { MUTED };
+    let marker_color = if selected {
+        ACCENT_PRIMARY
+    } else {
+        tool_result_color(tool)
+    };
     let header_style = if selected {
         Style::default().bg(SURFACE_RAISED)
     } else if hovered {
@@ -5114,7 +5455,6 @@ fn append_tool_lines(
     } else {
         Style::default().bg(SURFACE)
     };
-    let marker = fold;
     let result = tool_result(tool);
     let duration = format_duration(elapsed);
     lines.push(
@@ -5124,7 +5464,7 @@ fn append_tool_lines(
             &subject,
             &result,
             &duration,
-            rail_color,
+            marker_color,
             tool_result_color(tool),
             width,
         )
@@ -5132,73 +5472,127 @@ fn append_tool_lines(
     );
 
     if tool.expanded {
-        lines.push(
-            Line::from(vec![
-                Span::styled("  │ ", Style::default().fg(rail_color)),
-                Span::styled("input", Style::default().fg(DIM)),
-            ])
-            .style(Style::default().bg(SURFACE)),
-        );
-        for line in tool.arguments.split('\n') {
-            lines.push(
-                Line::from(vec![
-                    Span::styled("  │   ", Style::default().fg(rail_color)),
-                    Span::styled(line.to_owned(), Style::default().fg(TEXT)),
-                ])
-                .style(Style::default().bg(SURFACE)),
-            );
-        }
-        lines.push(
-            Line::from(vec![
-                Span::styled("  │ ", Style::default().fg(rail_color)),
-                Span::styled("output", Style::default().fg(DIM)),
-            ])
-            .style(Style::default().bg(SURFACE)),
-        );
-        if tool.output.is_empty() {
-            lines.push(
-                Line::from(vec![
-                    Span::styled("  │   ", Style::default().fg(rail_color)),
-                    Span::styled("waiting for result…", Style::default().fg(DIM)),
-                ])
-                .style(Style::default().bg(SURFACE)),
-            );
+        let rail_style = Style::default().fg(marker_color);
+        let label_style = Style::default().fg(TEXT_DIM);
+        let body_style = Style::default().fg(TEXT);
+        let added_style = Style::default().fg(OK);
+        let removed_style = Style::default().fg(BAD);
+        let card_bg = Style::default().bg(SURFACE);
+        let failed = tool_result_color(tool) == BAD;
+        let arguments = serde_json::from_str::<Value>(&tool.arguments).ok();
+        let param_key = match tool.name.as_str() {
+            "bash" => "command",
+            "read" | "write" | "edit" => "path",
+            "grep" | "glob" => "pattern",
+            _ => "",
+        };
+        let param = arguments
+            .as_ref()
+            .and_then(|value| value.get(param_key))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let body_lines = tool_output_body(tool);
+        let edit_diff = file_change_body(tool);
+        let visible_lines = if tool.show_full_output {
+            edit_diff
+                .as_ref()
+                .map_or_else(|| body_lines.len(), Vec::len)
         } else {
-            let output_lines = tool.output.split('\n').collect::<Vec<_>>();
-            let visible_lines = if tool.show_full_output {
-                output_lines.len()
-            } else {
-                output_lines.len().min(TOOL_OUTPUT_PREVIEW_LINES)
-            };
-            for line in output_lines.iter().take(visible_lines) {
-                lines.push(
-                    Line::from(vec![
-                        Span::styled("  │   ", Style::default().fg(rail_color)),
-                        Span::styled((*line).to_owned(), Style::default().fg(TEXT)),
-                    ])
-                    .style(Style::default().bg(SURFACE)),
-                );
+            edit_diff
+                .as_ref()
+                .map_or_else(|| body_lines.len(), Vec::len)
+                .min(TOOL_OUTPUT_PREVIEW_LINES)
+        };
+        let mut push = |spans: Vec<Span<'static>>| {
+            let mut row = vec![Span::styled("  │ ", rail_style)];
+            row.extend(spans);
+            lines.push(Line::from(row).style(card_bg));
+        };
+
+        if edit_diff.is_some() {
+            push(vec![
+                Span::styled("diff  ", label_style),
+                Span::styled(param.to_owned(), body_style),
+            ]);
+        } else if tool.name == "bash" && !failed {
+            for (index, line) in param.lines().enumerate() {
+                push(vec![
+                    Span::styled(if index == 0 { "$ " } else { "  " }, label_style),
+                    Span::styled(line.to_owned(), body_style),
+                ]);
+            }
+        } else if param.is_empty() {
+            push(vec![Span::styled(
+                single_line(&tool.arguments, 200),
+                label_style,
+            )]);
+        } else if tool.name == "bash" {
+            push(vec![Span::styled("command", label_style)]);
+            for line in param.lines() {
+                push(vec![Span::styled(line.to_owned(), body_style)]);
+            }
+            push(vec![]);
+            push(vec![Span::styled("stderr", label_style)]);
+        } else {
+            let indent = " ".repeat(param_key.len() + 2);
+            for (index, line) in param.lines().enumerate() {
+                push(vec![
+                    Span::styled(
+                        if index == 0 {
+                            format!("{param_key}  ")
+                        } else {
+                            indent.clone()
+                        },
+                        label_style,
+                    ),
+                    Span::styled(line.to_owned(), body_style),
+                ]);
             }
         }
-        let total_lines = tool_output_line_count(&tool.output);
-        let output_state = if !tool.show_full_output && total_lines > TOOL_OUTPUT_PREVIEW_LINES {
-            format!(
-                "{}/{} lines · click for all",
-                TOOL_OUTPUT_PREVIEW_LINES, total_lines
-            )
+
+        if let Some(diff_lines) = &edit_diff {
+            for line in diff_lines.iter().take(visible_lines) {
+                let style = if line.starts_with("+ ") {
+                    added_style
+                } else if line.starts_with("- ") {
+                    removed_style
+                } else {
+                    body_style
+                };
+                push(vec![Span::styled(line.clone(), style)]);
+            }
+        } else if tool.output.is_empty() && matches!(tool.status, ToolStatus::Running) {
+            push(vec![Span::styled("running…", label_style)]);
+        } else if body_lines.is_empty() {
+            push(vec![Span::styled("(no output)", label_style)]);
         } else {
+            for line in body_lines.iter().take(visible_lines) {
+                push(vec![Span::styled(line.clone(), body_style)]);
+            }
+        }
+
+        let total = edit_diff
+            .as_ref()
+            .map_or_else(|| body_lines.len(), Vec::len);
+        let unit = if total == 1 { "line" } else { "lines" };
+        let footer = if !tool.show_full_output && total > TOOL_OUTPUT_PREVIEW_LINES {
             format!(
-                "{} lines · timeout {} · click to preview",
-                total_lines,
-                format_duration(tool.timeout)
+                "{total} {unit} · {} more · click or Ctrl+O expand",
+                total - TOOL_OUTPUT_PREVIEW_LINES
             )
+        } else if tool.show_full_output && total > TOOL_OUTPUT_PREVIEW_LINES {
+            format!("{total} {unit} · click or Ctrl+O collapse")
+        } else if total > 0 {
+            format!("{total} {unit}")
+        } else {
+            format!("timeout {}", format_duration(tool.timeout))
         };
         lines.push(
             Line::from(vec![
-                Span::styled("  └ ", Style::default().fg(rail_color)),
-                Span::styled(output_state, Style::default().fg(DIM)),
+                Span::styled("  └ ", rail_style),
+                Span::styled(footer, label_style),
             ])
-            .style(Style::default().bg(SURFACE)),
+            .style(card_bg),
         );
     }
     lines.push(Line::default());
@@ -5246,13 +5640,42 @@ fn tool_header_line(
             Span::raw("  "),
             Span::styled(
                 pad_display_left(&truncate_display(duration, DURATION_WIDTH), DURATION_WIDTH),
-                Style::default().fg(DIM),
+                Style::default().fg(TEXT_DIM),
             ),
         ]);
     }
 
     let duration_width = UnicodeWidthStr::width(duration).min(DURATION_WIDTH);
     let result_width = UnicodeWidthStr::width(result).clamp(4, RESULT_WIDTH);
+    let fixed_width = MARKER_WIDTH + NAME_WIDTH + GAP_WIDTH * 3 + result_width + duration_width;
+    let subject_width = width.saturating_sub(fixed_width);
+    if subject_width > 0 {
+        return Line::from(vec![
+            Span::styled(format!("{marker} "), Style::default().fg(marker_color)),
+            Span::styled(
+                pad_display(&truncate_display(name, NAME_WIDTH), NAME_WIDTH),
+                Style::default()
+                    .fg(TEXT_STRONG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                pad_display(&truncate_display(subject, subject_width), subject_width),
+                Style::default().fg(TEXT),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                pad_display_left(&truncate_display(result, result_width), result_width),
+                Style::default().fg(result_color),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                truncate_display(duration, duration_width),
+                Style::default().fg(TEXT_DIM),
+            ),
+        ]);
+    }
+
     let available_name =
         width.saturating_sub(MARKER_WIDTH + GAP_WIDTH * 2 + result_width + duration_width);
     let name_width = available_name.clamp(1, NAME_WIDTH);
@@ -5272,13 +5695,31 @@ fn tool_header_line(
         Span::raw("  "),
         Span::styled(
             truncate_display(duration, duration_width),
-            Style::default().fg(DIM),
+            Style::default().fg(TEXT_DIM),
         ),
     ])
 }
 
 fn tool_output_line_count(output: &str) -> usize {
     output.split('\n').count().max(1)
+}
+
+fn tool_detail_line_count(tool: &ToolEntry) -> usize {
+    file_change_body(tool)
+        .map_or_else(|| tool_output_line_count(&tool.output), |lines| lines.len())
+        .max(1)
+}
+
+fn tool_marker(tool: &ToolEntry) -> &'static str {
+    if tool.expanded {
+        return "◆";
+    }
+    match tool.status {
+        ToolStatus::Running => "◌",
+        ToolStatus::Done => "●",
+        ToolStatus::Failed => "✗",
+        ToolStatus::Cancelled => "×",
+    }
 }
 
 fn tool_subject(tool: &ToolEntry) -> String {
@@ -5328,6 +5769,22 @@ fn tool_result(tool: &ToolEntry) -> String {
     }
     match tool.name.as_str() {
         "read" => format!("{} lines", tool.output.lines().count()),
+        "edit" => edit_change_counts(tool)
+            .map(|(added, removed)| match (added, removed) {
+                (added, 0) => format!("+{added}"),
+                (0, removed) => format!("−{removed}"),
+                (added, removed) => format!("+{added} −{removed}"),
+            })
+            .unwrap_or_else(|| "edited".to_owned()),
+        "write" => tool_arguments(tool)
+            .and_then(|arguments| {
+                arguments
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(|content| content.lines().count().max(1))
+            })
+            .map(|lines| format!("+{lines}"))
+            .unwrap_or_else(|| "written".to_owned()),
         "grep" if tool.output.starts_with("No matches found.") => "0 matches".to_owned(),
         "grep" => trailing_count_summary(&tool.output, "matching line(s)", "matches")
             .unwrap_or_else(|| format!("{} matches", content_line_count(&tool.output))),
@@ -5340,7 +5797,7 @@ fn tool_result(tool: &ToolEntry) -> String {
 
 fn tool_result_color(tool: &ToolEntry) -> Color {
     if tool.name == "bash" && bash_exit_code(&tool.output).is_some_and(|code| code != "0") {
-        return ERROR;
+        return BAD;
     }
     tool.status.color()
 }
@@ -5368,28 +5825,49 @@ fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
     app.register_hit(area, HitTarget::Input);
     let border = if app.input_focused && !app.page_open() && !app.busy {
-        ACCENT
+        ACCENT_PRIMARY
     } else if app.hovered(&HitTarget::Input) && !app.page_open() && !app.busy {
-        Color::Rgb(82, 105, 113)
+        TEXT_DIM
     } else {
-        Color::Rgb(72, 91, 98)
+        TEXT_FAINT
     };
     let border_style = Style::default().fg(border).bg(BACKGROUND);
     frame.render_widget(
         Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::LEFT | Borders::RIGHT)
             .border_style(border_style)
             .style(Style::default().bg(BACKGROUND)),
         area,
     );
-    if area.width <= 2 || area.height <= 2 {
+    if area.width > 2 {
+        let shoulder = if app.input_focused && !app.page_open() && !app.busy {
+            ACCENT_PRIMARY
+        } else {
+            TEXT_FAINT
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "─",
+                Style::default().fg(shoulder).bg(BACKGROUND),
+            )),
+            Rect::new(area.x + 1, area.y, 1, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "─",
+                Style::default().fg(shoulder).bg(BACKGROUND),
+            )),
+            Rect::new(area.right().saturating_sub(2), area.y, 1, 1),
+        );
+    }
+    if area.width <= 2 || area.height == 0 {
         return;
     }
     let input_area = Rect::new(
         area.x.saturating_add(2),
-        area.y.saturating_add(1),
+        area.y,
         area.width.saturating_sub(4),
-        area.height.saturating_sub(2),
+        area.height,
     );
     if input_area.is_empty() {
         return;
@@ -5408,7 +5886,7 @@ fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let y = area.y + area.height.saturating_sub(1) / 2;
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("ZEX / ", Style::default().fg(ACCENT).bg(BACKGROUND)),
+                Span::styled("ZEX / ", Style::default().fg(ACCENT_PRIMARY).bg(BACKGROUND)),
                 Span::styled(label, Style::default().fg(TEXT).bg(BACKGROUND)),
             ]))
             .style(Style::default().bg(BACKGROUND))
@@ -5434,7 +5912,7 @@ fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         "",
         Some(Line::from(Span::styled(
             "ask anything…",
-            Style::default().fg(DIM).bg(BACKGROUND),
+            Style::default().fg(TEXT_DIM).bg(BACKGROUND),
         ))),
         BACKGROUND,
     );
@@ -5463,7 +5941,7 @@ fn render_input_buffer(
         frame.render_widget(
             Paragraph::new(Span::styled(
                 prompt.to_owned(),
-                Style::default().fg(ACCENT).bg(background),
+                Style::default().fg(ACCENT_PRIMARY).bg(background),
             ))
             .style(Style::default().bg(background)),
             area,
@@ -5475,7 +5953,7 @@ fn render_input_buffer(
         frame.render_widget(
             Paragraph::new(Span::styled(
                 prompt.to_owned(),
-                Style::default().fg(ACCENT).bg(background),
+                Style::default().fg(ACCENT_PRIMARY).bg(background),
             ))
             .style(Style::default().bg(background)),
             prompt_area,
@@ -5536,7 +6014,7 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let hint = if app.model_picker_open() {
         Line::from(Span::styled(
             "↑↓/jk select · Enter/Space switch · click twice · Esc/q cancel",
-            Style::default().fg(DIM),
+            Style::default().fg(TEXT_DIM),
         ))
     } else if app.provider_editor_open() {
         let text = if app.provider_editor_is_confirming() {
@@ -5546,16 +6024,16 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             "Tab pane · ↑↓/jk select · f fetch models · Enter name · i ID · Space thinking · m/t min/max · r fill map · n new · d delete · Ctrl+S save · Esc exit"
         };
-        Line::from(Span::styled(text, Style::default().fg(DIM)))
+        Line::from(Span::styled(text, Style::default().fg(TEXT_DIM)))
     } else if app.session_picker_open() {
         Line::from(Span::styled(
             "↑↓/jk select · Enter/Space resume · click twice · Esc/q cancel",
-            Style::default().fg(DIM),
+            Style::default().fg(TEXT_DIM),
         ))
     } else if app.help_open {
         Line::from(Span::styled(
             "↑↓/jk select · Enter/Space run · click twice · Esc/q return",
-            Style::default().fg(DIM),
+            Style::default().fg(TEXT_DIM),
         ))
     } else if let Some(toast) = &app.toast {
         Line::from(vec![
@@ -5565,22 +6043,22 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else if app.completion_open() {
         Line::from(Span::styled(
             "↑↓ select · Tab complete · Enter run · Esc close",
-            Style::default().fg(DIM),
+            Style::default().fg(TEXT_DIM),
         ))
     } else if app.busy {
         let text = if area.width >= 72 {
-            "Esc stop · wheel/PgUp/PgDn scroll · Ctrl+O all cards"
+            "Esc stop · wheel/PgUp/PgDn scroll · Ctrl+O cards"
         } else {
             "Esc stop · PgUp/PgDn scroll"
         };
-        Line::from(Span::styled(text, Style::default().fg(DIM)))
+        Line::from(Span::styled(text, Style::default().fg(TEXT_FAINT)))
     } else {
         let text = if area.width >= 92 {
-            "Enter send · Shift+Enter newline · wheel scroll · Ctrl+O all cards · / commands"
+            "Enter send · Shift+Enter newline · wheel scroll · Ctrl+O cards · / commands"
         } else {
-            "Enter send · wheel/PgUp/PgDn scroll · / commands"
+            "Enter send · wheel scroll · / commands"
         };
-        Line::from(Span::styled(text, Style::default().fg(DIM)))
+        Line::from(Span::styled(text, Style::default().fg(TEXT_FAINT)))
     };
     frame.render_widget(Paragraph::new(hint), area);
 }
@@ -5646,6 +6124,162 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 fn single_line(value: &str, max_chars: usize) -> String {
     truncate_chars(&value.replace(['\r', '\n'], " "), max_chars).replace("\n… truncated", " …")
+}
+
+/// Strip ANSI escape sequences, carriage returns and control characters so
+/// captured tool output never renders as garbled terminal bytes. Runs of
+/// replacement characters (from lossy decoding) collapse to a single marker.
+fn sanitize_terminal_text(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    let mut escaped = false;
+                    for c in chars.by_ref() {
+                        if c == '\u{7}' || (escaped && c == '\\') {
+                            break;
+                        }
+                        escaped = c == '\u{1b}';
+                    }
+                }
+                _ => {}
+            },
+            '\n' | '\t' => cleaned.push(character),
+            '\r' => {}
+            '\u{fffd}' => {
+                if !cleaned.ends_with('\u{fffd}') {
+                    cleaned.push('\u{fffd}');
+                }
+            }
+            c if c.is_control() => {}
+            c => cleaned.push(c),
+        }
+    }
+    cleaned
+}
+
+struct BashOutput<'a> {
+    exit_code: Option<&'a str>,
+    stdout: &'a str,
+    stderr: &'a str,
+}
+
+/// Split the bash tool envelope (`exit_code: N\nstdout:\n…\nstderr:\n…`) into
+/// parts so the card can render a product view instead of the raw shell.
+fn parse_bash_output(output: &str) -> Option<BashOutput<'_>> {
+    let rest = output.strip_prefix("exit_code: ")?;
+    let (code, rest) = rest.split_once('\n')?;
+    let rest = rest.strip_prefix("stdout:\n")?;
+    let (stdout, stderr) = match rest.rfind("\nstderr:\n") {
+        Some(index) => {
+            let (stdout, tail) = rest.split_at(index);
+            (stdout, &tail["\nstderr:\n".len()..])
+        }
+        None => (rest, ""),
+    };
+    Some(BashOutput {
+        exit_code: Some(code.trim()),
+        stdout,
+        stderr,
+    })
+}
+
+/// Output lines shown inside an expanded tool card: parsed bash stdout/stderr
+/// for shell calls, plain output for everything else.
+fn tool_output_body(tool: &ToolEntry) -> Vec<String> {
+    if tool.name == "bash"
+        && let Some(parsed) = parse_bash_output(&tool.output)
+    {
+        let failed = parsed.exit_code.is_some_and(|code| code != "0");
+        let body = if failed && !parsed.stderr.trim().is_empty() {
+            parsed.stderr
+        } else {
+            parsed.stdout
+        };
+        return body.lines().map(str::to_owned).collect();
+    }
+    tool.output.lines().map(str::to_owned).collect()
+}
+
+fn tool_arguments(tool: &ToolEntry) -> Option<Value> {
+    serde_json::from_str::<Value>(&tool.arguments).ok()
+}
+
+fn edit_change_counts(tool: &ToolEntry) -> Option<(usize, usize)> {
+    let arguments = tool_arguments(tool)?;
+    let old = arguments.get("old_text")?.as_str()?;
+    let new = arguments.get("new_text")?.as_str()?;
+    let (_, old_changed, new_changed, _) = changed_line_ranges(old, new);
+    Some((new_changed.len(), old_changed.len()))
+}
+
+fn file_change_body(tool: &ToolEntry) -> Option<Vec<String>> {
+    let arguments = tool_arguments(tool)?;
+    match tool.name.as_str() {
+        "edit" => {
+            let old = arguments.get("old_text")?.as_str()?;
+            let new = arguments.get("new_text")?.as_str()?;
+            let (prefix, old_changed, new_changed, suffix) = changed_line_ranges(old, new);
+            let mut lines = Vec::new();
+            if let Some(context) = prefix.last() {
+                lines.push(format!("  {context}"));
+            }
+            lines.extend(old_changed.iter().map(|line| format!("- {line}")));
+            lines.extend(new_changed.iter().map(|line| format!("+ {line}")));
+            if let Some(context) = suffix.first() {
+                lines.push(format!("  {context}"));
+            }
+            Some(lines)
+        }
+        "write" => arguments.get("content")?.as_str().map(|content| {
+            content
+                .lines()
+                .map(|line| format!("+ {line}"))
+                .collect::<Vec<_>>()
+        }),
+        _ => None,
+    }
+}
+
+fn changed_line_ranges<'a>(
+    old: &'a str,
+    new: &'a str,
+) -> (Vec<&'a str>, Vec<&'a str>, Vec<&'a str>, Vec<&'a str>) {
+    let old_lines = old.lines().collect::<Vec<_>>();
+    let new_lines = new.lines().collect::<Vec<_>>();
+    let prefix_len = old_lines
+        .iter()
+        .zip(&new_lines)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let shared_remaining = old_lines
+        .len()
+        .saturating_sub(prefix_len)
+        .min(new_lines.len().saturating_sub(prefix_len));
+    let suffix_len = old_lines[prefix_len..]
+        .iter()
+        .rev()
+        .zip(new_lines[prefix_len..].iter().rev())
+        .take(shared_remaining)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let old_changed_end = old_lines.len().saturating_sub(suffix_len);
+    let new_changed_end = new_lines.len().saturating_sub(suffix_len);
+    (
+        old_lines[..prefix_len].to_vec(),
+        old_lines[prefix_len..old_changed_end].to_vec(),
+        new_lines[prefix_len..new_changed_end].to_vec(),
+        old_lines[old_changed_end..].to_vec(),
+    )
 }
 
 fn truncate_inline(value: &str, max_chars: usize) -> String {
@@ -5895,14 +6529,15 @@ mod tests {
     use std::{path::PathBuf, time::Duration};
 
     use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
 
     use super::{
-        ACCENT, App, AppContext, BACKGROUND, CommandOutput, ERROR, HitTarget, InputAction,
-        InputBuffer, KeyBurst, ProviderPane, SCROLL_STEP, SURFACE, SURFACE_RAISED, Status,
-        ThinkingEntry, ToolStatus, TranscriptEntry, command_specs, handle_key_event,
-        handle_mouse_event, handle_terminal_event, input_metrics, landing_regions, render,
-        truncate_chars, ui_regions,
+        ACCENT_PRIMARY, ACCENT_SECONDARY, App, AppContext, BACKGROUND, BAD, CommandOutput,
+        HitTarget, InputAction, InputBuffer, KeyBurst, OK, ProviderPane, SCROLL_STEP, SURFACE,
+        SURFACE_RAISED, Status, TEXT_DIM, ThinkingEntry, ToolStatus, TranscriptEntry,
+        command_specs, handle_key_event, handle_mouse_event, handle_terminal_event, input_metrics,
+        landing_regions, render, sanitize_terminal_text, truncate_chars, ui_regions,
+        working_shimmer_line,
     };
     use crate::agent::{AgentEvent, Message, MessageRole};
     use crate::config::{ModelConfig, ModelRef, ProviderCatalog, ProviderConfig, SecretValue};
@@ -6169,7 +6804,7 @@ mod tests {
         assert!(!screen.contains("42.7 tok/s"));
         assert!(!screen.contains("processing turn"));
         assert_eq!(
-            terminal.backend().buffer()[(regions.footer.x + 3, regions.footer.y + 2)].symbol(),
+            terminal.backend().buffer()[(regions.footer.x + 3, regions.footer.y + 1)].symbol(),
             " "
         );
     }
@@ -6577,25 +7212,27 @@ mod tests {
         let screen = format!("{}", terminal.backend());
         let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 100, 24), &app);
 
-        assert!(screen.contains("Z  E  X"));
+        assert!(screen.contains("ZEX"));
+        assert!(!screen.contains("Z  E  X"));
         assert!(screen.contains("ask anything…"));
         assert!(screen.contains("Enter send"));
         assert!(screen.contains("gpt-5"));
         assert!(screen.contains("high"));
-        assert!(screen.contains("25.0%/120Kc"));
+        assert!(!screen.contains("25.0%/120Kc"));
         assert!(screen.contains("D:/workspaces/zex"));
-        assert!(screen.contains("● idle"));
+        assert!(screen.contains(env!("CARGO_PKG_VERSION")));
+        assert!(!screen.contains("● idle"));
         assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
         assert!(regions.card.y > 4);
         assert!(regions.card.bottom() < regions.status.y);
         assert!(regions.card.width < 100);
         assert_eq!(
             terminal.backend().buffer()[(regions.card.x, regions.card.y)].symbol(),
-            "┌"
+            "▌"
         );
         assert_eq!(
             style_at(&terminal, regions.card.x + 1, regions.card.y).bg,
-            Some(BACKGROUND)
+            Some(SURFACE)
         );
     }
 
@@ -6607,8 +7244,8 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
-        let editor_x = regions.card.x + 2;
-        let editor_y = regions.card.y + 1;
+        let editor_x = regions.card.x + 3;
+        let editor_y = regions.card.y;
 
         terminal
             .backend_mut()
@@ -6630,8 +7267,8 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
         let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
-        let editor_x = regions.card.x + 2;
-        let editor_y = regions.card.y + 1;
+        let editor_x = regions.card.x + 3;
+        let editor_y = regions.card.y;
 
         assert!(screen.contains("hello"));
         assert!(!screen.contains("ask anything…"));
@@ -6700,6 +7337,18 @@ mod tests {
     }
 
     #[test]
+    fn grok_night_palette_matches_the_ui_plan() {
+        assert_eq!(BACKGROUND, Color::Rgb(20, 20, 20));
+        assert_eq!(super::TEXT, Color::Rgb(243, 243, 243));
+        assert_eq!(TEXT_DIM, Color::Rgb(160, 160, 160));
+        assert_eq!(super::TEXT_FAINT, Color::Rgb(120, 120, 120));
+        assert_eq!(ACCENT_PRIMARY, Color::Rgb(122, 162, 247));
+        assert_eq!(ACCENT_SECONDARY, Color::Rgb(187, 154, 247));
+        assert_eq!(OK, Color::Rgb(158, 206, 106));
+        assert_eq!(BAD, Color::Rgb(219, 75, 75));
+    }
+
+    #[test]
     fn first_turn_switches_to_a_top_anchored_work_timeline() {
         let mut app = app();
         assert!(app.landing_visible());
@@ -6742,7 +7391,8 @@ mod tests {
         let screen = format!("{}", terminal.backend());
 
         assert!(app.landing_visible());
-        assert!(screen.contains("Z  E  X"));
+        assert!(screen.contains("ZEX"));
+        assert!(!screen.contains("Z  E  X"));
         assert!(screen.contains("ask anything…"));
         assert!(!screen.contains("Inspect the project"));
     }
@@ -6803,6 +7453,10 @@ mod tests {
         });
         app.thinking_level = Some(ThinkingLevel::Medium);
         app.context_chars = 60_000;
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::User,
+            content: "statusline stays readable when narrow".to_owned(),
+        });
         let backend = TestBackend::new(38, 12);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -6871,19 +7525,16 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(multiline.footer.height > single.footer.height);
-        assert_eq!(
-            terminal.backend().buffer()[(multiline.footer.x + 1, multiline.footer.y + 1)].symbol(),
-            "┌"
-        );
-        assert_eq!(
-            terminal.backend().buffer()[(multiline.footer.x + 1, multiline.footer.y + 2)].symbol(),
-            "│"
-        );
-        assert_eq!(
-            terminal.backend().buffer()[(multiline.footer.x + 1, multiline.footer.bottom() - 1)]
-                .symbol(),
-            "└"
-        );
+        for y in [
+            multiline.footer.y + 1,
+            multiline.footer.y + 2,
+            multiline.footer.bottom() - 1,
+        ] {
+            assert_eq!(
+                terminal.backend().buffer()[(multiline.footer.x + 1, y)].symbol(),
+                "│"
+            );
+        }
     }
 
     #[test]
@@ -6913,7 +7564,7 @@ mod tests {
                 regions.footer.y + 1,
             )]
                 .symbol(),
-            "┌"
+            "│"
         );
         let selected_row = regions.completion.y + 1;
         assert!(
@@ -6922,7 +7573,7 @@ mod tests {
                 x,
                 selected_row
             )
-            .fg == Some(ACCENT))
+            .fg == Some(ACCENT_PRIMARY))
         );
         assert!(
             terminal
@@ -7095,6 +7746,79 @@ mod tests {
     }
 
     #[test]
+    fn completed_turn_status_precedes_the_final_answer() {
+        let mut app = app();
+        app.start_turn();
+        app.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::User,
+            delta: "Inspect the project".to_owned(),
+        });
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-read".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        app.apply_agent_event(AgentEvent::ToolEnd {
+            call_id: "call-read".to_owned(),
+            name: "read".to_owned(),
+            output: "line one\nline two".to_owned(),
+            is_error: false,
+            elapsed: Duration::from_millis(12),
+        });
+        app.apply_agent_event(AgentEvent::ProviderUsage {
+            output_tokens: 1_234,
+            elapsed: Duration::from_secs(2),
+        });
+        app.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::Assistant,
+            delta: "Final answer.".to_owned(),
+        });
+        app.apply_agent_event(AgentEvent::TurnEnd);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        let status_row = screen
+            .lines()
+            .position(|row| row.contains("turn done"))
+            .expect("missing completed turn row");
+        let answer_row = screen
+            .lines()
+            .position(|row| row.contains("Final answer."))
+            .expect("missing final answer");
+        assert!(status_row < answer_row);
+        assert!(screen.contains("1 tool"));
+        assert!(screen.contains("1.2k"));
+    }
+
+    #[test]
+    fn active_turn_renders_running_status_without_system_feed_rows() {
+        let mut app = app();
+        app.start_turn();
+        app.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::User,
+            delta: "Inspect".to_owned(),
+        });
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-read".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        assert!(screen.lines().any(|row| {
+            row.contains("running") && row.contains("test-model") && row.contains("1 tool")
+        }));
+        assert_eq!(screen.matches("Working...").count(), 1);
+    }
+
+    #[test]
     fn tool_cards_use_zex_subject_result_and_duration_summaries() {
         let mut app = app();
         app.apply_agent_event(AgentEvent::ToolStart {
@@ -7240,8 +7964,8 @@ mod tests {
         let status_x = unicode_width::UnicodeWidthStr::width(&row_text[..status_byte]) as u16;
         let name_x = unicode_width::UnicodeWidthStr::width(&row_text[..name_byte]) as u16;
 
-        assert_eq!(style_at(&terminal, status_x, row).fg, Some(ERROR));
-        assert_ne!(style_at(&terminal, name_x, row).fg, Some(ERROR));
+        assert_eq!(style_at(&terminal, status_x, row).fg, Some(BAD));
+        assert_ne!(style_at(&terminal, name_x, row).fg, Some(BAD));
     }
 
     #[test]
@@ -7269,15 +7993,260 @@ mod tests {
         app.toggle_selected_tool();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let preview = format!("{}", terminal.backend());
+        assert!(preview.contains("path  long.txt"));
+        assert!(!preview.contains("\"path\""));
         assert!(preview.contains("line 12"));
         assert!(!preview.contains("line 13"));
-        assert!(preview.contains("12/20 lines · click for all"));
+        assert!(preview.contains("20 lines · 8 more · click or Ctrl+O expand"));
 
         app.toggle_selected_tool_output();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let full = format!("{}", terminal.backend());
         assert!(full.contains("line 20"));
-        assert!(full.contains("20 lines · timeout 30.0s · click to preview"));
+        assert!(full.contains("20 lines · click or Ctrl+O collapse"));
+    }
+
+    #[test]
+    fn edit_card_renders_a_human_readable_diff_without_json() {
+        let mut app = app();
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-edit".to_owned(),
+            name: "edit".to_owned(),
+            arguments: serde_json::json!({
+                "path": "src/tui.rs",
+                "old_text": "fn render() {\n    old();\n}",
+                "new_text": "fn render() {\n    new();\n    finish();\n}"
+            })
+            .to_string(),
+            timeout: Duration::from_secs(30),
+        });
+        app.apply_agent_event(AgentEvent::ToolEnd {
+            call_id: "call-edit".to_owned(),
+            name: "edit".to_owned(),
+            output: "edited src/tui.rs".to_owned(),
+            is_error: false,
+            elapsed: Duration::from_millis(8),
+        });
+        app.toggle_selected_tool();
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        assert!(screen.contains("edit"));
+        assert!(screen.contains("src/tui.rs"));
+        assert!(screen.contains("+2 −1"));
+        assert!(screen.contains("-     old();"));
+        assert!(screen.contains("+     new();"));
+        assert!(screen.contains("+     finish();"));
+        assert!(!screen.contains("\"old_text\""));
+        assert!(!screen.contains("\"new_text\""));
+    }
+
+    #[test]
+    fn failed_bash_card_shows_command_and_stderr_sections() {
+        let mut app = app();
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-fail".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"pwd && find . -name '*.rs'","timeout_seconds":30}"#
+                .to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        app.apply_agent_event(AgentEvent::ToolEnd {
+            call_id: "call-fail".to_owned(),
+            name: "bash".to_owned(),
+            output: "exit_code: 1\nstdout:\n\nstderr:\n'pwd' is not recognized\n".to_owned(),
+            is_error: true,
+            elapsed: Duration::from_millis(20),
+        });
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        app.toggle_selected_tool();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let expanded = format!("{}", terminal.backend());
+        assert!(expanded.contains("exit 1"));
+        assert!(expanded.contains("command"));
+        assert!(expanded.contains("pwd && find . -name '*.rs'"));
+        assert!(expanded.contains("stderr"));
+        assert!(expanded.contains("'pwd' is not recognized"));
+        assert!(!expanded.contains("exit_code:"));
+        assert!(!expanded.contains("stdout:"));
+        assert!(!expanded.contains("timeout_seconds"));
+        assert!(!expanded.contains('{'));
+    }
+
+    #[test]
+    fn working_shimmer_sweeps_primary_with_a_secondary_tail() {
+        let line = working_shimmer_line("Working... (Esc)", 0.6);
+        let colors: Vec<_> = line.spans.iter().map(|span| span.style.fg).collect();
+        assert!(colors.contains(&Some(ACCENT_PRIMARY)));
+        assert!(colors.contains(&Some(TEXT_DIM)));
+        assert!(
+            colors.iter().any(|color| {
+                matches!(
+                    color,
+                    Some(Color::Rgb(r, g, b))
+                        if *r > 122 && *r < 187 && *g >= 154 && *g < 162 && *b == 247
+                )
+            }),
+            "tail should blend toward the secondary accent: {colors:?}"
+        );
+
+        let later = working_shimmer_line("Working... (Esc)", 0.7);
+        let later_colors: Vec<_> = later.spans.iter().map(|span| span.style.fg).collect();
+        assert_ne!(colors, later_colors, "the band must move over time");
+    }
+
+    #[test]
+    fn sanitize_terminal_text_strips_escape_sequences_and_control_bytes() {
+        assert_eq!(
+            sanitize_terminal_text("ok\u{1b}[31mred\u{1b}[0m\r\nplain"),
+            "okred\nplain"
+        );
+        assert_eq!(sanitize_terminal_text("a\u{7}b\u{0}c"), "abc");
+        assert_eq!(
+            sanitize_terminal_text("x\u{fffd}\u{fffd}\u{fffd}y"),
+            "x\u{fffd}y"
+        );
+        assert_eq!(sanitize_terminal_text("tab\there"), "tab\there");
+    }
+
+    #[test]
+    fn clicking_the_landing_card_focuses_the_input() {
+        let mut app = app();
+        app.input_focused = false;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let card = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == HitTarget::Input)
+            .expect("landing card registers an input hit area")
+            .area;
+
+        handle_mouse_event(
+            mouse(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                card.x + 2,
+                card.y + 1,
+            ),
+            &mut app,
+            false,
+        );
+        assert!(app.input_focused);
+    }
+
+    #[test]
+    #[ignore = "visual smoke dump; run with --ignored --nocapture"]
+    fn visual_dump() {
+        let dump = |app: &mut App, w: u16, h: u16| {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            format!("{}", terminal.backend())
+        };
+
+        let mut landing = configured_app();
+        landing.working_dir = PathBuf::from("D:/code/Zex");
+        println!("=== LANDING 80x24 ===\n{}", dump(&mut landing, 80, 24));
+
+        let mut work = configured_app();
+        work.working_dir = PathBuf::from("D:/code/Zex");
+        work.git_status = Some(super::GitStatus {
+            branch: "main".to_owned(),
+            commit: "9b2995d".to_owned(),
+            dirty_count: 1,
+        });
+        work.tokens_per_second = Some(21.5);
+        work.context_chars = 1800;
+        work.start_turn();
+        work.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::User,
+            delta: "当前目录有哪些文件".to_owned(),
+        });
+        work.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::Assistant,
+            delta: "我会先查看当前工作目录中的条目\n- 先列目录\n- 再总结".to_owned(),
+        });
+        work.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "c1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"dir /b /a"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        work.apply_agent_event(AgentEvent::ToolEnd {
+            call_id: "c1".to_owned(),
+            name: "bash".to_owned(),
+            output: "exit_code: 0\nstdout:\n.git/\nsrc/\nCargo.toml\nstderr:\n".to_owned(),
+            is_error: false,
+            elapsed: Duration::from_millis(19),
+        });
+        work.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "c2".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"pwd && find . -name '*.rs'"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        work.apply_agent_event(AgentEvent::ToolEnd {
+            call_id: "c2".to_owned(),
+            name: "bash".to_owned(),
+            output: "exit_code: 1\nstdout:\n\nstderr:\n'pwd' 不是内部或外部命令\n".to_owned(),
+            is_error: true,
+            elapsed: Duration::from_millis(20),
+        });
+        work.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::Assistant,
+            delta: "当前目录是 D:\\code\\Zex".to_owned(),
+        });
+        work.apply_agent_event(AgentEvent::TurnEnd);
+        println!("=== WORK 100x26 ===\n{}", dump(&mut work, 100, 26));
+
+        if let Some(super::TranscriptEntry::Tool(tool)) = work.transcript.get_mut(2) {
+            tool.expanded = true;
+        }
+        if let Some(super::TranscriptEntry::Tool(tool)) = work.transcript.get_mut(3) {
+            tool.expanded = true;
+        }
+        println!("=== EXPANDED 100x30 ===\n{}", dump(&mut work, 100, 30));
+
+        let mut busy = configured_app();
+        busy.apply_agent_event(AgentEvent::MessageDelta {
+            role: MessageRole::User,
+            delta: "go".to_owned(),
+        });
+        busy.start_turn();
+        println!("=== BUSY 90x18 ===\n{}", dump(&mut busy, 90, 18));
+
+        println!("=== NARROW 38x12 ===\n{}", dump(&mut work, 38, 12));
+    }
+
+    #[test]
+    fn garbled_tool_output_is_cleaned_before_it_reaches_the_screen() {
+        let mut app = app();
+        app.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-garbled".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"dir"}"#.to_owned(),
+            timeout: Duration::from_secs(30),
+        });
+        app.apply_agent_event(AgentEvent::ToolEnd {
+            call_id: "call-garbled".to_owned(),
+            name: "bash".to_owned(),
+            output: "exit_code: 0\nstdout:\n\u{1b}[32mfile.txt\u{1b}[0m\r\nstderr:\n".to_owned(),
+            is_error: false,
+            elapsed: Duration::from_millis(5),
+        });
+        app.toggle_selected_tool();
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        assert!(screen.contains("file.txt"));
+        assert!(!screen.contains("[32m"));
+        assert!(!screen.contains('\r'));
     }
 
     #[test]
@@ -7784,6 +8753,10 @@ mod tests {
     fn resumed_session_id_is_visible_in_the_footer() {
         let mut app = app();
         app.session_id = Some("20260812-121500-cafebabe".to_owned());
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::User,
+            content: "resumed session".to_owned(),
+        });
         let backend = TestBackend::new(120, 18);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -8261,6 +9234,10 @@ mod tests {
     #[test]
     fn mouse_click_focuses_input_and_statusline_fields_share_actions() {
         let mut app = configured_app();
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::User,
+            content: "keep the working chrome visible".to_owned(),
+        });
         app.input_focused = false;
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -8870,11 +9847,16 @@ mod tests {
         app.toggle_selected_tool();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let expanded = format!("{}", terminal.backend());
-        assert!(expanded.contains("input"));
-        assert!(expanded.contains("output"));
-        assert!(expanded.contains("exit_code: 0"));
+        assert!(expanded.contains("$ git status --short --branch"));
         assert!(expanded.contains("M src/tui.rs"));
-        assert!(expanded.contains("timeout 30.0s"));
+        assert!(expanded.contains("2 lines"));
+        assert!(!expanded.contains("input"));
+        assert!(!expanded.contains("output {"));
+        assert!(!expanded.contains("exit_code:"));
+        assert!(!expanded.contains("stdout:"));
+        assert!(!expanded.contains("stderr:"));
+        assert!(!expanded.contains("timeout_seconds"));
+        assert!(!expanded.contains("timeout 30.0s"));
         assert!(expanded.contains("Branch `main` is ahead by one commit"));
     }
 
