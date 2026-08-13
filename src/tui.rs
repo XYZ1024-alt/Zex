@@ -69,6 +69,14 @@ const ACCENT_PRIMARY: Color = Color::Rgb(122, 162, 247); // #7AA2F7
 const ACCENT_SECONDARY: Color = Color::Rgb(187, 154, 247); // #BB9AF7
 const OK: Color = Color::Rgb(158, 206, 106); // #9ECE6A
 const BAD: Color = Color::Rgb(219, 75, 75); // #DB4B4B
+const LANDING_LOGO_ROWS: [&str; 5] = [
+    "██████ ██████ ██  ██",
+    "    ██ ██      ████ ",
+    "   ██  █████    ██  ",
+    " ██    ██      ████ ",
+    "██████ ██████ ██  ██",
+];
+const LANDING_LOGO_DARK: Color = Color::Rgb(82, 82, 82);
 
 pub fn is_available() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
@@ -4497,7 +4505,11 @@ fn landing_regions(area: Rect, app: &App) -> LandingRegions {
         1..=4 => 1,
         _ => 0,
     };
-    let brand_height = u16::from(stage.height >= 7);
+    let brand_height = if stage.height >= 13 {
+        LANDING_LOGO_ROWS.len() as u16
+    } else {
+        0
+    };
     let brand_gap = if brand_height == 0 {
         0
     } else if stage.height >= 14 {
@@ -4514,9 +4526,9 @@ fn landing_regions(area: Rect, app: &App) -> LandingRegions {
     let card_y = brand.bottom().saturating_add(brand_gap);
     let card = Rect::new(card_x, card_y, card_width, card_height);
     let hint = Rect::new(
-        area.x,
+        card.x,
         card.bottom().saturating_add(hint_gap),
-        area.width,
+        card.width,
         hint_height,
     );
 
@@ -4535,31 +4547,30 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let regions = landing_regions(area, app);
 
     if !regions.brand.is_empty() {
-        let brand = Line::from(Span::styled(
-            "ZEX",
-            Style::default()
-                .fg(TEXT_STRONG)
-                .add_modifier(Modifier::BOLD),
-        ));
-        frame.render_widget(
-            Paragraph::new(brand).alignment(Alignment::Center),
-            regions.brand,
-        );
+        for (row, logo_row) in LANDING_LOGO_ROWS.iter().enumerate() {
+            frame.render_widget(
+                Paragraph::new(landing_logo_line(logo_row)).alignment(Alignment::Center),
+                Rect::new(
+                    regions.brand.x,
+                    regions.brand.y + row as u16,
+                    regions.brand.width,
+                    1,
+                ),
+            );
+        }
     }
 
     render_landing_card(frame, regions.card, app);
 
     if !regions.hint.is_empty() {
-        let hint = if regions.hint.width >= 72 {
-            "Enter send  ·  Shift+Enter newline  ·  / commands"
-        } else if regions.hint.width >= 42 {
-            "Enter send  ·  Shift+Enter newline  ·  /"
+        let hint = if regions.hint.width >= 28 {
+            "enter send    / commands"
         } else {
-            "Enter send  ·  /"
+            "enter    /"
         };
         frame.render_widget(
             Paragraph::new(Span::styled(hint, Style::default().fg(TEXT_FAINT)))
-                .alignment(Alignment::Center),
+                .alignment(Alignment::Right),
             regions.hint,
         );
     }
@@ -4578,6 +4589,25 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         );
         render_completion(frame, completion, app);
     }
+}
+
+fn landing_logo_line(row: &str) -> Line<'static> {
+    let width = UnicodeWidthStr::width(row).saturating_sub(1).max(1);
+    Line::from(
+        row.char_indices()
+            .map(|(column, character)| {
+                let color = lerp_color(
+                    LANDING_LOGO_DARK,
+                    TEXT_STRONG,
+                    UnicodeWidthStr::width(&row[..column]) as f32 / width as f32,
+                );
+                Span::styled(
+                    character.to_string(),
+                    Style::default().fg(color).bg(BACKGROUND),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn landing_card_width(width: u16) -> u16 {
@@ -4607,7 +4637,7 @@ fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     for row in 0..inner_rows {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                "▌",
+                "▎",
                 Style::default().fg(ACCENT_PRIMARY).bg(SURFACE),
             )),
             Rect::new(area.x, area.y + row, 1, 1),
@@ -4622,28 +4652,38 @@ fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     );
     if model_row == 1 {
         let model = model_short_name(&app.model);
-        let thinking = thinking_short_name(app.thinking_level.unwrap_or(app.thinking_preference));
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                format!("{model}  ·  {thinking}"),
-                Style::default().fg(TEXT_DIM).bg(SURFACE),
-            ))
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "Build",
+                    Style::default()
+                        .fg(ACCENT_PRIMARY)
+                        .bg(SURFACE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ·  ", Style::default().fg(TEXT_FAINT).bg(SURFACE)),
+                Span::styled(model, Style::default().fg(TEXT_DIM).bg(SURFACE)),
+            ]))
             .style(Style::default().bg(SURFACE)),
             Rect::new(editor_area.x, editor_area.bottom(), editor_area.width, 1),
         );
     }
     if !editor_area.is_empty() {
-        render_input_buffer(
-            frame,
-            editor_area,
-            app,
-            "",
-            Some(Line::from(Span::styled(
-                "ask anything…",
-                Style::default().fg(TEXT_FAINT).bg(SURFACE),
-            ))),
-            SURFACE,
-        );
+        let placeholder = if editor_area.width >= 40 {
+            Line::from(vec![
+                Span::styled("Ask anything...", Style::default().fg(TEXT_DIM).bg(SURFACE)),
+                Span::styled(
+                    "  “Explain this repo”",
+                    Style::default().fg(TEXT_FAINT).bg(SURFACE),
+                ),
+            ])
+        } else {
+            Line::from(Span::styled(
+                "Ask anything...",
+                Style::default().fg(TEXT_DIM).bg(SURFACE),
+            ))
+        };
+        render_input_buffer(frame, editor_area, app, "", Some(placeholder), SURFACE);
     }
 }
 
@@ -4655,18 +4695,36 @@ fn render_landing_status(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.is_empty() {
         return;
     }
-    let label = truncate_inline(
-        &format!(
-            "{}  ·  Zex v{}",
-            app.working_dir.display(),
-            env!("CARGO_PKG_VERSION")
-        ),
-        area.width as usize,
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let version_width = UnicodeWidthStr::width(version.as_str()).min(area.width as usize) as u16;
+    let version_area = Rect::new(
+        area.right().saturating_sub(version_width),
+        area.y,
+        version_width,
+        1,
+    );
+    let path_area = Rect::new(
+        area.x,
+        area.y,
+        version_area.x.saturating_sub(area.x).saturating_sub(2),
+        1,
+    );
+    let path = truncate_inline(
+        &app.working_dir.display().to_string(),
+        path_area.width as usize,
     );
     frame.render_widget(
-        Paragraph::new(Span::styled(label, Style::default().fg(TEXT_FAINT)))
+        Paragraph::new(Span::styled(path, Style::default().fg(TEXT_FAINT)))
             .style(Style::default().bg(BACKGROUND)),
-        area,
+        path_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            version,
+            Style::default().fg(TEXT_FAINT).bg(BACKGROUND),
+        ))
+        .alignment(Alignment::Right),
+        version_area,
     );
 }
 
@@ -6533,11 +6591,11 @@ mod tests {
 
     use super::{
         ACCENT_PRIMARY, ACCENT_SECONDARY, App, AppContext, BACKGROUND, BAD, CommandOutput,
-        HitTarget, InputAction, InputBuffer, KeyBurst, OK, ProviderPane, SCROLL_STEP, SURFACE,
-        SURFACE_RAISED, Status, TEXT_DIM, ThinkingEntry, ToolStatus, TranscriptEntry,
-        command_specs, handle_key_event, handle_mouse_event, handle_terminal_event, input_metrics,
-        landing_regions, render, sanitize_terminal_text, truncate_chars, ui_regions,
-        working_shimmer_line,
+        HitTarget, InputAction, InputBuffer, KeyBurst, LANDING_LOGO_DARK, LANDING_LOGO_ROWS, OK,
+        ProviderPane, SCROLL_STEP, SURFACE, SURFACE_RAISED, Status, TEXT_DIM, ThinkingEntry,
+        ToolStatus, TranscriptEntry, command_specs, handle_key_event, handle_mouse_event,
+        handle_terminal_event, input_metrics, landing_regions, render, sanitize_terminal_text,
+        truncate_chars, ui_regions, working_shimmer_line,
     };
     use crate::agent::{AgentEvent, Message, MessageRole};
     use crate::config::{ModelConfig, ModelRef, ProviderCatalog, ProviderConfig, SecretValue};
@@ -7212,27 +7270,57 @@ mod tests {
         let screen = format!("{}", terminal.backend());
         let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 100, 24), &app);
 
-        assert!(screen.contains("ZEX"));
+        assert!(screen.contains(LANDING_LOGO_ROWS[0]));
         assert!(!screen.contains("Z  E  X"));
-        assert!(screen.contains("ask anything…"));
-        assert!(screen.contains("Enter send"));
+        assert!(screen.contains("Ask anything..."));
+        assert!(screen.contains("enter send"));
+        assert!(screen.contains("/ commands"));
+        assert!(screen.contains("Build"));
         assert!(screen.contains("gpt-5"));
-        assert!(screen.contains("high"));
+        assert!(!screen.contains("high"));
         assert!(!screen.contains("25.0%/120Kc"));
         assert!(screen.contains("D:/workspaces/zex"));
         assert!(screen.contains(env!("CARGO_PKG_VERSION")));
         assert!(!screen.contains("● idle"));
+        assert!(!screen.contains("ctx "));
+        assert!(!screen.contains("tok/s"));
+        assert!(!screen.contains("Zex v"));
         assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
         assert!(regions.card.y > 4);
         assert!(regions.card.bottom() < regions.status.y);
         assert!(regions.card.width < 100);
         assert_eq!(
             terminal.backend().buffer()[(regions.card.x, regions.card.y)].symbol(),
-            "▌"
+            "▎"
         );
         assert_eq!(
             style_at(&terminal, regions.card.x + 1, regions.card.y).bg,
             Some(SURFACE)
+        );
+        let logo_x = regions.brand.x
+            + regions
+                .brand
+                .width
+                .saturating_sub(LANDING_LOGO_ROWS[0].chars().count() as u16)
+                / 2;
+        assert_eq!(
+            style_at(&terminal, logo_x, regions.brand.y).fg,
+            Some(LANDING_LOGO_DARK)
+        );
+        assert_eq!(
+            style_at(
+                &terminal,
+                logo_x + LANDING_LOGO_ROWS[0].chars().count() as u16 - 1,
+                regions.brand.y
+            )
+            .fg,
+            Some(super::TEXT_STRONG)
+        );
+        let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let version_x = 100 - version.chars().count() as u16 - super::HORIZONTAL_GUTTER;
+        assert_eq!(
+            terminal.backend().buffer()[(version_x, regions.status.y)].symbol(),
+            "v"
         );
     }
 
@@ -7271,7 +7359,7 @@ mod tests {
         let editor_y = regions.card.y;
 
         assert!(screen.contains("hello"));
-        assert!(!screen.contains("ask anything…"));
+        assert!(!screen.contains("Ask anything..."));
         terminal
             .backend_mut()
             .assert_cursor_position((editor_x + 5, editor_y));
@@ -7370,8 +7458,9 @@ mod tests {
             .position(|row| row.contains("Inspect the project"))
             .expect("message should be visible") as u16;
         assert!(!app.landing_visible());
-        assert!(!screen.contains("ask anything…"));
+        assert!(!screen.contains("Ask anything..."));
         assert!(screen.contains("thinking"));
+        assert!(!screen.contains(LANDING_LOGO_ROWS[0]));
         assert_eq!(message_row, regions.transcript.y);
     }
 
@@ -7391,9 +7480,9 @@ mod tests {
         let screen = format!("{}", terminal.backend());
 
         assert!(app.landing_visible());
-        assert!(screen.contains("ZEX"));
+        assert!(screen.contains(LANDING_LOGO_ROWS[0]));
         assert!(!screen.contains("Z  E  X"));
-        assert!(screen.contains("ask anything…"));
+        assert!(screen.contains("Ask anything..."));
         assert!(!screen.contains("Inspect the project"));
     }
 
