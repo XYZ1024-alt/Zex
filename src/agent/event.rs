@@ -45,6 +45,10 @@ pub enum AgentEvent {
     ContextCompacted {
         stats: CompactStats,
     },
+    ProviderUsage {
+        output_tokens: u64,
+        elapsed: Duration,
+    },
     TurnCancelled,
     TurnEnd,
 }

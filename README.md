@@ -173,9 +173,9 @@ zex
 TUI 占满 terminal 工作区，但不铺自定义整屏背景。它保持单列时间流，不使用左侧对话、右侧工具的仪表盘分栏：
 
 1. 主区：可滚动时间流，按发生顺序显示 user/assistant 文本、思考卡片和 tool 卡片。短时间流靠近输入区向上生长，长时间流占满主区并正常滚动；当前 core 未生产 planning/todo 事件，因此不会为不存在的数据预留面板。
-2. 斜杠补全：输入 `/` 时固定浮在中央输入列上方，不遮挡左右状态，也不占永久分区。
-3. 固定底栏：两行主信息带，下面紧接一行快捷键。左段稳定显示 `ZEX`、run 与短 session、工作目录或 git；右段严格按 model → think → context → idle/thinking/running 状态排列；中央保留输入或当前活动。
-4. 三段之间只使用低亮度细 `│` 分隔。中央输入可编辑多行，但在固定两行高度内滚动，不推动主区或底栏跳动；不保留空白状态行。
+2. 斜杠补全：输入 `/` 时从输入框上方弹出，不打断 statusline，也不占永久分区。
+3. 固定底栏：上方是一条不换行的高密度 statusline，按 `ZEX → model → think → cwd → git → session/commit` 排列左侧上下文，右侧显示真实 Provider 输出速率、字符上下文占用与 `idle/thinking/tool` 运行态。空间不足时优先移除 session、折叠路径与 git，再移除速率；model、think 与 context 最后保留。
+4. 输入区位于 statusline 下方，由低亮度 `┌─┐ / │ │ / └─┘` 框架夹住。正文和光标保持最高可读层级，占位符明显更淡；多行输入会把框架增高到最多五行，statusline 始终保持单行。
 
 根区域、空状态、用户消息和 assistant 正文都使用终端原生背景；近黑 surface 只用于代码块、展开的 tool 输出和斜杠补全。界面使用冷中性正文、明显更暗的次要文本、单一 Zex 钢青 accent，以及低饱和 success/error 色。用户消息使用轻量 `›` 引导，assistant 正文使用低亮度 `│` 连成单一时间流；两者都不显示 `YOU` / `ASSISTANT` 标签。基础 Markdown 标题、列表、引用和代码围栏形成清楚但克制的层级。
 

@@ -156,10 +156,11 @@ impl ModelsDevCatalog {
 }
 
 fn canonical_model_id(provider_id: &str, model_id: &str) -> String {
-    model_id
-        .contains('/')
-        .then(|| model_id.to_owned())
-        .unwrap_or_else(|| format!("{provider_id}/{model_id}"))
+    if model_id.contains('/') {
+        model_id.to_owned()
+    } else {
+        format!("{provider_id}/{model_id}")
+    }
 }
 
 fn model_aliases(model_key: &str, model_id: &str) -> BTreeSet<String> {

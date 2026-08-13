@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
@@ -79,6 +82,7 @@ impl OpenAiProvider {
         tools: &[ToolDefinition],
         events: &EventSender,
     ) -> Result<AssistantMessage> {
+        let started = Instant::now();
         let response = self.send_request(model, thinking, messages, tools).await?;
         let content_type = response
             .headers()
@@ -90,7 +94,16 @@ impl OpenAiProvider {
             .bytes()
             .await
             .context("failed to read provider response body")?;
-        parse_response_body(&body, &content_type, self.api, events)
+        let elapsed = started.elapsed();
+        let output_tokens = response_output_tokens(&body, &content_type, self.api);
+        let message = parse_response_body(&body, &content_type, self.api, events)?;
+        if let Some(output_tokens) = output_tokens.filter(|tokens| *tokens > 0) {
+            let _ = events.send(AgentEvent::ProviderUsage {
+                output_tokens,
+                elapsed,
+            });
+        }
+        Ok(message)
     }
 
     pub async fn list_models(
@@ -174,6 +187,7 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<WireMessage<'a>>,
     stream: bool,
+    stream_options: ChatStreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -193,11 +207,19 @@ impl<'a> ChatRequest<'a> {
             model,
             messages: messages.iter().map(WireMessage::from).collect(),
             stream: true,
+            stream_options: ChatStreamOptions {
+                include_usage: true,
+            },
             reasoning_effort: thinking.provider_value.as_deref(),
             tools: tools.iter().map(WireTool::from).collect(),
             tool_choice: (!tools.is_empty()).then_some("auto"),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ChatStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -569,6 +591,48 @@ fn parse_response_body(
         display_content_type(content_type),
         body_preview(body)
     )
+}
+
+fn response_output_tokens(body: &[u8], content_type: &str, api: OpenAiApi) -> Option<u64> {
+    let body = strip_utf8_bom(body);
+    let looks_like_sse = content_type.contains("text/event-stream")
+        || body
+            .split(|byte| *byte == b'\n')
+            .any(|line| line.trim_ascii_start().starts_with(b"data:"));
+    if looks_like_sse {
+        return body
+            .split(|byte| *byte == b'\n')
+            .rev()
+            .filter_map(|line| {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                let data = line.strip_prefix(b"data:")?;
+                let data = data.strip_prefix(b" ").unwrap_or(data);
+                (data != b"[DONE]" && !data.is_empty())
+                    .then(|| serde_json::from_slice::<Value>(data).ok())
+                    .flatten()
+            })
+            .filter_map(|event| output_tokens_from_value(&event, api))
+            .next();
+    }
+
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|response| output_tokens_from_value(&response, api))
+}
+
+fn output_tokens_from_value(value: &Value, api: OpenAiApi) -> Option<u64> {
+    let usage = match api {
+        OpenAiApi::ChatCompletions => value.get("usage"),
+        OpenAiApi::Responses => value.get("usage").or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("usage"))
+        }),
+    }?;
+    usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(Value::as_u64)
 }
 
 fn parse_chat_stream_body(body: &[u8], events: &EventSender) -> Result<AssistantMessage> {
@@ -1209,7 +1273,7 @@ mod tests {
 
     use super::{
         ChatProviderState, ResponsesRequest, ToolCallAccumulator, consume_sse_line, finish_message,
-        parse_response_body,
+        parse_response_body, response_output_tokens,
     };
 
     #[test]
@@ -1311,6 +1375,34 @@ mod tests {
             }
             event => panic!("unexpected event: {event:?}"),
         }
+    }
+
+    #[test]
+    fn extracts_output_tokens_from_chat_and_responses_usage() {
+        assert_eq!(
+            response_output_tokens(
+                br#"{"usage":{"completion_tokens":37}}"#,
+                "application/json",
+                OpenAiApi::ChatCompletions,
+            ),
+            Some(37)
+        );
+        assert_eq!(
+            response_output_tokens(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":91}}}\n\ndata: [DONE]\n\n",
+                "text/event-stream",
+                OpenAiApi::Responses,
+            ),
+            Some(91)
+        );
+        assert_eq!(
+            response_output_tokens(
+                b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":42}}\n\ndata: [DONE]\n\n",
+                "text/event-stream",
+                OpenAiApi::ChatCompletions,
+            ),
+            Some(42)
+        );
     }
 
     #[test]
@@ -1608,6 +1700,7 @@ data: [DONE]
         let chat =
             serde_json::to_value(super::ChatRequest::new("gpt-5", &low, &messages, &[])).unwrap();
         assert_eq!(chat["reasoning_effort"], "low");
+        assert_eq!(chat["stream_options"]["include_usage"], true);
     }
 
     #[test]

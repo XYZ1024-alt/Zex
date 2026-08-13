@@ -172,8 +172,9 @@ fn print_event(event: AgentEvent) -> Result<()> {
             "\n[compact] freed approximately {} chars; kept {} recent turn(s)",
             stats.freed_chars, stats.kept_turns
         ),
-        AgentEvent::TurnCancelled => eprintln!("\nZex turn interrupted."),
-        AgentEvent::TurnEnd => println!(),
+        AgentEvent::ProviderUsage { .. } => {}
+        AgentEvent::TurnCancelled => eprintln!("\n[interrupted]"),
+        AgentEvent::TurnEnd => {}
     }
     Ok(())
 }

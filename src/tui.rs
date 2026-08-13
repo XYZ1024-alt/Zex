@@ -51,8 +51,7 @@ const MAX_TOOL_ARGUMENT_CHARS: usize = 2_000;
 const MAX_INPUT_HISTORY: usize = 100;
 const MIN_TRANSCRIPT_HEIGHT: u16 = 2;
 const HORIZONTAL_GUTTER: u16 = 1;
-const FOOTER_HEIGHT: u16 = 2;
-const INPUT_PROMPT: &str = "› ";
+const MAX_INPUT_ROWS: usize = 5;
 const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -905,16 +904,6 @@ enum Status {
 }
 
 impl Status {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Thinking => "thinking",
-            Self::RunningTool => "running",
-            Self::Cancelling => "stopping",
-            Self::Error => "error",
-        }
-    }
-
     fn color(self) -> Color {
         match self {
             Self::Idle => SUCCESS,
@@ -1102,6 +1091,7 @@ impl InputBuffer {
 struct GitStatus {
     branch: String,
     commit: String,
+    dirty_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1261,6 +1251,7 @@ struct App {
     thinking_preference: ThinkingLevel,
     context_chars: usize,
     max_context_chars: usize,
+    tokens_per_second: Option<f64>,
     default_tool_timeout: Duration,
     show_thinking: bool,
     completion: CompletionState,
@@ -1303,6 +1294,7 @@ impl App {
             thinking_preference: context.thinking_preference,
             context_chars: context.context_chars,
             max_context_chars: context.max_context_chars,
+            tokens_per_second: None,
             default_tool_timeout: context.default_tool_timeout,
             show_thinking: context.show_thinking,
             completion: CompletionState {
@@ -1486,6 +1478,14 @@ impl App {
                     ),
                     ToastTone::Neutral,
                 );
+            }
+            AgentEvent::ProviderUsage {
+                output_tokens,
+                elapsed,
+            } => {
+                self.tokens_per_second = (elapsed > Duration::ZERO)
+                    .then(|| output_tokens as f64 / elapsed.as_secs_f64())
+                    .filter(|rate| rate.is_finite());
             }
             AgentEvent::TurnCancelled => {
                 for entry in &mut self.transcript {
@@ -1796,7 +1796,11 @@ impl App {
     where
         P: Provider,
     {
-        self.model = agent.model().to_owned();
+        let model = agent.model();
+        if self.model != model {
+            self.tokens_per_second = None;
+        }
+        self.model = model.to_owned();
         self.session_id = session_id.map(str::to_owned);
         self.thinking_level = Some(agent.thinking_level());
         self.thinking_preference = agent.thinking_preference();
@@ -2698,7 +2702,14 @@ fn load_git_status(working_dir: &Path) -> Option<GitStatus> {
             .map(|commit| format!("detached:{commit}"))
     })?;
     let commit = git_output(working_dir, &["rev-parse", "--short", "HEAD"])?;
-    Some(GitStatus { branch, commit })
+    let dirty_count = git_output(working_dir, &["status", "--porcelain"])
+        .map(|status| status.lines().count())
+        .unwrap_or(0);
+    Some(GitStatus {
+        branch,
+        commit,
+        dirty_count,
+    })
 }
 
 fn git_output(working_dir: &Path, arguments: &[&str]) -> Option<String> {
@@ -2750,113 +2761,331 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
-    frame.render_widget(Block::default().style(Style::default().bg(SURFACE)), area);
-    let regions = footer_regions(area);
-    render_footer_context(frame, regions.left, app);
-    render_footer_input(frame, regions.input, app);
-    render_footer_runtime(frame, regions.right, app);
-}
-
-fn render_footer_context(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let area = footer_segment_area(area, true, true);
+    let area = content_area(area);
     if area.is_empty() {
         return;
     }
-    let session = app
+    let status_height = u16::from(area.height > 0);
+    render_statusline(
+        frame,
+        Rect::new(area.x, area.y, area.width, status_height),
+        app,
+        false,
+    );
+    let input = Rect::new(
+        area.x,
+        area.y.saturating_add(status_height),
+        area.width,
+        area.height.saturating_sub(status_height),
+    );
+    render_input_frame(frame, input, app);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatuslineLayout {
+    Full,
+    WithoutIdentifier,
+    ShortPath,
+    ShortContext,
+    WithoutSpeed,
+    WithoutGit,
+    Core,
+    PointState,
+    ContextOnly,
+}
+
+struct StatuslineFields<'a> {
+    model: &'a str,
+    thinking: &'a str,
+    cwd: &'a str,
+    project: &'a str,
+    git: Option<&'a str>,
+    short_git: Option<&'a str>,
+    identifier: Option<&'a str>,
+}
+
+fn render_statusline(frame: &mut Frame<'_>, area: Rect, app: &App, subdued: bool) {
+    if area.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(statusline_line(app, area.width as usize, subdued))
+            .style(Style::default().bg(BACKGROUND))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn statusline_line(app: &App, width: usize, subdued: bool) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+    let model = model_short_name(&app.model);
+    let thinking = thinking_short_name(app.thinking_level.unwrap_or(app.thinking_preference));
+    let cwd = app.working_dir.display().to_string();
+    let project = app
+        .working_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(cwd.as_str())
+        .to_owned();
+    let git = app.git_status.as_ref().map(git_status_label);
+    let short_git = app.git_status.as_ref().map(|git| {
+        let dirty = dirty_suffix(git.dirty_count);
+        format!("{}{}", truncate_inline(&git.branch, 14), dirty)
+    });
+    let identifier = app
         .session_id
         .as_deref()
         .map(short_session_id)
-        .unwrap_or("new");
-    let location = match &app.git_status {
-        Some(git) => format!("{}@{}", single_line(&git.branch, 18), git.commit),
-        None => short_path(&app.working_dir, area.width as usize),
-    };
-    let title = if area.height == 1 || area.width < 14 {
-        format!("ZEX {session}")
-    } else {
-        format!("ZEX · run {session}")
-    };
-    let mut lines = vec![Line::from(vec![Span::styled(
-        single_line(&title, area.width as usize),
-        Style::default()
-            .fg(TEXT_STRONG)
-            .bg(SURFACE)
-            .add_modifier(Modifier::BOLD),
-    )])];
-    if area.height > 1 {
-        lines.push(Line::from(Span::styled(
-            single_line(&location, area.width as usize),
-            Style::default().fg(DIM).bg(SURFACE),
-        )));
-    }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(SURFACE))
-            .wrap(Wrap { trim: false }),
-        area,
+        .or_else(|| app.git_status.as_ref().map(|git| git.commit.as_str()))
+        .map(str::to_owned);
+    let context = context_label(app);
+    let speed = (!app.busy)
+        .then_some(app.tokens_per_second)
+        .flatten()
+        .map(|rate| format!("{rate:.1} tok/s"));
+    let state = format!(
+        "{} {}",
+        app.status.symbol(),
+        statusline_state_label(app.status)
     );
+    let fields = StatuslineFields {
+        model: &model,
+        thinking,
+        cwd: &cwd,
+        project: &project,
+        git: git.as_deref(),
+        short_git: short_git.as_deref(),
+        identifier: identifier.as_deref(),
+    };
+
+    let layouts = [
+        StatuslineLayout::Full,
+        StatuslineLayout::WithoutIdentifier,
+        StatuslineLayout::ShortPath,
+        StatuslineLayout::ShortContext,
+        StatuslineLayout::WithoutSpeed,
+        StatuslineLayout::WithoutGit,
+        StatuslineLayout::Core,
+        StatuslineLayout::PointState,
+        StatuslineLayout::ContextOnly,
+    ];
+    for layout in layouts {
+        let left = statusline_left_parts(layout, &fields);
+        let right = statusline_right_parts(
+            layout,
+            speed.as_deref(),
+            &context,
+            &state,
+            app.status.symbol(),
+        );
+        if statusline_parts_width(&left, &right) <= width {
+            return styled_statusline(left, right, width, app.status, subdued);
+        }
+    }
+
+    compact_statusline(&model, thinking, &context, width, subdued)
 }
 
-fn render_footer_runtime(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let area = footer_segment_area(area, true, true);
-    if area.is_empty() {
-        return;
+fn statusline_left_parts(layout: StatuslineLayout, fields: &StatuslineFields<'_>) -> Vec<String> {
+    let mut parts = vec![
+        "ZEX".to_owned(),
+        fields.model.to_owned(),
+        fields.thinking.to_owned(),
+    ];
+    match layout {
+        StatuslineLayout::Full => {
+            parts.push(fields.cwd.to_owned());
+            parts.extend(fields.git.map(str::to_owned));
+            parts.extend(fields.identifier.map(str::to_owned));
+        }
+        StatuslineLayout::WithoutIdentifier => {
+            parts.push(fields.cwd.to_owned());
+            parts.extend(fields.git.map(str::to_owned));
+        }
+        StatuslineLayout::ShortPath => {
+            parts.push(fields.project.to_owned());
+            parts.extend(fields.git.map(str::to_owned));
+        }
+        StatuslineLayout::ShortContext | StatuslineLayout::WithoutSpeed => {
+            parts.push(fields.project.to_owned());
+            parts.extend(fields.short_git.map(str::to_owned));
+        }
+        StatuslineLayout::WithoutGit => parts.push(fields.project.to_owned()),
+        StatuslineLayout::Core | StatuslineLayout::PointState | StatuslineLayout::ContextOnly => {}
     }
-    let context_percent = app
-        .context_chars
-        .saturating_mul(100)
-        .checked_div(app.max_context_chars.max(1))
-        .unwrap_or(0)
-        .min(999);
-    let thinking = app.thinking_level.map_or_else(
-        || app.thinking_preference.to_string(),
-        |level| level.to_string(),
-    );
-    let model_label = ModelRef::from_key(&app.model)
-        .and_then(|target| {
-            app.providers.model(&target).map(|(provider, model)| {
-                format!("{} / {}", provider.display_name, model.display_name)
-            })
-        })
-        .unwrap_or_else(|| app.model.clone());
-    let runtime = format!("{} {}", app.status.symbol(), app.status.label());
-    let compact = format!("{} · {context_percent}%", app.status.label());
-    let title = if area.height == 1 {
-        format!("{context_percent}% · {}", app.status.label())
+    parts
+}
+
+fn statusline_right_parts(
+    layout: StatuslineLayout,
+    speed: Option<&str>,
+    context: &str,
+    state: &str,
+    state_symbol: &str,
+) -> Vec<String> {
+    let mut parts = Vec::new();
+    if matches!(
+        layout,
+        StatuslineLayout::Full
+            | StatuslineLayout::WithoutIdentifier
+            | StatuslineLayout::ShortPath
+            | StatuslineLayout::ShortContext
+    ) {
+        parts.extend(speed.map(str::to_owned));
+    }
+    parts.push(context.to_owned());
+    match layout {
+        StatuslineLayout::PointState => parts.push(state_symbol.to_owned()),
+        StatuslineLayout::ContextOnly => {}
+        _ => parts.push(state.to_owned()),
+    }
+    parts
+}
+
+fn statusline_parts_width(left: &[String], right: &[String]) -> usize {
+    let separator_width = UnicodeWidthStr::width("  ·  ");
+    let left_width = left
+        .iter()
+        .map(|part| UnicodeWidthStr::width(part.as_str()))
+        .sum::<usize>()
+        + separator_width.saturating_mul(left.len().saturating_sub(1));
+    let right_width = right
+        .iter()
+        .map(|part| UnicodeWidthStr::width(part.as_str()))
+        .sum::<usize>()
+        + separator_width.saturating_mul(right.len().saturating_sub(1));
+    left_width + right_width + usize::from(!left.is_empty() && !right.is_empty()) * 2
+}
+
+fn styled_statusline(
+    left: Vec<String>,
+    right: Vec<String>,
+    width: usize,
+    status: Status,
+    subdued: bool,
+) -> Line<'static> {
+    let content_width = statusline_parts_width(&left, &right);
+    let spacer = width.saturating_sub(content_width);
+    let strong = if subdued { TEXT } else { TEXT_STRONG };
+    let secondary = if subdued { MUTED } else { DIM };
+    let separator = if subdued {
+        MUTED
     } else {
-        format!("{model_label}  ·  think {thinking}")
+        Color::Rgb(72, 82, 90)
     };
-    let mut lines = vec![Line::from(Span::styled(
-        truncate_inline(&title, area.width as usize),
-        Style::default()
-            .fg(TEXT_STRONG)
-            .bg(SURFACE)
-            .add_modifier(Modifier::BOLD),
-    ))];
-    if area.height > 1 {
-        let detail = if area.width < 18 {
-            Line::from(Span::styled(
-                single_line(&compact, area.width as usize),
-                Style::default().fg(app.status.color()).bg(SURFACE),
-            ))
-        } else {
-            Line::from(vec![
-                Span::styled(
-                    format!("ctx {context_percent}%  ·  "),
-                    Style::default().fg(DIM).bg(SURFACE),
-                ),
-                Span::styled(runtime, Style::default().fg(app.status.color()).bg(SURFACE)),
-            ])
+    let mut spans = Vec::new();
+    for (index, part) in left.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ·  ", Style::default().fg(separator)));
+        }
+        let style = match index {
+            0 => Style::default()
+                .fg(if subdued { DIM } else { ACCENT })
+                .add_modifier(Modifier::BOLD),
+            1 | 2 => Style::default().fg(strong),
+            _ => Style::default().fg(secondary),
         };
-        lines.push(detail);
+        spans.push(Span::styled(part, style));
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(SURFACE))
-            .alignment(Alignment::Right)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    if !spans.is_empty() && !right.is_empty() {
+        spans.push(Span::raw(" ".repeat(spacer.saturating_add(2))));
+    }
+    let right_len = right.len();
+    for (index, part) in right.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ·  ", Style::default().fg(separator)));
+        }
+        let style = if index + 1 == right_len {
+            Style::default().fg(if subdued { DIM } else { status.color() })
+        } else {
+            Style::default().fg(secondary)
+        };
+        spans.push(Span::styled(part, style));
+    }
+    Line::from(spans)
+}
+
+fn compact_statusline(
+    model: &str,
+    thinking: &str,
+    context: &str,
+    width: usize,
+    subdued: bool,
+) -> Line<'static> {
+    let separator = " · ";
+    let fixed = UnicodeWidthStr::width("ZEX")
+        + UnicodeWidthStr::width(thinking)
+        + UnicodeWidthStr::width(context)
+        + UnicodeWidthStr::width(separator) * 3;
+    let model = truncate_inline(model, width.saturating_sub(fixed).max(1));
+    let content = format!("ZEX{separator}{model}{separator}{thinking}{separator}{context}");
+    Line::from(Span::styled(
+        truncate_inline(&content, width),
+        Style::default()
+            .fg(if subdued { DIM } else { TEXT_STRONG })
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn model_short_name(model: &str) -> String {
+    ModelRef::from_key(model)
+        .map(|target| target.model_id)
+        .unwrap_or_else(|| model.rsplit('/').next().unwrap_or(model).to_owned())
+}
+
+fn thinking_short_name(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off => "off",
+        ThinkingLevel::Minimal => "min",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "med",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::XHigh => "xhi",
+        ThinkingLevel::Max => "max",
+    }
+}
+
+fn git_status_label(git: &GitStatus) -> String {
+    format!("{}{}", git.branch, dirty_suffix(git.dirty_count))
+}
+
+fn dirty_suffix(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!(" *{count}")
+    }
+}
+
+fn context_label(app: &App) -> String {
+    let percent = app.context_chars as f64 * 100.0 / app.max_context_chars.max(1) as f64;
+    format!(
+        "{percent:.1}%/{}",
+        format_char_budget(app.max_context_chars)
+    )
+}
+
+fn format_char_budget(chars: usize) -> String {
+    if chars >= 1_000_000 {
+        format!("{:.1}Mc", chars as f64 / 1_000_000.0)
+    } else if chars >= 1_000 {
+        format!("{}Kc", (chars + 500) / 1_000)
+    } else {
+        format!("{chars}c")
+    }
+}
+
+fn statusline_state_label(status: Status) -> &'static str {
+    match status {
+        Status::Idle => "idle",
+        Status::Thinking => "thinking",
+        Status::RunningTool => "tool",
+        Status::Cancelling => "stopping",
+        Status::Error => "error",
+    }
 }
 
 fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &App) {
@@ -3321,18 +3550,35 @@ struct UiRegions {
 
 fn ui_regions(area: Rect, app: &App) -> UiRegions {
     let keymap_height = u16::from(area.height >= 3);
-    let footer_height = if area.height >= 6 {
-        FOOTER_HEIGHT
+    let requested_input_rows = if app.busy || app.page_open() {
+        1
     } else {
-        area.height.saturating_sub(keymap_height).min(1)
+        input_metrics(
+            &app.input.content,
+            app.input.cursor,
+            footer_input_width(area.width).saturating_sub(4).max(1) as usize,
+        )
+        .total_rows
+        .clamp(1, MAX_INPUT_ROWS)
+    };
+    let preferred_footer_height = (requested_input_rows as u16).saturating_add(3);
+    let footer_height = if area.height
+        >= keymap_height
+            .saturating_add(MIN_TRANSCRIPT_HEIGHT)
+            .saturating_add(4)
+    {
+        preferred_footer_height.min(
+            area.height
+                .saturating_sub(keymap_height)
+                .saturating_sub(MIN_TRANSCRIPT_HEIGHT),
+        )
+    } else {
+        area.height.saturating_sub(keymap_height).min(3)
     };
     let fixed_height = footer_height + keymap_height;
     let remaining = area.height.saturating_sub(fixed_height);
     let transcript_reserve = MIN_TRANSCRIPT_HEIGHT.min(remaining);
-    let completion_width =
-        footer_regions(Rect::new(area.x, area.y, area.width, footer_height.max(1)))
-            .input
-            .width;
+    let completion_width = footer_input_width(area.width);
     let completion_height =
         completion_height(app, completion_width).min(remaining.saturating_sub(transcript_reserve));
     let transcript_height = remaining.saturating_sub(completion_height);
@@ -3355,49 +3601,19 @@ fn ui_regions(area: Rect, app: &App) -> UiRegions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FooterRegions {
-    left: Rect,
-    input: Rect,
-    right: Rect,
-}
-
-fn footer_regions(area: Rect) -> FooterRegions {
-    let (left_width, right_width) = match area.width {
-        110.. => (24, 38),
-        84..=109 => (22, 32),
-        60..=83 => (18, 24),
-        30..=59 => (9, 12),
-        _ => (0, 0),
-    };
-    let [left, input, right] = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(left_width),
-            Constraint::Min(1),
-            Constraint::Length(right_width),
-        ])
-        .areas(area);
-    FooterRegions { left, input, right }
-}
-
 fn align_with_footer_input(area: Rect, footer: Rect) -> Rect {
-    let input = footer_regions(footer).input;
-    Rect::new(input.x, area.y, input.width, area.height)
-}
-
-fn footer_segment_area(area: Rect, inset_left: bool, inset_right: bool) -> Rect {
-    if area.is_empty() {
-        return area;
-    }
-    let left = u16::from(inset_left && area.width > 1);
-    let right = u16::from(inset_right && area.width > left + 1);
+    let gutter = HORIZONTAL_GUTTER.min(footer.width / 2);
     Rect::new(
-        area.x.saturating_add(left),
+        footer.x.saturating_add(gutter),
         area.y,
-        area.width.saturating_sub(left + right),
+        footer.width.saturating_sub(gutter.saturating_mul(2)),
         area.height,
     )
+}
+
+fn footer_input_width(width: u16) -> u16 {
+    let gutter = HORIZONTAL_GUTTER.min(width / 2);
+    width.saturating_sub(gutter.saturating_mul(2))
 }
 
 fn horizontal_inset(area: Rect, amount: u16) -> Rect {
@@ -3470,7 +3686,7 @@ struct LandingRegions {
     status: Rect,
 }
 
-fn landing_regions(area: Rect) -> LandingRegions {
+fn landing_regions(area: Rect, app: &App) -> LandingRegions {
     if area.is_empty() {
         return LandingRegions {
             brand: area,
@@ -3493,8 +3709,15 @@ fn landing_regions(area: Rect) -> LandingRegions {
         area.width,
         area.height.saturating_sub(status_height),
     );
+    let input_rows = input_metrics(
+        &app.input.content,
+        app.input.cursor,
+        area.width.saturating_sub(12).clamp(1, 72) as usize,
+    )
+    .total_rows
+    .clamp(1, MAX_INPUT_ROWS) as u16;
     let card_height = match stage.height {
-        9.. => 5,
+        9.. => input_rows.saturating_add(2).max(3),
         5..=8 => 3,
         1..=4 => 1,
         _ => 0,
@@ -3540,7 +3763,7 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
-    let regions = landing_regions(area);
+    let regions = landing_regions(area, app);
 
     if !regions.brand.is_empty() {
         let brand = if area.width >= 12 {
@@ -3605,109 +3828,18 @@ fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
-    frame.render_widget(Block::default().style(Style::default().bg(SURFACE)), area);
-    frame.render_widget(
-        Paragraph::new(
-            std::iter::repeat_n(
-                Line::from(Span::styled("▌", Style::default().fg(ACCENT).bg(SURFACE))),
-                area.height as usize,
-            )
-            .collect::<Vec<_>>(),
-        )
-        .style(Style::default().bg(SURFACE)),
-        Rect::new(area.x, area.y, 1, area.height),
-    );
-
-    let content_x = area.x.saturating_add(if area.width >= 4 { 3 } else { 1 });
-    let content_width = area.right().saturating_sub(content_x).saturating_sub(1);
-    let input_height = if area.height >= 5 { 2 } else { 1 };
-    let input_y = area.y + u16::from(area.height >= 5);
-    let input_area = Rect::new(content_x, input_y, content_width, input_height);
-    render_input_buffer(
-        frame,
-        input_area,
-        app,
-        "",
-        Some(Line::from(vec![
-            Span::styled("Ask anything…", Style::default().fg(TEXT).bg(SURFACE)),
-            Span::styled(
-                "  “帮我看下这个项目的结构”",
-                Style::default().fg(DIM).bg(SURFACE),
-            ),
-        ])),
-        SURFACE,
-    );
-
-    if area.height >= 3 && content_width > 0 {
-        let metadata = landing_metadata(app);
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                truncate_inline(&metadata, content_width as usize),
-                Style::default().fg(DIM).bg(SURFACE),
-            ))
-            .style(Style::default().bg(SURFACE)),
-            Rect::new(
-                content_x,
-                area.bottom()
-                    .saturating_sub(if area.height >= 5 { 2 } else { 1 }),
-                content_width,
-                1,
-            ),
-        );
-    }
-}
-
-fn landing_metadata(app: &App) -> String {
-    let Some(target) = ModelRef::from_key(&app.model) else {
-        return format!("Agent  ·  {}", app.model);
-    };
-    let provider = app
-        .providers
-        .provider(&target.provider_id)
-        .map(|provider| provider.display_name.as_str())
-        .unwrap_or(target.provider_id.as_str());
-    format!("Agent  ·  {}  ·  {provider}", target.model_id)
+    render_input_frame(frame, area, app);
 }
 
 fn render_landing_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
-    let area = horizontal_inset(area, 2);
+    let area = horizontal_inset(area, HORIZONTAL_GUTTER);
     if area.is_empty() {
         return;
     }
-    let version = format!("zex {}", env!("CARGO_PKG_VERSION"));
-    let version_width = UnicodeWidthStr::width(version.as_str()).min(area.width as usize) as u16;
-    let left_width = area.width.saturating_sub(version_width.saturating_add(2));
-    if left_width > 0 {
-        let location = short_path(&app.working_dir, left_width as usize);
-        let context = app
-            .session_id
-            .as_deref()
-            .map(short_session_id)
-            .map(|session| format!("run {session}  ·  {location}"))
-            .unwrap_or(location);
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                single_line(&context, left_width as usize),
-                Style::default().fg(MUTED),
-            )),
-            Rect::new(area.x, area.y, left_width, 1),
-        );
-    }
-    if version_width > 0 {
-        frame.render_widget(
-            Paragraph::new(Span::styled(version, Style::default().fg(MUTED)))
-                .alignment(Alignment::Right),
-            Rect::new(
-                area.right().saturating_sub(version_width),
-                area.y,
-                version_width,
-                1,
-            ),
-        );
-    }
+    render_statusline(frame, area, app, true);
 }
 
 fn completion_height(app: &App, width: u16) -> u16 {
@@ -4324,26 +4456,26 @@ fn bash_output_summary(output: &str) -> Option<String> {
     Some(single_line(summary, 120))
 }
 
-fn render_footer_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
+    let border_style = Style::default().fg(Color::Rgb(72, 91, 98)).bg(BACKGROUND);
     frame.render_widget(
-        Paragraph::new(
-            std::iter::repeat_n(
-                Line::from(Span::styled("▌", Style::default().fg(ACCENT).bg(SURFACE))),
-                area.height as usize,
-            )
-            .collect::<Vec<_>>(),
-        )
-        .style(Style::default().bg(SURFACE)),
-        Rect::new(area.x, area.y, 1, area.height),
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .style(Style::default().bg(BACKGROUND)),
+        area,
     );
+    if area.width <= 2 || area.height <= 2 {
+        return;
+    }
     let input_area = Rect::new(
         area.x.saturating_add(2),
-        area.y,
-        area.width.saturating_sub(3),
-        area.height,
+        area.y.saturating_add(1),
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2),
     );
     if input_area.is_empty() {
         return;
@@ -4362,49 +4494,36 @@ fn render_footer_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let y = area.y + area.height.saturating_sub(1) / 2;
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("ZEX / ", Style::default().fg(ACCENT).bg(SURFACE)),
-                Span::styled(label, Style::default().fg(TEXT).bg(SURFACE)),
+                Span::styled("ZEX / ", Style::default().fg(ACCENT).bg(BACKGROUND)),
+                Span::styled(label, Style::default().fg(TEXT).bg(BACKGROUND)),
             ]))
-            .style(Style::default().bg(SURFACE))
+            .style(Style::default().bg(BACKGROUND))
             .alignment(Alignment::Center),
-            Rect::new(input_area.x, y, input_area.width, 1),
+            Rect::new(
+                input_area.x,
+                y.clamp(input_area.y, input_area.bottom().saturating_sub(1)),
+                input_area.width,
+                1,
+            ),
         );
         return;
     }
 
     if app.busy {
-        let busy_text = match app.status {
-            Status::Thinking => "processing turn".to_owned(),
-            Status::RunningTool => app
-                .transcript
-                .iter()
-                .rev()
-                .find_map(|entry| {
-                    let TranscriptEntry::Tool(tool) = entry else {
-                        return None;
-                    };
-                    (tool.status == ToolStatus::Running)
-                        .then(|| format!("{} · {}", tool.name, tool_subject(tool)))
-                })
-                .unwrap_or_else(|| "running tool".to_owned()),
-            Status::Cancelling => "stopping".to_owned(),
-            Status::Error => "stopped with an error".to_owned(),
-            Status::Idle => "working".to_owned(),
-        };
-        let y = area.y + area.height.saturating_sub(1) / 2;
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("◌ ", Style::default().fg(ACCENT).bg(SURFACE)),
-                Span::styled(busy_text, Style::default().fg(TEXT).bg(SURFACE)),
-            ]))
-            .style(Style::default().bg(SURFACE))
-            .wrap(Wrap { trim: false }),
-            Rect::new(input_area.x, y, input_area.width, 1),
-        );
         return;
     }
 
-    render_input_buffer(frame, input_area, app, INPUT_PROMPT, None, SURFACE);
+    render_input_buffer(
+        frame,
+        input_area,
+        app,
+        "",
+        Some(Line::from(Span::styled(
+            "ask anything…",
+            Style::default().fg(DIM).bg(BACKGROUND),
+        ))),
+        BACKGROUND,
+    );
 }
 
 fn render_input_buffer(
@@ -4642,23 +4761,6 @@ fn format_session_time(timestamp: time::OffsetDateTime) -> String {
         .unwrap_or_else(|_| timestamp.unix_timestamp().to_string())
 }
 
-fn short_path(path: &Path, max_chars: usize) -> String {
-    let display = path.display().to_string();
-    if display.chars().count() <= max_chars {
-        return display;
-    }
-    let keep = max_chars.saturating_sub(2);
-    let tail = display
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    format!("…{tail}")
-}
-
 fn content_area(area: Rect) -> Rect {
     let gutter = HORIZONTAL_GUTTER.min(area.width / 2);
     Rect::new(
@@ -4775,8 +4877,8 @@ mod tests {
     use super::{
         ACCENT, App, AppContext, BACKGROUND, CommandOutput, InputAction, InputBuffer, KeyBurst,
         ProviderPane, SCROLL_STEP, SURFACE, SURFACE_RAISED, Status, ThinkingEntry, ToolStatus,
-        TranscriptEntry, UiRegions, command_specs, handle_key_event, handle_terminal_event,
-        input_metrics, landing_regions, render, truncate_chars, ui_regions,
+        TranscriptEntry, command_specs, handle_key_event, handle_terminal_event, input_metrics,
+        landing_regions, render, truncate_chars, ui_regions,
     };
     use crate::agent::{AgentEvent, Message, MessageRole};
     use crate::config::{ModelConfig, ModelRef, ProviderCatalog, ProviderConfig, SecretValue};
@@ -4893,14 +4995,6 @@ mod tests {
         terminal.backend().buffer()[(x, y)].style()
     }
 
-    fn assert_regions_fill(area: ratatui::layout::Rect, regions: UiRegions) {
-        assert_eq!(regions.transcript.y, area.y);
-        assert_eq!(regions.completion.y, regions.transcript.bottom());
-        assert_eq!(regions.footer.y, regions.completion.bottom());
-        assert_eq!(regions.keymap.y, regions.footer.bottom());
-        assert_eq!(regions.keymap.bottom(), area.bottom());
-    }
-
     #[test]
     fn model_picker_selects_configured_models_without_editing_the_catalog() {
         let mut app = configured_app();
@@ -4954,6 +5048,93 @@ mod tests {
         assert_eq!(app.thinking_preference, ThinkingLevel::Max);
         assert_eq!(app.thinking_level, Some(ThinkingLevel::High));
         assert!(!app.show_thinking);
+    }
+
+    #[test]
+    fn provider_usage_updates_statusline_rate_without_feed_rows() {
+        let mut app = configured_app();
+        let transcript = app.transcript.clone();
+
+        app.apply_agent_event(AgentEvent::ProviderUsage {
+            output_tokens: 128,
+            elapsed: Duration::from_secs(2),
+        });
+
+        assert_eq!(app.tokens_per_second, Some(64.0));
+        assert_eq!(app.transcript, transcript);
+
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Ready.".to_owned(),
+        });
+        let backend = TestBackend::new(120, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(format!("{}", terminal.backend()).contains("64.0 tok/s"));
+    }
+
+    #[test]
+    fn statusline_prefers_model_think_and_context_as_width_shrinks() {
+        let mut app = configured_app();
+        app.model = "openai/gpt-5.6-sol".to_owned();
+        app.working_dir = PathBuf::from("D:/code/Zex");
+        app.git_status = Some(super::GitStatus {
+            branch: "feature/statusline-polish".to_owned(),
+            commit: "019ff991".to_owned(),
+            dirty_count: 3,
+        });
+        app.session_id = Some("20260813-120000-cafebabe".to_owned());
+        app.context_chars = 58_920;
+        app.tokens_per_second = Some(42.7);
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "Ready.".to_owned(),
+        });
+
+        let backend = TestBackend::new(120, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let wide = format!("{}", terminal.backend());
+        assert!(wide.contains("gpt-5.6-sol"));
+        assert!(wide.contains("high"));
+        assert!(wide.contains("Zex"));
+        assert!(wide.contains("*3"));
+        assert!(wide.contains("42.7 tok/s"));
+        assert!(wide.contains("49.1%/120Kc"));
+
+        let backend = TestBackend::new(42, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let narrow = format!("{}", terminal.backend());
+        assert!(narrow.contains("gpt-5.6-sol"));
+        assert!(narrow.contains("high"));
+        assert!(narrow.contains("49.1%/120K"));
+        assert!(!narrow.contains("feature/statusline-polish"));
+        assert!(!narrow.contains("cafebabe"));
+    }
+
+    #[test]
+    fn thinking_statusline_hides_stale_rate_and_keeps_input_frame_empty() {
+        let mut app = configured_app();
+        app.tokens_per_second = Some(42.7);
+        app.transcript.push(TranscriptEntry::Message {
+            role: MessageRole::User,
+            content: "Inspect.".to_owned(),
+        });
+        app.start_turn();
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+        let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 100, 18), &app);
+        assert!(screen.contains("thinking"));
+        assert!(!screen.contains("42.7 tok/s"));
+        assert!(!screen.contains("processing turn"));
+        assert_eq!(
+            terminal.backend().buffer()[(regions.footer.x + 3, regions.footer.y + 2)].symbol(),
+            " "
+        );
     }
 
     #[test]
@@ -5348,6 +5529,7 @@ mod tests {
         app.git_status = Some(super::GitStatus {
             branch: "main".to_owned(),
             commit: "a1b2c3d".to_owned(),
+            dirty_count: 0,
         });
         app.thinking_level = Some(ThinkingLevel::High);
         app.context_chars = 30_000;
@@ -5356,29 +5538,27 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
-        let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 100, 24));
+        let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 100, 24), &app);
 
         assert!(screen.contains("Z  E  X"));
-        assert!(screen.contains("Ask anything…"));
-        assert!(screen.contains("帮我看下这个项目的结构"));
-        assert!(screen.contains("Agent  ·  gpt-5  ·  OpenAI"));
+        assert!(screen.contains("ask anything…"));
         assert!(screen.contains("Enter send"));
+        assert!(screen.contains("gpt-5"));
+        assert!(screen.contains("high"));
+        assert!(screen.contains("25.0%/120Kc"));
         assert!(screen.contains("D:/workspaces/zex"));
-        assert!(screen.contains("zex 0.1.0"));
-        assert!(!screen.contains("think high"));
-        assert!(!screen.contains("ctx 25%"));
-        assert!(!screen.contains("● idle"));
+        assert!(screen.contains("● idle"));
         assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
         assert!(regions.card.y > 4);
         assert!(regions.card.bottom() < regions.status.y);
         assert!(regions.card.width < 100);
         assert_eq!(
             terminal.backend().buffer()[(regions.card.x, regions.card.y)].symbol(),
-            "▌"
+            "┌"
         );
         assert_eq!(
             style_at(&terminal, regions.card.x + 1, regions.card.y).bg,
-            Some(SURFACE)
+            Some(BACKGROUND)
         );
     }
 
@@ -5389,8 +5569,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16));
-        let editor_x = regions.card.x + 3;
+        let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
+        let editor_x = regions.card.x + 2;
         let editor_y = regions.card.y + 1;
 
         terminal
@@ -5412,12 +5592,12 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
-        let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16));
-        let editor_x = regions.card.x + 3;
+        let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
+        let editor_x = regions.card.x + 2;
         let editor_y = regions.card.y + 1;
 
         assert!(screen.contains("hello"));
-        assert!(!screen.contains("Ask anything…"));
+        assert!(!screen.contains("ask anything…"));
         terminal
             .backend_mut()
             .assert_cursor_position((editor_x + 5, editor_y));
@@ -5435,7 +5615,7 @@ mod tests {
 
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             let area = ratatui::layout::Rect::new(0, 0, width, height);
-            let regions = landing_regions(area);
+            let regions = landing_regions(area, &app);
             assert!(regions.brand.bottom() <= area.bottom());
             assert!(regions.card.bottom() <= area.bottom());
             assert!(regions.hint.bottom() <= area.bottom());
@@ -5466,7 +5646,7 @@ mod tests {
             .position(|row| row.contains("Inspect the project"))
             .expect("message should be visible") as u16;
         assert!(!app.landing_visible());
-        assert!(!screen.contains("Ask anything…"));
+        assert!(!screen.contains("ask anything…"));
         assert!(screen.contains("thinking"));
         assert_eq!(message_row, regions.transcript.y);
     }
@@ -5488,7 +5668,7 @@ mod tests {
 
         assert!(app.landing_visible());
         assert!(screen.contains("Z  E  X"));
-        assert!(screen.contains("Ask anything…"));
+        assert!(screen.contains("ask anything…"));
         assert!(!screen.contains("Inspect the project"));
     }
 
@@ -5539,6 +5719,7 @@ mod tests {
         app.git_status = Some(super::GitStatus {
             branch: "feature/very-long-branch-name".to_owned(),
             commit: "deadbee".to_owned(),
+            dirty_count: 0,
         });
         app.thinking_level = Some(ThinkingLevel::Medium);
         app.context_chars = 60_000;
@@ -5547,8 +5728,9 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
-        assert!(screen.contains("zex 0.1.0"), "screen:\n{screen}");
-        assert!(!screen.contains("50%"));
+        assert!(screen.contains("ZEX"), "screen:\n{screen}");
+        assert!(screen.contains("med"));
+        assert!(screen.contains("50.0%/120K"));
         assert!(!screen.contains("feature/very-long-branch-name"));
     }
 
@@ -5603,14 +5785,20 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
-        assert_eq!(multiline.footer, single.footer);
-        let footer = super::footer_regions(multiline.footer);
-        for y in footer.input.y..footer.input.bottom() {
-            assert_eq!(
-                terminal.backend().buffer()[(footer.input.x, y)].symbol(),
-                "▌"
-            );
-        }
+        assert!(multiline.footer.height > single.footer.height);
+        assert_eq!(
+            terminal.backend().buffer()[(multiline.footer.x + 1, multiline.footer.y + 1)].symbol(),
+            "┌"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(multiline.footer.x + 1, multiline.footer.y + 2)].symbol(),
+            "│"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(multiline.footer.x + 1, multiline.footer.bottom() - 1)]
+                .symbol(),
+            "└"
+        );
     }
 
     #[test]
@@ -5627,14 +5815,20 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 100, 28), &app);
-        let footer = super::footer_regions(regions.footer);
         let completion = super::align_with_footer_input(regions.completion, regions.footer);
         assert!(regions.completion.width > 0);
-        assert_eq!(completion.x, footer.input.x);
-        assert_eq!(completion.width, footer.input.width);
+        assert_eq!(completion.x, regions.footer.x + super::HORIZONTAL_GUTTER);
         assert_eq!(
-            terminal.backend().buffer()[(footer.input.x, footer.input.y)].symbol(),
-            "▌"
+            completion.width,
+            regions.footer.width - super::HORIZONTAL_GUTTER.saturating_mul(2)
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(
+                regions.footer.x + super::HORIZONTAL_GUTTER,
+                regions.footer.y + 1,
+            )]
+                .symbol(),
+            "┌"
         );
         let selected_row = regions.completion.y + 1;
         assert!(
@@ -6370,7 +6564,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
 
-        assert!(screen.contains("run cafebabe"));
+        assert!(screen.contains("cafebabe"));
     }
 
     #[test]
@@ -6745,10 +6939,10 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let screen = format!("{}", terminal.backend());
 
-        assert!(screen.contains("OpenAI / GPT-5"));
-        assert!(screen.contains("think max"));
-        assert!(screen.contains("run cafebabe"));
-        assert!(screen.contains("running"));
+        assert!(screen.contains("gpt-5"));
+        assert!(screen.contains("max"));
+        assert!(screen.contains("cafebabe"));
+        assert!(screen.contains("tool"));
         assert_eq!(app.transcript.len(), transcript_len);
     }
 
@@ -6851,8 +7045,8 @@ mod tests {
         assert!(!screen.contains("Ctrl+O"));
         assert!(screen.contains("/sessions"));
         assert!(screen.contains("List saved sessions"));
-        assert!(screen.contains("think high"));
-        assert!(screen.contains("› /se"));
+        assert!(screen.contains("high"));
+        assert!(screen.contains("/se"));
 
         let rows = screen.lines().collect::<Vec<_>>();
         let completion_row = rows
@@ -6861,7 +7055,7 @@ mod tests {
             .expect("missing completion row");
         let status_row = rows
             .iter()
-            .position(|row| row.contains("think high"))
+            .position(|row| row.contains("ZEX") && row.contains("high"))
             .expect("missing status row");
         let keymap_row = rows
             .iter()
@@ -6869,7 +7063,7 @@ mod tests {
             .expect("missing keymap row");
         let input_row = rows
             .iter()
-            .rposition(|row| row.contains("› /se"))
+            .rposition(|row| row.contains("/se"))
             .expect("missing input row");
         assert!(completion_row < status_row);
         assert!(completion_row < input_row);
