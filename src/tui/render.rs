@@ -1342,7 +1342,20 @@ pub(super) fn landing_regions(area: Rect, app: &App) -> LandingRegions {
         && menu_height > 0;
 
     let (hero, logo, menu, card, completion) = if want_hero {
-        let box_width = stage.width.saturating_sub(6).min(120).max(1);
+        let logo_w = hero_art
+            .map(crate::tui::glyphs::logo_visual_width)
+            .unwrap_or(0);
+        let left_w = if logo_w == 0 {
+            2
+        } else {
+            logo_w + HERO_LOGO_PAD
+        };
+        let menu_w = welcome_menu_width(welcome_actions_for_rows(menu_height), stage.width);
+        // Size the box to its content: borders + logo column + gap + menu
+        // column + breathing room, so the hero reads as a deliberate card.
+        let content_width = 2 + left_w + 4 + menu_w + 4;
+        let max_width = stage.width.saturating_sub(6).clamp(1, 96);
+        let box_width = content_width.clamp(max_width.min(64), max_width);
         let remaining = stage.height.saturating_sub(hero_box_height + card_height);
         let top_pad = remaining / 3;
         let hero_x = stage.x + stage.width.saturating_sub(box_width) / 2;
@@ -1353,14 +1366,6 @@ pub(super) fn landing_regions(area: Rect, app: &App) -> LandingRegions {
             hero.width.saturating_sub(2),
             hero_inner,
         );
-        let logo_w = hero_art
-            .map(crate::tui::glyphs::logo_visual_width)
-            .unwrap_or(0);
-        let left_w = if logo_w == 0 {
-            2
-        } else {
-            logo_w + HERO_LOGO_PAD
-        };
         let logo = Rect::new(inner.x, inner.y, left_w.min(inner.width), hero_logo_rows.min(inner.height));
         let right_x = inner.x.saturating_add(left_w.min(inner.width));
         let inset = 2u16.min(inner.width.saturating_sub(left_w.min(inner.width)) / 2);
@@ -1368,11 +1373,16 @@ pub(super) fn landing_regions(area: Rect, app: &App) -> LandingRegions {
             .width
             .saturating_sub(left_w.min(inner.width))
             .saturating_sub(inset);
+        let menu_w = menu_w.min(right_w);
+        let menu_x = right_x + right_w.saturating_sub(menu_w) / 2;
+        // Vertically center the right column (version + gap + menu) against
+        // the logo when the logo is taller.
+        let menu_offset = 2 + hero_inner.saturating_sub(right_col) / 2;
         let menu = Rect::new(
-            right_x,
-            inner.y.saturating_add(2).min(inner.bottom()),
-            right_w,
-            menu_height.min(inner.bottom().saturating_sub(inner.y.saturating_add(2))),
+            menu_x,
+            inner.y.saturating_add(menu_offset).min(inner.bottom()),
+            menu_w,
+            menu_height.min(inner.bottom().saturating_sub(inner.y.saturating_add(menu_offset))),
         );
         let card = Rect::new(
             stage.x + 2,
@@ -1501,7 +1511,7 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 
     render_landing_card(frame, regions.card, app);
-    render_product_badge(frame, regions.status);
+    render_landing_status(frame, regions.status, app);
 
     if !regions.completion.is_empty() {
         render_completion(frame, regions.completion, app);
@@ -1509,7 +1519,7 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn render_hero_box(frame: &mut Frame<'_>, regions: &LandingRegions, app: &mut App) {
-    let border = Style::default().fg(BORDER);
+    let border = Style::default().fg(BORDER_ACTIVE);
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
@@ -1521,7 +1531,7 @@ fn render_hero_box(frame: &mut Frame<'_>, regions: &LandingRegions, app: &mut Ap
     render_logo_art(frame, regions.logo, crate::tui::glyphs::hero_logo_art());
     let version_row = Rect::new(
         regions.menu.x,
-        regions.logo.y,
+        regions.menu.y.saturating_sub(2),
         regions.menu.width,
         1,
     );
@@ -1575,7 +1585,7 @@ fn render_logo_art(frame: &mut Frame<'_>, area: Rect, art: Option<&str>) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Grok-style logo shimmer: a raised-cosine sheen sweeps the braille mark
+/// Grok-style logo shimmer: a raised-cosine sheen sweeps the mascot
 /// diagonally every 4s, layered over a slow 5s breathing pulse.
 fn logo_shimmer_color(row: usize, column: usize) -> Color {
     let millis = std::time::SystemTime::now()
@@ -1608,13 +1618,33 @@ fn blend_color(from: Color, to: Color, t: f64) -> Color {
     Color::Rgb(lerp(fr, tr), lerp(fg, tg), lerp(fb, tb))
 }
 
-fn render_product_badge(frame: &mut Frame<'_>, area: Rect) {
+fn render_landing_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
     let area = content_area(area);
     if area.is_empty() {
         return;
+    }
+    let badge = format!("{PRODUCT_NAME}  {}", env!("CARGO_PKG_VERSION"));
+    let badge_width = UnicodeWidthStr::width(badge.as_str());
+    let hints: &[(&str, &str)] = if app.completion_open() {
+        &[
+            ("↑↓", "select"),
+            ("tab", "complete"),
+            ("enter", "run"),
+            ("esc", "close"),
+        ]
+    } else {
+        &[("↑↓", "select"), ("enter", "confirm"), ("/", "commands")]
+    };
+    let hint_width = (area.width as usize).saturating_sub(badge_width + 4);
+    if hint_width >= 16 {
+        frame.render_widget(
+            Paragraph::new(shortcut_bar(hints, hint_width))
+                .style(Style::default().bg(BACKGROUND)),
+            Rect::new(area.x, area.y, hint_width as u16, 1),
+        );
     }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -1650,16 +1680,27 @@ fn render_landing_menu(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let selected = app.welcome_menu_selected == Some(index)
             || app.hovered(&HitTarget::WelcomeAction(action.kind));
         let shortcut_width = UnicodeWidthStr::width(action.shortcut);
-        let label_budget = width.saturating_sub(shortcut_width.saturating_add(2));
+        let label_budget = width.saturating_sub(shortcut_width.saturating_add(4));
         let label = truncate_display(action.label, label_budget);
-        let shortcut = if shortcut_width + 2 <= width {
+        let shortcut = if shortcut_width + 4 <= width {
             action.shortcut
         } else {
             ""
         };
         let spacer = width
+            .saturating_sub(2)
             .saturating_sub(UnicodeWidthStr::width(label.as_str()))
             .saturating_sub(UnicodeWidthStr::width(shortcut));
+        let pointer = if selected {
+            Span::styled(
+                crate::tui::glyphs::prompt_arrow().to_owned(),
+                Style::default()
+                    .fg(ACCENT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("  ")
+        };
         let (label_style, shortcut_style, background) = if selected {
             (
                 Style::default()
@@ -1677,6 +1718,7 @@ fn render_landing_menu(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
+                pointer,
                 Span::styled(label, label_style),
                 Span::raw(" ".repeat(spacer)),
                 Span::styled(shortcut.to_owned(), shortcut_style),
@@ -1691,7 +1733,8 @@ fn welcome_menu_width(actions: &[WelcomeAction], max_width: u16) -> u16 {
     let content = actions
         .iter()
         .map(|action| {
-            UnicodeWidthStr::width(action.label) + 4 + UnicodeWidthStr::width(action.shortcut)
+            // 2 for the selection pointer, 2 for the label/shortcut gap.
+            2 + UnicodeWidthStr::width(action.label) + 2 + UnicodeWidthStr::width(action.shortcut)
         })
         .max()
         .unwrap_or(24) as u16;

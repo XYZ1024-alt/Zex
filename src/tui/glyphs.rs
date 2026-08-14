@@ -1,6 +1,6 @@
-//! Chrome glyphs and static braille logo, with legacy-console fallbacks.
+//! Chrome glyphs and the static block-glyph logo, with legacy-console fallbacks.
 //!
-//! Chrome glyphs: prompt arrow, left accent rail, height-tiered braille logo.
+//! Chrome glyphs: prompt arrow, left accent rail, height-tiered mascot art.
 
 use unicode_width::UnicodeWidthStr;
 
@@ -41,23 +41,30 @@ pub(super) const FULL_LOGO_MIN_HEIGHT: u16 = 26;
 /// Minimum terminal width for the side-by-side hero box.
 pub(super) const HERO_BOX_MIN_WIDTH: u16 = 90;
 
-/// Full-size abstract mark (7 rows). Does not spell a product name.
+/// Full-size ZEX mascot: a round little spark sprite with a lightning-bolt
+/// crest (12 rows, double-width block pixels so every pixel stays square).
 const LOGO_FULL: &str = "\
-⠀⠀⣀⣤⣶⣿⣿⣿⣿⣶⣤⣀⠀⠀
-⢀⣾⣿⠟⠋⠁⠀⠀⠈⠙⠻⣿⣷⡀
-⠈⠛⠁⠀⠀⢀⣤⣤⡀⠀⠀⠈⠛⠁
-⠀⠀⠀⠀⢠⣿⣿⣿⣿⡄⠀⠀⠀⠀
-⣀⣀⠀⠀⠈⠛⠛⠛⠛⠁⠀⠀⣀⣀
-⢿⣿⣷⣤⣀⠀⠀⠀⠀⣀⣤⣾⣿⡿
-⠀⠙⠻⢿⣿⣿⣿⣿⣿⣿⡿⠟⠋⠀";
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀██████⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀██████⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀██████████⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀██████⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀██████████████████⠀⠀⠀⠀
+⠀⠀⠀⠀██████████████████████⠀⠀
+⠀⠀██████████      ██████████
+⠀⠀██████████      ██████████
+⠀⠀██████████████████████████
+⠀⠀██████████████████████████
+⠀⠀⠀⠀██████████████████████⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀██████████████⠀⠀⠀⠀⠀⠀";
 
-/// Compact mark (5 rows) for mid-height terminals.
+/// Compact mascot face (6 rows) for mid-height terminals.
 const LOGO_SMALL: &str = "\
-⠀⣀⣤⣶⣿⣿⣶⣤⣀⠀
-⢠⣿⠟⠋⠁⠈⠙⠻⣿⡄
-⠀⠀⠀⠀⣤⣤⠀⠀⠀⠀
-⢸⣿⣄⡀⠀⠀⢀⣠⣿⡇
-⠀⠙⠻⣿⣿⣿⣿⠟⠋⠀";
+⠀⠀██████████████████████⠀⠀
+██████████      ██████████
+██████████████████████████
+██████████████████████████
+⠀⠀██████████████████████⠀⠀
+⠀⠀⠀⠀⠀⠀██████████████⠀⠀⠀⠀⠀⠀";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LogoTier {
