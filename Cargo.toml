@@ -5,6 +5,10 @@ edition = "2024"
 description = "A minimal AI agent harness core"
 license = "MIT"
 
+[lib]
+name = "zex"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }

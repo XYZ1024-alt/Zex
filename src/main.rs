@@ -1,22 +1,16 @@
-mod agent;
-mod cli;
-mod command;
-mod config;
-mod headless;
-mod provider;
-mod session;
-mod tools;
-mod tui;
-
-use agent::{Agent, AgentOptions};
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{Cli, Command};
-use config::Config;
-use provider::ProviderRegistry;
-use session::{SessionStore, format_session_summaries};
 use tokio::sync::mpsc;
-use tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, ToolRegistry, WriteTool};
+use zex::{
+    agent::{Agent, AgentOptions},
+    cli::{Cli, Command},
+    config::Config,
+    headless,
+    provider::ProviderRegistry,
+    session::{SessionStore, format_session_summaries},
+    tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, ToolRegistry, WriteTool},
+    tui,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -58,25 +58,81 @@ const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-const BACKGROUND: Color = Color::Rgb(20, 20, 20); // #141414
-const SURFACE: Color = Color::Rgb(27, 27, 27);
-const SURFACE_HOVER: Color = Color::Rgb(31, 31, 31);
-const SURFACE_RAISED: Color = Color::Rgb(34, 34, 34);
-const TEXT: Color = Color::Rgb(243, 243, 243); // #F3F3F3
-const TEXT_STRONG: Color = TEXT;
-const TEXT_DIM: Color = Color::Rgb(160, 160, 160); // #A0A0A0
-const TEXT_FAINT: Color = Color::Rgb(120, 120, 120); // #787878
-const ACCENT_PRIMARY: Color = Color::Rgb(122, 162, 247); // #7AA2F7
-const ACCENT_SECONDARY: Color = Color::Rgb(187, 154, 247); // #BB9AF7
-const OK: Color = Color::Rgb(158, 206, 106); // #9ECE6A
-const BAD: Color = Color::Rgb(219, 75, 75); // #DB4B4B
-const LANDING_LOGO_ROWS: [&str; 5] = [
-    "███████  ███████  ██   ██",
-    "     ██  ██        ██ ██ ",
-    "   ███   █████      ███  ",
-    " ██      ██        ██ ██ ",
-    "███████  ███████  ██   ██",
+// Default night palette (near-black base, TokyoNight-style accents).
+const BACKGROUND: Color = Color::Rgb(20, 20, 20);
+const SURFACE: Color = Color::Rgb(36, 36, 36);
+const SURFACE_HOVER: Color = Color::Rgb(44, 44, 44);
+const SURFACE_RAISED: Color = Color::Rgb(54, 54, 54);
+const TEXT: Color = Color::Rgb(225, 225, 225);
+const TEXT_STRONG: Color = Color::Rgb(243, 243, 243);
+const TEXT_DIM: Color = Color::Rgb(200, 200, 200);
+const TEXT_FAINT: Color = Color::Rgb(108, 108, 108);
+const ACCENT_PRIMARY: Color = Color::Rgb(122, 162, 247);
+const ACCENT_SECONDARY: Color = Color::Rgb(187, 154, 247);
+const ACCENT_USER: Color = Color::Rgb(200, 200, 200);
+const ACCENT_ASSISTANT: Color = Color::Rgb(187, 154, 247);
+const ACCENT_THINKING: Color = Color::Rgb(187, 154, 247);
+const ACCENT_TOOL: Color = Color::Rgb(120, 120, 120);
+const BORDER: Color = Color::Rgb(50, 50, 55);
+const BORDER_ACTIVE: Color = Color::Rgb(80, 80, 88);
+const OK: Color = Color::Rgb(158, 206, 106);
+const BAD: Color = Color::Rgb(247, 118, 142);
+const PRODUCT_NAME: &str = "ZEX";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WelcomeActionKind {
+    ResumeSessions,
+    Commands,
+    Model,
+    Provider,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WelcomeAction {
+    label: &'static str,
+    shortcut: &'static str,
+    kind: WelcomeActionKind,
+}
+
+const WELCOME_ACTIONS: &[WelcomeAction] = &[
+    WelcomeAction {
+        label: "Resume sessions",
+        shortcut: "ctrl+s",
+        kind: WelcomeActionKind::ResumeSessions,
+    },
+    WelcomeAction {
+        label: "Commands",
+        shortcut: "ctrl+p",
+        kind: WelcomeActionKind::Commands,
+    },
+    WelcomeAction {
+        label: "Model",
+        shortcut: "/model",
+        kind: WelcomeActionKind::Model,
+    },
+    WelcomeAction {
+        label: "Provider",
+        shortcut: "/provider",
+        kind: WelcomeActionKind::Provider,
+    },
+    WelcomeAction {
+        label: "Quit",
+        shortcut: "esc",
+        kind: WelcomeActionKind::Quit,
+    },
 ];
+
+const WELCOME_ACTIONS_COMPACT: &[WelcomeAction] = &[WELCOME_ACTIONS[0], WELCOME_ACTIONS[4]];
+
+fn welcome_actions_for_rows(rows: u16) -> &'static [WelcomeAction] {
+    match rows {
+        0 => &[],
+        1 => &WELCOME_ACTIONS_COMPACT[..1],
+        2..=4 => WELCOME_ACTIONS_COMPACT,
+        _ => WELCOME_ACTIONS,
+    }
+}
 
 pub fn is_available() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
@@ -728,6 +784,17 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App, turn_active: bool) -> In
                     }
                     InputAction::None
                 }
+                Some(HitTarget::WelcomeAction(kind)) if !turn_active => {
+                    app.armed_click = None;
+                    app.input_focused = false;
+                    if let Some(index) = welcome_actions_for_rows(app.welcome_menu_len as u16)
+                        .iter()
+                        .position(|action| action.kind == kind)
+                    {
+                        app.welcome_menu_selected = Some(index);
+                    }
+                    dispatch_welcome_action(app, kind)
+                }
                 Some(HitTarget::Input) if !turn_active && !app.page_open() => {
                     app.armed_click = None;
                     app.focus_input();
@@ -811,6 +878,21 @@ fn handle_key_event(
             .provider_catalog_to_save()
             .map(InputAction::SaveProviders)
             .unwrap_or(InputAction::None);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('s')
+        && !turn_active
+        && !app.page_open()
+    {
+        return InputAction::Submit("/resume".to_owned());
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('q')
+        && !turn_active
+    {
+        return InputAction::Quit;
     }
 
     if app.provider_editor_open() && !turn_active {
@@ -1011,7 +1093,16 @@ fn handle_key_event(
         return InputAction::None;
     }
 
-    if !app.input_focused && key.code == KeyCode::Enter {
+    if app.landing_visible()
+        && app.input.is_empty()
+        && app.welcome_menu_selected.is_some()
+        && !app.input_focused
+        && key.code == KeyCode::Enter
+    {
+        return dispatch_selected_welcome_action(app);
+    }
+
+    if !app.input_focused && key.code == KeyCode::Enter && app.input.is_empty() {
         app.activate_selected_entry();
         return InputAction::None;
     }
@@ -1023,11 +1114,19 @@ fn handle_key_event(
 
     match key.code {
         KeyCode::Up => {
-            app.navigate_history(true);
+            if app.landing_visible() && app.input.is_empty() {
+                app.select_welcome_action(true);
+            } else {
+                app.navigate_history(true);
+            }
             return InputAction::None;
         }
         KeyCode::Down => {
-            app.navigate_history(false);
+            if app.landing_visible() && app.input.is_empty() {
+                app.select_welcome_action(false);
+            } else {
+                app.navigate_history(false);
+            }
             return InputAction::None;
         }
         _ => {}
@@ -1089,6 +1188,34 @@ fn handle_key_event(
     }
 
     InputAction::None
+}
+
+fn dispatch_welcome_action(app: &mut App, kind: WelcomeActionKind) -> InputAction {
+    match kind {
+        WelcomeActionKind::ResumeSessions => InputAction::Submit("/resume".to_owned()),
+        WelcomeActionKind::Commands => {
+            app.help_open = true;
+            app.help_selected = 0;
+            app.input_focused = false;
+            app.completion.dismissed = true;
+            app.welcome_menu_selected = None;
+            InputAction::None
+        }
+        WelcomeActionKind::Model => InputAction::Submit("/model".to_owned()),
+        WelcomeActionKind::Provider => InputAction::Submit("/provider".to_owned()),
+        WelcomeActionKind::Quit => InputAction::Quit,
+    }
+}
+
+fn dispatch_selected_welcome_action(app: &mut App) -> InputAction {
+    let actions = welcome_actions_for_rows(app.welcome_menu_len as u16);
+    let Some(index) = app.welcome_menu_selected else {
+        return InputAction::None;
+    };
+    let Some(action) = actions.get(index) else {
+        return InputAction::None;
+    };
+    dispatch_welcome_action(app, action.kind)
 }
 
 fn next_thinking_action(app: &App) -> InputAction {
@@ -1165,6 +1292,7 @@ enum HitTarget {
     Input,
     StatusModel,
     StatusThinking,
+    WelcomeAction(WelcomeActionKind),
     OutputPanel,
     OutputClose,
 }
@@ -1207,6 +1335,7 @@ struct ToolEntry {
 struct ThinkingEntry {
     content: String,
     expanded: bool,
+    elapsed: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1248,7 +1377,6 @@ enum TranscriptEntry {
         expanded: bool,
     },
     Turn(TurnEntry),
-    Sessions(Vec<crate::session::SessionSummary>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1534,6 +1662,9 @@ struct App {
     providers: ProviderCatalog,
     model_picker: Option<ModelPicker>,
     provider_editor: Option<ProviderEditor>,
+    welcome_menu_selected: Option<usize>,
+    welcome_menu_len: usize,
+    thinking_started: Option<Instant>,
 }
 
 impl App {
@@ -1589,6 +1720,9 @@ impl App {
             providers: context.providers,
             model_picker: None,
             provider_editor: None,
+            welcome_menu_selected: None,
+            welcome_menu_len: WELCOME_ACTIONS.len(),
+            thinking_started: None,
         };
 
         let mut restored_turn_open = false;
@@ -1617,6 +1751,7 @@ impl App {
                             .push(TranscriptEntry::Thinking(ThinkingEntry {
                                 content: truncate_chars(thinking, MAX_THINKING_DETAIL_CHARS),
                                 expanded: false,
+                                elapsed: None,
                             }));
                     }
                     let completes_turn = restored_turn_open && tool_calls.is_empty();
@@ -1789,6 +1924,7 @@ impl App {
                 arguments,
                 timeout,
             } => {
+                self.freeze_thinking_elapsed();
                 self.active_tools.insert(call_id.clone(), name.clone());
                 self.turn_tool_count = self.turn_tool_count.saturating_add(1);
                 self.status = Status::RunningTool;
@@ -1890,6 +2026,7 @@ impl App {
             return;
         }
 
+        self.freeze_thinking_elapsed();
         self.transcript.push(TranscriptEntry::Message {
             role,
             content: delta,
@@ -1905,11 +2042,27 @@ impl App {
             return;
         }
 
+        self.thinking_started = Some(Instant::now());
         self.transcript
             .push(TranscriptEntry::Thinking(ThinkingEntry {
                 content: truncate_chars(&delta, MAX_THINKING_DETAIL_CHARS),
                 expanded: false,
+                elapsed: None,
             }));
+    }
+
+    fn freeze_thinking_elapsed(&mut self) {
+        let Some(started) = self.thinking_started.take() else {
+            return;
+        };
+        if let Some(TranscriptEntry::Thinking(thinking)) = self
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|entry| matches!(entry, TranscriptEntry::Thinking(_)))
+        {
+            thinking.elapsed = Some(started.elapsed());
+        }
     }
 
     fn reset_transcript(&mut self) {
@@ -1922,6 +2075,8 @@ impl App {
         self.armed_click = None;
         self.input_focused = true;
         self.help_selected = 0;
+        self.welcome_menu_selected = None;
+        self.thinking_started = None;
         self.status = Status::Idle;
         self.busy = false;
         self.turn_started = None;
@@ -2012,21 +2167,17 @@ impl App {
                 self.input_focused = false;
                 return false;
             }
-            CommandOutput::Sessions(sessions) => {
-                self.transcript.push(TranscriptEntry::Sessions(sessions));
-            }
-            CommandOutput::ResumePicker(sessions) => {
+            CommandOutput::Sessions(sessions) | CommandOutput::ResumePicker(sessions) => {
                 self.input.clear();
                 self.reset_history_navigation();
+                self.welcome_menu_selected = None;
                 self.open_session_picker(sessions);
-                return false;
             }
             CommandOutput::Status(message) => {
                 self.show_toast(message, ToastTone::Success);
-                return false;
             }
         }
-        true
+        false
     }
 
     fn scroll_page_up(&mut self) {
@@ -2576,7 +2727,33 @@ impl App {
         self.dismiss_help();
         self.input_focused = true;
         self.selected_entry = None;
+        self.welcome_menu_selected = None;
         self.reset_history_navigation();
+    }
+
+    fn select_welcome_action(&mut self, reverse: bool) {
+        let actions = welcome_actions_for_rows(self.welcome_menu_len as u16);
+        if actions.is_empty() {
+            return;
+        }
+        self.input_focused = false;
+        let len = actions.len();
+        self.welcome_menu_selected = Some(match self.welcome_menu_selected {
+            None => {
+                if reverse {
+                    len - 1
+                } else {
+                    0
+                }
+            }
+            Some(index) => {
+                if reverse {
+                    index.checked_sub(1).unwrap_or(len - 1)
+                } else {
+                    (index + 1) % len
+                }
+            }
+        });
     }
 
     fn focus_input(&mut self) {
@@ -2592,6 +2769,7 @@ impl App {
         self.dismiss_help();
         self.input_focused = true;
         self.selected_entry = None;
+        self.welcome_menu_selected = None;
         self.reset_history_navigation();
     }
 
@@ -3387,6 +3565,7 @@ fn git_output(working_dir: &Path, arguments: &[&str]) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+mod glyphs;
 mod render;
 
 use render::{
@@ -3395,7 +3574,10 @@ use render::{
 };
 
 #[cfg(test)]
-use render::{align_with_footer_input, input_metrics, landing_regions, ui_regions};
+use render::{
+    align_with_footer_input, composer_editor_origin, input_metrics, landing_regions,
+    regions_inside_frame, regions_non_overlapping, ui_regions,
+};
 
 struct TerminalSession {
     terminal: DefaultTerminal,

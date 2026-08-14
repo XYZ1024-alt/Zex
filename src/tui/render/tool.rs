@@ -7,23 +7,16 @@ pub(super) fn append_tool_lines(
     _hovered: bool,
     width: usize,
 ) {
-    let marker = tool_marker(tool);
     let subject = tool_subject(tool);
     let elapsed = tool_elapsed(tool);
-    let marker_color = if selected {
-        ACCENT_PRIMARY
-    } else {
-        tool_result_color(tool)
-    };
     let result = tool_result(tool);
     let duration = format_duration(elapsed);
     lines.push(tool_header_line(
-        marker,
-        &tool.name,
+        &tool_verb(&tool.name),
         &subject,
         &result,
         &duration,
-        marker_color,
+        selected,
         tool_result_color(tool),
         width,
     ));
@@ -59,7 +52,8 @@ pub(super) fn append_tool_lines(
                 .min(TOOL_OUTPUT_PREVIEW_LINES)
         };
         let mut push = |spans: Vec<Span<'static>>| {
-            let mut row = vec![Span::raw("     ")];
+            let mut row = rail_spans(ACCENT_TOOL);
+            row.push(Span::raw("  "));
             row.extend(spans);
             lines.push(Line::from(row));
         };
@@ -121,7 +115,9 @@ pub(super) fn append_tool_lines(
                 } else {
                     body_style
                 };
-                push(vec![Span::styled(line.clone(), style)]);
+                for segment in wrap_display_hard(line, width.saturating_sub(4).max(1)) {
+                    push(vec![Span::styled(segment, style)]);
+                }
             }
         } else if tool.output.is_empty() && matches!(tool.status, ToolStatus::Running) {
             push(vec![Span::styled("running…", label_style)]);
@@ -129,7 +125,9 @@ pub(super) fn append_tool_lines(
             push(vec![Span::styled("(no output)", label_style)]);
         } else {
             for line in body_lines.iter().take(visible_lines) {
-                push(vec![Span::styled(line.clone(), body_style)]);
+                for segment in wrap_display_hard(line, width.saturating_sub(4).max(1)) {
+                    push(vec![Span::styled(segment, body_style)]);
+                }
             }
         }
 
@@ -153,106 +151,44 @@ pub(super) fn append_tool_lines(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn tool_verb(name: &str) -> String {
+    match name {
+        "read" => "Read".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 fn tool_header_line(
-    marker: &str,
-    name: &str,
+    verb: &str,
     subject: &str,
     result: &str,
     duration: &str,
-    marker_color: Color,
+    selected: bool,
     result_color: Color,
     width: usize,
 ) -> Line<'static> {
-    const NAME_WIDTH: usize = 8;
-    const RESULT_WIDTH: usize = 12;
-    const DURATION_WIDTH: usize = 7;
-    const MARKER_WIDTH: usize = 4;
-    const GAP_WIDTH: usize = 2;
-
-    let wide_fixed_width =
-        MARKER_WIDTH + NAME_WIDTH + GAP_WIDTH * 3 + RESULT_WIDTH + DURATION_WIDTH;
-    if width >= wide_fixed_width + 4 {
-        let subject_width = width - wide_fixed_width;
-        return Line::from(vec![
-            Span::styled(format!("  {marker} "), Style::default().fg(marker_color)),
-            Span::styled(
-                pad_display(&truncate_display(name, NAME_WIDTH), NAME_WIDTH),
-                Style::default()
-                    .fg(TEXT_STRONG)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                pad_display(&truncate_display(subject, subject_width), subject_width),
-                Style::default().fg(TEXT),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                pad_display_left(&truncate_display(result, RESULT_WIDTH), RESULT_WIDTH),
-                Style::default().fg(result_color),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                pad_display_left(&truncate_display(duration, DURATION_WIDTH), DURATION_WIDTH),
-                Style::default().fg(TEXT_DIM),
-            ),
+    let verb_style = Style::default()
+        .fg(if selected { TEXT_STRONG } else { TEXT })
+        .add_modifier(Modifier::BOLD);
+    let mut spans = rail_spans(ACCENT_TOOL);
+    spans.extend([
+        Span::styled(verb.to_owned(), verb_style),
+        Span::raw(" "),
+        Span::styled(subject.to_owned(), Style::default().fg(TEXT_DIM)),
+    ]);
+    if width >= 36 && !result.is_empty() {
+        spans.extend([
+            Span::styled("  ", Style::default().fg(TEXT_FAINT)),
+            Span::styled(result.to_owned(), Style::default().fg(result_color)),
         ]);
     }
-
-    let duration_width = UnicodeWidthStr::width(duration).min(DURATION_WIDTH);
-    let result_width = UnicodeWidthStr::width(result).clamp(4, RESULT_WIDTH);
-    let fixed_width = MARKER_WIDTH + NAME_WIDTH + GAP_WIDTH * 3 + result_width + duration_width;
-    let subject_width = width.saturating_sub(fixed_width);
-    if subject_width > 0 {
-        return Line::from(vec![
-            Span::styled(format!("  {marker} "), Style::default().fg(marker_color)),
-            Span::styled(
-                pad_display(&truncate_display(name, NAME_WIDTH), NAME_WIDTH),
-                Style::default()
-                    .fg(TEXT_STRONG)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                pad_display(&truncate_display(subject, subject_width), subject_width),
-                Style::default().fg(TEXT),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                pad_display_left(&truncate_display(result, result_width), result_width),
-                Style::default().fg(result_color),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                truncate_display(duration, duration_width),
-                Style::default().fg(TEXT_DIM),
-            ),
+    if width >= 48 && !duration.is_empty() {
+        spans.extend([
+            Span::styled("  ", Style::default().fg(TEXT_FAINT)),
+            Span::styled(duration.to_owned(), Style::default().fg(TEXT_FAINT)),
         ]);
     }
-
-    let available_name =
-        width.saturating_sub(MARKER_WIDTH + GAP_WIDTH * 2 + result_width + duration_width);
-    let name_width = available_name.clamp(1, NAME_WIDTH);
-    Line::from(vec![
-        Span::styled(format!("  {marker} "), Style::default().fg(marker_color)),
-        Span::styled(
-            pad_display(&truncate_display(name, name_width), name_width),
-            Style::default()
-                .fg(TEXT_STRONG)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            pad_display_left(&truncate_display(result, result_width), result_width),
-            Style::default().fg(result_color),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            truncate_display(duration, duration_width),
-            Style::default().fg(TEXT_DIM),
-        ),
-    ])
+    Line::from(super::truncate_spans(spans, width)).style(header_row_style(selected, false))
 }
 
 fn tool_output_line_count(output: &str) -> usize {
@@ -263,18 +199,6 @@ pub(in crate::tui) fn tool_detail_line_count(tool: &ToolEntry) -> usize {
     file_change_body(tool)
         .map_or_else(|| tool_output_line_count(&tool.output), |lines| lines.len())
         .max(1)
-}
-
-fn tool_marker(tool: &ToolEntry) -> &'static str {
-    if tool.expanded {
-        return "◆";
-    }
-    match tool.status {
-        ToolStatus::Running => "◇",
-        ToolStatus::Done => "♦",
-        ToolStatus::Failed => "×",
-        ToolStatus::Cancelled => "·",
-    }
 }
 
 fn tool_subject(tool: &ToolEntry) -> String {
