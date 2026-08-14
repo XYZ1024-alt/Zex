@@ -699,7 +699,7 @@ fn empty_state_centers_a_large_zex_wordmark_and_focused_prompt_surface() {
     assert!(screen.contains("D:/workspaces/zex") || screen.contains("workspaces/zex"));
     assert!(!screen.contains("● idle"));
     assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
-    assert_eq!(BACKGROUND, Color::Rgb(20, 20, 20));
+    assert_eq!(BACKGROUND, Color::Rgb(15, 17, 22));
     assert!(
         !regions.hero.is_empty(),
         "width 104 should use the hero box"
@@ -998,13 +998,13 @@ fn every_draw_paints_the_full_terminal_background() {
 
 #[test]
 fn night_palette_uses_shipped_default_rgb_values() {
-    assert_eq!(BACKGROUND, Color::Rgb(20, 20, 20));
-    assert_eq!(super::TEXT, Color::Rgb(225, 225, 225));
-    assert_eq!(SURFACE, Color::Rgb(36, 36, 36));
-    assert_eq!(SURFACE_RAISED, Color::Rgb(54, 54, 54));
-    assert_eq!(ACCENT_PRIMARY, Color::Rgb(122, 162, 247));
-    assert_eq!(super::ACCENT_SECONDARY, Color::Rgb(187, 154, 247));
-    assert_eq!(BAD, Color::Rgb(247, 118, 142));
+    assert_eq!(BACKGROUND, Color::Rgb(15, 17, 22));
+    assert_eq!(super::TEXT, Color::Rgb(207, 213, 224));
+    assert_eq!(SURFACE, Color::Rgb(22, 25, 31));
+    assert_eq!(SURFACE_RAISED, Color::Rgb(37, 42, 52));
+    assert_eq!(ACCENT_PRIMARY, Color::Rgb(137, 171, 240));
+    assert_eq!(super::ACCENT_SECONDARY, Color::Rgb(188, 168, 232));
+    assert_eq!(BAD, Color::Rgb(224, 122, 133));
     assert_ne!(ACCENT_PRIMARY, Color::Rgb(120, 158, 166));
 }
 
@@ -1033,7 +1033,9 @@ fn first_turn_switches_to_a_top_anchored_work_timeline() {
     assert!(!screen.contains("Ask anything"));
     assert!(screen.contains("thinking"));
     assert!(!screen.contains("precision, without noise"));
-    assert_eq!(message_row, regions.transcript.y);
+    // The user band leads with a blank padding row, so the message itself
+    // sits one row below the transcript top.
+    assert_eq!(message_row, regions.transcript.y + 1);
     assert_no_banned_branding(&screen);
 }
 
@@ -4739,7 +4741,7 @@ fn welcome_wide_uses_hero_box_and_night_palette() {
     assert!(screen.contains("main"));
     assert!(screen_has_glyph(&terminal, "╭"));
     assert!(screen_has_glyph(&terminal, "\u{276F}") || screen.contains('❯') || screen.contains('>'));
-    assert_eq!(style_at(&terminal, 0, 0).bg, Some(Color::Rgb(20, 20, 20)));
+    assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
     assert!(!screen_has_rgb(&terminal, Color::Rgb(120, 158, 166)));
     assert_no_banned_branding(&screen);
 }
@@ -4804,7 +4806,7 @@ fn conversation_paints_rail_thought_tool_info_and_shortcuts() {
             || screen_has_glyph(&terminal, "\u{2502}")
             || screen_has_glyph(&terminal, "│")
     );
-    assert_eq!(style_at(&terminal, 0, 0).bg, Some(Color::Rgb(20, 20, 20)));
+    assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
     assert!(!screen.contains("Ask anything"));
     assert!(!screen.contains('›'));
     assert_no_banned_branding(&screen);
@@ -5027,7 +5029,7 @@ fn grok_style_visual_regression() {
         .expect("code row visible") as u16;
     assert_eq!(style_at(&terminal, band_right, code_row).bg, Some(CODE_BG));
 
-    // Tool header: orange path subject.
+    // Tool header: path subject stays on the quiet gray ramp.
     let tool_row = screen
         .lines()
         .position(|row| row.contains("edit") && row.contains("src/tui.rs"))
@@ -5040,7 +5042,7 @@ fn grok_style_visual_regression() {
         .unwrap() as u16;
     assert_eq!(
         style_at(&terminal, path_col, tool_row).fg,
-        Some(super::PATH)
+        Some(super::TEXT_DIM)
     );
 
     // Composer chrome: teal model name.

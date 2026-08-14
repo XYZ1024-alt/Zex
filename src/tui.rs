@@ -58,41 +58,40 @@ const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-// Default night palette (near-black base, TokyoNight-style accents),
-// aligned with grok build's GrokNight theme.
-const BACKGROUND: Color = Color::Rgb(20, 20, 20);
-const SURFACE: Color = Color::Rgb(36, 36, 36);
-const SURFACE_HOVER: Color = Color::Rgb(44, 44, 44);
-const SURFACE_RAISED: Color = Color::Rgb(54, 54, 54);
-const TEXT: Color = Color::Rgb(225, 225, 225);
-const TEXT_STRONG: Color = Color::Rgb(243, 243, 243);
-const TEXT_DIM: Color = Color::Rgb(200, 200, 200);
-const TEXT_FAINT: Color = Color::Rgb(108, 108, 108);
-const GRAY_DIM: Color = Color::Rgb(88, 88, 88);
-const ACCENT_PRIMARY: Color = Color::Rgb(122, 162, 247);
-const ACCENT_SECONDARY: Color = Color::Rgb(187, 154, 247);
-const ACCENT_USER: Color = Color::Rgb(200, 200, 200);
-const ACCENT_ASSISTANT: Color = Color::Rgb(187, 154, 247);
-const ACCENT_THINKING: Color = Color::Rgb(187, 154, 247);
-const ACCENT_TOOL: Color = Color::Rgb(120, 120, 120);
-const BORDER: Color = Color::Rgb(50, 50, 55);
-const BORDER_ACTIVE: Color = Color::Rgb(80, 80, 88);
-const OK: Color = Color::Rgb(158, 206, 106);
-const BAD: Color = Color::Rgb(247, 118, 142);
-// Semantic accents borrowed from grok's GrokNight theme: warm command yellow,
-// path orange, running cyan and model teal.
-const COMMAND: Color = Color::Rgb(224, 175, 104);
-const PATH: Color = Color::Rgb(255, 158, 100);
-const RUNNING: Color = Color::Rgb(125, 207, 255);
-const MODEL_ACCENT: Color = Color::Rgb(26, 188, 156);
-const MD_CODE: Color = Color::Rgb(58, 149, 171);
-const CODE_BG: Color = Color::Rgb(28, 28, 28);
-const DIFF_ADD_BG: Color = Color::Rgb(6, 56, 6);
-const DIFF_DEL_BG: Color = Color::Rgb(66, 14, 20);
+// Ink Indigo palette: cool near-black base with tinted surfaces and a
+// restrained soft-blue accent. Surfaces stay within ~6-14 RGB steps of the
+// base so background bands read as a whisper, not slabs.
+const BACKGROUND: Color = Color::Rgb(15, 17, 22);
+const SURFACE: Color = Color::Rgb(22, 25, 31);
+const SURFACE_HOVER: Color = Color::Rgb(29, 33, 41);
+const SURFACE_RAISED: Color = Color::Rgb(37, 42, 52);
+const TEXT: Color = Color::Rgb(207, 213, 224);
+const TEXT_STRONG: Color = Color::Rgb(235, 239, 246);
+const TEXT_DIM: Color = Color::Rgb(155, 163, 178);
+const TEXT_FAINT: Color = Color::Rgb(99, 107, 122);
+const GRAY_DIM: Color = Color::Rgb(80, 87, 100);
+const ACCENT_PRIMARY: Color = Color::Rgb(137, 171, 240);
+const ACCENT_SECONDARY: Color = Color::Rgb(188, 168, 232);
+const ACCENT_USER: Color = Color::Rgb(196, 201, 212);
+const ACCENT_THINKING: Color = ACCENT_SECONDARY;
+// Tool chrome deliberately blends into the gray ramp; only status colors pop.
+const ACCENT_TOOL: Color = TEXT_FAINT;
+const BORDER: Color = Color::Rgb(38, 43, 53);
+const BORDER_ACTIVE: Color = Color::Rgb(66, 76, 94);
+const OK: Color = Color::Rgb(152, 195, 132);
+const BAD: Color = Color::Rgb(224, 122, 133);
+// Semantic accents, kept muted so at most three hues are on screen at once.
+const COMMAND: Color = Color::Rgb(196, 168, 124);
+const RUNNING: Color = Color::Rgb(125, 196, 222);
+const MODEL_ACCENT: Color = Color::Rgb(118, 196, 186);
+const MD_CODE: Color = Color::Rgb(148, 158, 210);
+const CODE_BG: Color = Color::Rgb(19, 22, 28);
+const DIFF_ADD_BG: Color = Color::Rgb(22, 40, 31);
+const DIFF_DEL_BG: Color = Color::Rgb(46, 26, 31);
 const PRODUCT_NAME: &str = "ZEX";
 // Wordmark palette: a single silver tone for the block letters,
 // animated by the shimmer sweep.
-const WORDMARK_INK: Color = Color::Rgb(150, 152, 164);
+const WORDMARK_INK: Color = Color::Rgb(148, 155, 172);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WelcomeActionKind {

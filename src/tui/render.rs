@@ -423,7 +423,9 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     row_width,
                 ))
             };
-            lines.push(row.style(Style::default().bg(background)));
+            let mut row = row;
+            paint_row_band(&mut row, row_width, background);
+            lines.push(row);
         }
     }
 
@@ -571,30 +573,28 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             let selected = index == editor.provider_selected;
             let hovered = app.hovered(&target);
             let armed = app.armed(&target);
-            provider_lines.push(
-                Line::from(vec![
-                    Span::styled(
-                        if selected { "  " } else { "  " },
-                        Style::default().fg(ACCENT_PRIMARY),
+            let background = if (selected && editor.pane == ProviderPane::Providers) || armed {
+                SURFACE_RAISED
+            } else if hovered {
+                SURFACE_HOVER
+            } else {
+                BACKGROUND
+            };
+            let mut row = Line::from(vec![
+                Span::styled(
+                    if selected { "  " } else { "  " },
+                    Style::default().fg(ACCENT_PRIMARY),
+                ),
+                Span::styled(
+                    single_line(
+                        &provider.display_name,
+                        left_width.saturating_sub(5) as usize,
                     ),
-                    Span::styled(
-                        single_line(
-                            &provider.display_name,
-                            left_width.saturating_sub(5) as usize,
-                        ),
-                        Style::default().fg(if selected { TEXT_STRONG } else { TEXT }),
-                    ),
-                ])
-                .style(Style::default().bg(
-                    if (selected && editor.pane == ProviderPane::Providers) || armed {
-                        SURFACE_RAISED
-                    } else if hovered {
-                        SURFACE_HOVER
-                    } else {
-                        BACKGROUND
-                    },
-                )),
-            );
+                    Style::default().fg(if selected { TEXT_STRONG } else { TEXT }),
+                ),
+            ]);
+            paint_row_band(&mut row, left_width.saturating_sub(1) as usize, background);
+            provider_lines.push(row);
         }
     }
     frame.render_widget(
@@ -677,22 +677,22 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let selected = detail_active && editor.detail_selected == index;
         let hovered = app.hovered(&target);
         let armed = app.armed(&target);
-        lines.push(
-            Line::from(vec![
-                Span::styled(
-                    format!("{} {:<10}", if selected { "▌" } else { " " }, label),
-                    Style::default().fg(if selected { ACCENT_PRIMARY } else { TEXT_DIM }),
-                ),
-                Span::styled(single_line(&value, 70), Style::default().fg(TEXT_STRONG)),
-            ])
-            .style(Style::default().bg(if selected || armed {
-                SURFACE_RAISED
-            } else if hovered {
-                SURFACE_HOVER
-            } else {
-                BACKGROUND
-            })),
-        );
+        let background = if selected || armed {
+            SURFACE_RAISED
+        } else if hovered {
+            SURFACE_HOVER
+        } else {
+            BACKGROUND
+        };
+        let mut row = Line::from(vec![
+            Span::styled(
+                format!("{} {:<10}", if selected { "▌" } else { " " }, label),
+                Style::default().fg(if selected { ACCENT_PRIMARY } else { TEXT_DIM }),
+            ),
+            Span::styled(single_line(&value, 70), Style::default().fg(TEXT_STRONG)),
+        ]);
+        paint_row_band(&mut row, right.width as usize, background);
+        lines.push(row);
     }
     lines.extend([
         Line::default(),
@@ -733,36 +733,48 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 .map(|(level, value)| format!("{level}:{value}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            lines.push(
-                Line::from(vec![
-                    Span::styled(
-                        if selected { "▌ " } else { "  " },
-                        Style::default().fg(ACCENT_PRIMARY),
-                    ),
-                    Span::styled(
-                        pad_display(&single_line(&model.display_name, 28), 30),
-                        Style::default().fg(TEXT_STRONG),
-                    ),
-                    Span::styled(
-                        pad_display(&single_line(&model.id, 24), 26),
-                        Style::default().fg(TEXT_DIM),
-                    ),
-                    Span::styled(
-                        format!("think {thinking}  map {map}"),
-                        Style::default().fg(TEXT_DIM),
-                    ),
-                ])
-                .style(Style::default().bg(if selected || armed {
-                    SURFACE_RAISED
-                } else if hovered {
-                    SURFACE_HOVER
-                } else {
-                    BACKGROUND
-                })),
-            );
+            let background = if selected || armed {
+                SURFACE_RAISED
+            } else if hovered {
+                SURFACE_HOVER
+            } else {
+                BACKGROUND
+            };
+            let mut row = Line::from(vec![
+                Span::styled(
+                    if selected { "▌ " } else { "  " },
+                    Style::default().fg(ACCENT_PRIMARY),
+                ),
+                Span::styled(
+                    pad_display(&single_line(&model.display_name, 28), 30),
+                    Style::default().fg(TEXT_STRONG),
+                ),
+                Span::styled(
+                    pad_display(&single_line(&model.id, 24), 26),
+                    Style::default().fg(TEXT_DIM),
+                ),
+                Span::styled(
+                    format!("think {thinking}  map {map}"),
+                    Style::default().fg(TEXT_DIM),
+                ),
+            ]);
+            paint_row_band(&mut row, right.width as usize, background);
+            lines.push(row);
         }
     }
     if let Some(field_editor) = &editor.field_editor {
+        let mut value_row = Line::from(Span::styled(
+            if matches!(
+                field_editor.target,
+                ProviderEditTarget::Provider(ProviderField::ApiKey)
+            ) {
+                "•".repeat(field_editor.input.content.chars().count())
+            } else {
+                field_editor.input.content.clone()
+            },
+            Style::default().fg(TEXT_STRONG).bg(SURFACE_RAISED),
+        ));
+        paint_row_band(&mut value_row, right.width as usize, SURFACE_RAISED);
         lines.extend([
             Line::default(),
             Line::from(Span::styled(
@@ -771,17 +783,7 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     .fg(ACCENT_PRIMARY)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::styled(
-                if matches!(
-                    field_editor.target,
-                    ProviderEditTarget::Provider(ProviderField::ApiKey)
-                ) {
-                    "•".repeat(field_editor.input.content.chars().count())
-                } else {
-                    field_editor.input.content.clone()
-                },
-                Style::default().fg(TEXT_STRONG).bg(SURFACE_RAISED),
-            )),
+            value_row,
             Line::from(Span::styled(
                 "Enter apply field · Esc cancel",
                 Style::default().fg(TEXT_DIM),
@@ -1032,7 +1034,7 @@ fn render_output_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ACCENT_PRIMARY))
-            .style(Style::default().bg(SURFACE_RAISED)),
+            .style(Style::default().bg(SURFACE)),
         panel_area,
     );
 
@@ -1067,7 +1069,7 @@ fn render_output_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Style::default().fg(TEXT_STRONG),
             ),
         ]))
-        .style(Style::default().bg(SURFACE_RAISED)),
+        .style(Style::default().bg(SURFACE)),
         header,
     );
     frame.render_widget(
@@ -1079,7 +1081,7 @@ fn render_output_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 } else {
                     ACCENT_PRIMARY
                 })
-                .bg(SURFACE_RAISED)
+                .bg(SURFACE)
                 .add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Right),
@@ -1106,7 +1108,7 @@ fn render_output_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         content.width.saturating_sub(2) as usize,
     );
     let paragraph = Paragraph::new(Text::from(lines))
-        .style(Style::default().fg(TEXT).bg(SURFACE))
+        .style(Style::default().fg(TEXT).bg(BACKGROUND))
         .wrap(Wrap { trim: false });
     let line_count = paragraph.line_count(content.width.max(1));
     let page_height = content.height as usize;
@@ -1140,7 +1142,7 @@ fn render_output_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             ),
             Span::styled(format!("  {position}"), Style::default().fg(TEXT_FAINT)),
         ]))
-        .style(Style::default().bg(SURFACE_RAISED)),
+        .style(Style::default().bg(SURFACE)),
         footer,
     );
 }
@@ -1798,7 +1800,16 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     let matches = app.completion_matches();
-    let inner_width = area.width.saturating_sub(2) as usize;
+    let palette = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(BACKGROUND))
+        .padding(ratatui::widgets::Padding::horizontal(1));
+    let inner = palette.inner(area);
+    // Rows are padded to the inner text width so the selection band spans the
+    // full row without tripping Paragraph wrapping.
+    let inner_width = inner.width as usize;
     let usage_width = matches
         .iter()
         .map(|command| UnicodeWidthStr::width(command.usage))
@@ -1825,10 +1836,9 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             let description_style = Style::default()
                 .fg(if selected { TEXT } else { TEXT_DIM })
                 .bg(background);
-            let row_style = Style::default().bg(background);
             let available = inner_width.saturating_sub(2);
             let wide = available >= usage_width + 2 + 18;
-            if wide {
+            let mut row = if wide {
                 Line::from(truncate_spans(
                     vec![
                         Span::styled(pad_display(command.usage, usage_width), command_style),
@@ -1837,7 +1847,6 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     ],
                     inner_width,
                 ))
-                .style(row_style)
             } else {
                 Line::from(truncate_spans(
                     vec![
@@ -1847,17 +1856,11 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     ],
                     inner_width,
                 ))
-                .style(row_style)
-            }
+            };
+            paint_row_band(&mut row, inner_width, background);
+            row
         })
         .collect::<Vec<_>>();
-    let palette = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(BACKGROUND))
-        .padding(ratatui::widgets::Padding::horizontal(1));
-    let inner = palette.inner(area);
     for index in 0..matches.len().min(inner.height as usize) {
         app.register_hit(
             Rect::new(
@@ -1907,10 +1910,6 @@ fn rail_spans(color: Color) -> Vec<Span<'static>> {
     ]
 }
 
-fn header_row_style(selected: bool, hovered: bool) -> Style {
-    Style::default().bg(row_highlight(selected, hovered))
-}
-
 /// Extend a banded line to the full content width: ratatui only paints line
 /// style over existing graphemes, so pad with background-colored spaces.
 fn pad_line_band(line: &mut Line<'static>, width: usize) {
@@ -1924,6 +1923,27 @@ fn pad_line_band(line: &mut Line<'static>, width: usize) {
             Style::default().bg(bg),
         ));
     }
+}
+
+/// Paint a full-width row highlight: a line's style only covers its own
+/// graphemes, so give every span the band color (filling raw-gap holes) and
+/// pad the tail out to `width`.
+fn paint_row_band(line: &mut Line<'static>, width: usize, bg: Color) {
+    line.style = line.style.patch(Style::default().bg(bg));
+    for span in &mut line.spans {
+        if span.style.bg.is_none() {
+            span.style = span.style.patch(Style::default().bg(bg));
+        }
+    }
+    pad_line_band(line, width);
+}
+
+/// Card header (tool/thinking) with a full-width selection band instead of a
+/// highlight that only sits behind the text.
+fn card_header_line(spans: Vec<Span<'static>>, selected: bool, width: usize) -> Line<'static> {
+    let mut line = Line::from(truncate_spans(spans, width));
+    paint_row_band(&mut line, width, row_highlight(selected, false));
+    line
 }
 
 fn transcript_text(app: &App, width: usize) -> TranscriptRender {
@@ -1941,15 +1961,20 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                 let start_line = lines.len();
                 append_markdown_lines(&mut lines, content, *role, final_answer, content_width);
                 if *role == MessageRole::User {
-                    // Grok-style raised band: user turns get a full-width
-                    // surface background so they stay scannable in long
-                    // transcripts.
+                    // Raised band with breathing room: a low-contrast surface
+                    // tint across the full width, plus a blank padded row above
+                    // and below so the band floats instead of hugging the text.
                     for line in &mut lines[start_line..] {
                         if line.style.bg.is_none() {
                             line.style = line.style.patch(Style::default().bg(SURFACE));
                         }
                         pad_line_band(line, content_width);
                     }
+                    let mut padding = Line::default();
+                    padding.style = Style::default().bg(SURFACE);
+                    pad_line_band(&mut padding, content_width);
+                    lines.insert(start_line, padding.clone());
+                    lines.push(padding);
                 }
                 panels.push(TranscriptPanel {
                     start_line,
@@ -2158,7 +2183,7 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 BACKGROUND
             };
             let marker = if selected { "  " } else { "  " };
-            if wide {
+            let mut row = if wide {
                 Line::from(vec![
                     Span::styled(marker, Style::default().fg(ACCENT_PRIMARY)),
                     Span::styled(
@@ -2172,7 +2197,6 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     Span::raw("  "),
                     Span::styled(command.description, Style::default().fg(TEXT_DIM)),
                 ])
-                .style(Style::default().bg(background))
             } else {
                 Line::from(vec![
                     Span::styled(marker, Style::default().fg(ACCENT_PRIMARY)),
@@ -2185,8 +2209,9 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                         }),
                     ),
                 ])
-                .style(Style::default().bg(background))
-            }
+            };
+            paint_row_band(&mut row, width, background);
+            row
         })
         .collect()
 }
@@ -2275,7 +2300,7 @@ fn append_markdown_lines(
                         rail,
                         Style::default().fg(message_rail_color(role, final_answer)),
                     ),
-                    Span::styled("▌ ", Style::default().fg(TEXT_DIM)),
+                    Span::styled("▌ ", Style::default().fg(TEXT_FAINT)),
                     Span::styled(
                         if language.is_empty() {
                             "code".to_owned()
@@ -2312,7 +2337,7 @@ fn append_markdown_lines(
                         rail,
                         Style::default().fg(message_rail_color(role, final_answer)),
                     ),
-                    Span::styled("▌ ", Style::default().fg(TEXT_DIM)),
+                    Span::styled("▌ ", Style::default().fg(TEXT_FAINT)),
                     Span::styled(segment, Style::default().fg(TEXT_STRONG)),
                 ])
                 .style(Style::default().bg(CODE_BG));
@@ -2329,9 +2354,7 @@ fn append_markdown_lines(
                 final_answer,
                 &mut first_visual_line,
                 width,
-                Style::default()
-                    .fg(ACCENT_SECONDARY)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             );
         } else if let Some(heading) = trimmed.strip_prefix("## ") {
             append_wrapped_message_lines(
@@ -2342,7 +2365,7 @@ fn append_markdown_lines(
                 &mut first_visual_line,
                 width,
                 Style::default()
-                    .fg(ACCENT_PRIMARY)
+                    .fg(TEXT_STRONG)
                     .add_modifier(Modifier::BOLD),
             );
         } else if let Some(heading) = trimmed.strip_prefix("# ") {
@@ -2354,7 +2377,7 @@ fn append_markdown_lines(
                 &mut first_visual_line,
                 width,
                 Style::default()
-                    .fg(MODEL_ACCENT)
+                    .fg(ACCENT_PRIMARY)
                     .add_modifier(Modifier::BOLD),
             );
         } else if let Some(item) = trimmed
@@ -2413,12 +2436,14 @@ fn append_markdown_lines(
 fn role_accent(role: MessageRole) -> Color {
     match role {
         MessageRole::User => ACCENT_USER,
-        MessageRole::Assistant => ACCENT_ASSISTANT,
+        // Assistant turns rely on indentation for grouping; the rail stays a
+        // quiet gray so long transcripts don't accumulate purple noise.
+        MessageRole::Assistant => TEXT_FAINT,
     }
 }
 
-/// User turns lead with a `❯` prompt (grok-style); continuation lines indent
-/// to the same column. Assistant turns keep the accent rail.
+/// User turns lead with a `❯` prompt; continuation lines indent to the same
+/// column. Assistant turns keep a dim rail.
 fn message_rail(
     role: MessageRole,
     _final_answer: bool,
@@ -2577,7 +2602,7 @@ fn append_thinking_lines(
     width: usize,
 ) {
     let label_style = Style::default()
-        .fg(if selected { TEXT_STRONG } else { TEXT })
+        .fg(if selected { TEXT_STRONG } else { TEXT_DIM })
         .add_modifier(Modifier::BOLD);
     let header = match status {
         ThinkingStatus::Active => "Thinking…".to_owned(),
@@ -2595,9 +2620,7 @@ fn append_thinking_lines(
             Style::default().fg(GRAY_DIM),
         ));
     }
-    lines.push(
-        Line::from(truncate_spans(header_spans, width)).style(header_row_style(selected, false)),
-    );
+    lines.push(card_header_line(header_spans, selected, width));
 
     if thinking.expanded {
         // Grok-style de-emphasis: thinking bodies render dim + italic.
@@ -3089,24 +3112,23 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn shortcut_bar(items: &[(&str, &str)], width: usize) -> Line<'static> {
     let key_style = Style::default()
-        .fg(TEXT_DIM)
+        .fg(TEXT_FAINT)
         .add_modifier(Modifier::BOLD);
     let label_style = Style::default().fg(TEXT_FAINT);
-    let sep_style = Style::default().fg(TEXT_FAINT);
     let mut spans = Vec::new();
     let mut used = 0;
     for (index, (key, label)) in items.iter().enumerate() {
         let piece = if index == 0 {
             format!("{key}  {label}")
         } else {
-            format!("  │  {key}  {label}")
+            format!("    {key}  {label}")
         };
         let piece_width = UnicodeWidthStr::width(piece.as_str());
         if used + piece_width > width {
             break;
         }
         if index > 0 {
-            spans.push(Span::styled("  │  ", sep_style));
+            spans.push(Span::raw("    "));
         }
         spans.push(Span::styled((*key).to_owned(), key_style));
         spans.push(Span::styled(format!("  {label}"), label_style));

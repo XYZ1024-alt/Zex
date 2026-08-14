@@ -167,7 +167,8 @@ fn tool_verb(name: &str) -> String {
     }
 }
 
-/// Grok-style subject: paths glow orange, shell commands get a dim `$` prompt.
+/// Quiet subject: paths and identifiers stay on the gray ramp, shell
+/// commands get a dim `$` prompt and a muted sand tone.
 fn tool_subject_spans(tool: &ToolEntry, subject: &str) -> Vec<Span<'static>> {
     if tool.name == "bash" {
         return vec![
@@ -175,11 +176,7 @@ fn tool_subject_spans(tool: &ToolEntry, subject: &str) -> Vec<Span<'static>> {
             Span::styled(subject.to_owned(), Style::default().fg(COMMAND)),
         ];
     }
-    let color = match tool.name.as_str() {
-        "read" | "write" | "edit" | "grep" | "glob" => PATH,
-        _ => TEXT_DIM,
-    };
-    vec![Span::styled(subject.to_owned(), Style::default().fg(color))]
+    vec![Span::styled(subject.to_owned(), Style::default().fg(TEXT_DIM))]
 }
 
 fn tool_header_line(
@@ -209,7 +206,7 @@ fn tool_header_line(
             Span::styled(duration.to_owned(), Style::default().fg(TEXT_FAINT)),
         ]);
     }
-    Line::from(super::truncate_spans(spans, width)).style(header_row_style(selected, false))
+    super::card_header_line(spans, selected, width)
 }
 
 fn tool_output_line_count(output: &str) -> usize {
