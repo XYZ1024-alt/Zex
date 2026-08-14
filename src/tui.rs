@@ -58,7 +58,8 @@ const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-// Default night palette (near-black base, TokyoNight-style accents).
+// Default night palette (near-black base, TokyoNight-style accents),
+// aligned with grok build's GrokNight theme.
 const BACKGROUND: Color = Color::Rgb(20, 20, 20);
 const SURFACE: Color = Color::Rgb(36, 36, 36);
 const SURFACE_HOVER: Color = Color::Rgb(44, 44, 44);
@@ -67,6 +68,7 @@ const TEXT: Color = Color::Rgb(225, 225, 225);
 const TEXT_STRONG: Color = Color::Rgb(243, 243, 243);
 const TEXT_DIM: Color = Color::Rgb(200, 200, 200);
 const TEXT_FAINT: Color = Color::Rgb(108, 108, 108);
+const GRAY_DIM: Color = Color::Rgb(88, 88, 88);
 const ACCENT_PRIMARY: Color = Color::Rgb(122, 162, 247);
 const ACCENT_SECONDARY: Color = Color::Rgb(187, 154, 247);
 const ACCENT_USER: Color = Color::Rgb(200, 200, 200);
@@ -77,6 +79,16 @@ const BORDER: Color = Color::Rgb(50, 50, 55);
 const BORDER_ACTIVE: Color = Color::Rgb(80, 80, 88);
 const OK: Color = Color::Rgb(158, 206, 106);
 const BAD: Color = Color::Rgb(247, 118, 142);
+// Semantic accents borrowed from grok's GrokNight theme: warm command yellow,
+// path orange, running cyan and model teal.
+const COMMAND: Color = Color::Rgb(224, 175, 104);
+const PATH: Color = Color::Rgb(255, 158, 100);
+const RUNNING: Color = Color::Rgb(125, 207, 255);
+const MODEL_ACCENT: Color = Color::Rgb(26, 188, 156);
+const MD_CODE: Color = Color::Rgb(58, 149, 171);
+const CODE_BG: Color = Color::Rgb(28, 28, 28);
+const DIFF_ADD_BG: Color = Color::Rgb(6, 56, 6);
+const DIFF_DEL_BG: Color = Color::Rgb(66, 14, 20);
 const PRODUCT_NAME: &str = "ZEX";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +230,8 @@ async fn run_loop(
         tokio::select! {
             _ = redraw.tick() => {
                 dirty |= app.expire_toast(Instant::now());
+                // Keep the welcome logo shimmer animating.
+                dirty |= app.landing_visible();
                 if dirty {
                     terminal
                         .draw(|frame| render(frame, &mut app))
@@ -1265,7 +1279,8 @@ impl ToolStatus {
 
     fn color(self) -> Color {
         match self {
-            Self::Running | Self::Cancelled => ACCENT_PRIMARY,
+            Self::Running => RUNNING,
+            Self::Cancelled => TEXT_FAINT,
             Self::Done => OK,
             Self::Failed => BAD,
         }
@@ -3606,6 +3621,8 @@ impl TerminalSession {
             },
         )
         .context("failed to initialize terminal")?;
+        // Sync the cursor color with the user accent (OSC 12), like grok.
+        let _ = io::Write::write_all(&mut io::stderr(), b"\x1b]12;#c8c8c8\x1b\\");
         Ok(Self {
             terminal,
             restored: false,
@@ -3621,6 +3638,8 @@ impl TerminalSession {
             return Ok(());
         }
         self.restored = true;
+        // Restore the terminal's own cursor color (OSC 112).
+        let _ = io::Write::write_all(&mut io::stderr(), b"\x1b]112;\x1b\\");
 
         disable_raw_mode().context("failed to disable terminal raw mode")?;
         execute!(
@@ -3641,6 +3660,7 @@ impl Drop for TerminalSession {
         if self.restored {
             return;
         }
+        let _ = io::Write::write_all(&mut io::stderr(), b"\x1b]112;\x1b\\");
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),

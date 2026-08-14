@@ -13,7 +13,7 @@ pub(super) fn append_tool_lines(
     let duration = format_duration(elapsed);
     lines.push(tool_header_line(
         &tool_verb(&tool.name),
-        &subject,
+        tool_subject_spans(tool, &subject),
         &result,
         &duration,
         selected,
@@ -51,48 +51,48 @@ pub(super) fn append_tool_lines(
                 .map_or_else(|| body_lines.len(), Vec::len)
                 .min(TOOL_OUTPUT_PREVIEW_LINES)
         };
-        let mut push = |spans: Vec<Span<'static>>| {
+        let mut push = |lines: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>| {
             let mut row = rail_spans(ACCENT_TOOL);
             row.push(Span::raw("  "));
             row.extend(spans);
             lines.push(Line::from(row));
         };
 
-        push(Vec::new());
+        push(lines, Vec::new());
         if edit_diff.is_some() {
-            push(vec![
+            push(lines, vec![
                 Span::styled("diff  ", label_style),
                 Span::styled(param.to_owned(), body_style),
             ]);
         } else if tool.name == "bash" && !failed {
-            push(vec![Span::styled("command", label_style)]);
+            push(lines, vec![Span::styled("command", label_style)]);
             for line in param.lines() {
-                push(vec![
+                push(lines, vec![
                     Span::raw("  "),
                     Span::styled(line.to_owned(), body_style),
                 ]);
             }
-            push(Vec::new());
-            push(vec![Span::styled("output", label_style)]);
+            push(lines, Vec::new());
+            push(lines, vec![Span::styled("output", label_style)]);
         } else if param.is_empty() {
-            push(vec![Span::styled(
+            push(lines, vec![Span::styled(
                 single_line(&tool.arguments, 200),
                 label_style,
             )]);
         } else if tool.name == "bash" {
-            push(vec![Span::styled("command", label_style)]);
+            push(lines, vec![Span::styled("command", label_style)]);
             for line in param.lines() {
-                push(vec![
+                push(lines, vec![
                     Span::raw("  "),
                     Span::styled(line.to_owned(), body_style),
                 ]);
             }
-            push(vec![]);
-            push(vec![Span::styled("stderr", label_style)]);
+            push(lines, vec![]);
+            push(lines, vec![Span::styled("stderr", label_style)]);
         } else {
             let indent = " ".repeat(param_key.len() + 2);
             for (index, line) in param.lines().enumerate() {
-                push(vec![
+                push(lines, vec![
                     Span::styled(
                         if index == 0 {
                             format!("{param_key}  ")
@@ -108,25 +108,34 @@ pub(super) fn append_tool_lines(
 
         if let Some(diff_lines) = &edit_diff {
             for line in diff_lines.iter().take(visible_lines) {
-                let style = if line.starts_with("+ ") {
-                    added_style
+                let (style, band) = if line.starts_with("+ ") {
+                    (added_style, Some(DIFF_ADD_BG))
                 } else if line.starts_with("- ") {
-                    removed_style
+                    (removed_style, Some(DIFF_DEL_BG))
                 } else {
-                    body_style
+                    (body_style, None)
                 };
                 for segment in wrap_display_hard(line, width.saturating_sub(4).max(1)) {
-                    push(vec![Span::styled(segment, style)]);
+                    let mut row = rail_spans(ACCENT_TOOL);
+                    row.push(Span::raw("  "));
+                    row.push(Span::styled(segment, style));
+                    let mut rendered = Line::from(row);
+                    if let Some(band) = band {
+                        // Full-width band, like grok's diff rows.
+                        rendered = rendered.style(Style::default().bg(band));
+                        pad_line_band(&mut rendered, width);
+                    }
+                    lines.push(rendered);
                 }
             }
         } else if tool.output.is_empty() && matches!(tool.status, ToolStatus::Running) {
-            push(vec![Span::styled("running…", label_style)]);
+            push(lines, vec![Span::styled("running…", label_style)]);
         } else if body_lines.is_empty() {
-            push(vec![Span::styled("(no output)", label_style)]);
+            push(lines, vec![Span::styled("(no output)", label_style)]);
         } else {
             for line in body_lines.iter().take(visible_lines) {
                 for segment in wrap_display_hard(line, width.saturating_sub(4).max(1)) {
-                    push(vec![Span::styled(segment, body_style)]);
+                    push(lines, vec![Span::styled(segment, body_style)]);
                 }
             }
         }
@@ -147,7 +156,7 @@ pub(super) fn append_tool_lines(
         } else {
             format!("timeout {}", format_duration(tool.timeout))
         };
-        push(vec![Span::styled(footer, label_style)]);
+        push(lines, vec![Span::styled(footer, label_style)]);
     }
 }
 
@@ -158,9 +167,24 @@ fn tool_verb(name: &str) -> String {
     }
 }
 
+/// Grok-style subject: paths glow orange, shell commands get a dim `$` prompt.
+fn tool_subject_spans(tool: &ToolEntry, subject: &str) -> Vec<Span<'static>> {
+    if tool.name == "bash" {
+        return vec![
+            Span::styled("$ ", Style::default().fg(GRAY_DIM)),
+            Span::styled(subject.to_owned(), Style::default().fg(COMMAND)),
+        ];
+    }
+    let color = match tool.name.as_str() {
+        "read" | "write" | "edit" | "grep" | "glob" => PATH,
+        _ => TEXT_DIM,
+    };
+    vec![Span::styled(subject.to_owned(), Style::default().fg(color))]
+}
+
 fn tool_header_line(
     verb: &str,
-    subject: &str,
+    subject: Vec<Span<'static>>,
     result: &str,
     duration: &str,
     selected: bool,
@@ -171,11 +195,8 @@ fn tool_header_line(
         .fg(if selected { TEXT_STRONG } else { TEXT })
         .add_modifier(Modifier::BOLD);
     let mut spans = rail_spans(ACCENT_TOOL);
-    spans.extend([
-        Span::styled(verb.to_owned(), verb_style),
-        Span::raw(" "),
-        Span::styled(subject.to_owned(), Style::default().fg(TEXT_DIM)),
-    ]);
+    spans.extend([Span::styled(verb.to_owned(), verb_style), Span::raw(" ")]);
+    spans.extend(subject);
     if width >= 36 && !result.is_empty() {
         spans.extend([
             Span::styled("  ", Style::default().fg(TEXT_FAINT)),

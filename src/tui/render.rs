@@ -79,10 +79,7 @@ fn location_line(app: &App, width: usize) -> Line<'static> {
     } else {
         path
     };
-    spans.push(Span::styled(
-        path,
-        Style::default().fg(Color::Rgb(88, 88, 88)),
-    ));
+    spans.push(Span::styled(path, Style::default().fg(GRAY_DIM)));
     Line::from(truncate_spans(spans, width))
 }
 
@@ -1559,15 +1556,56 @@ fn render_logo_art(frame: &mut Frame<'_>, area: Rect, art: Option<&str>) {
         .lines()
         .filter(|line| !line.is_empty())
         .take(area.height as usize)
-        .map(|line| {
-            Line::from(Span::styled(
-                line.to_owned(),
-                Style::default().fg(TEXT_FAINT),
-            ))
+        .enumerate()
+        .map(|(row, line)| {
+            Line::from(
+                line.chars()
+                    .enumerate()
+                    .map(|(column, character)| {
+                        Span::styled(
+                            character.to_string(),
+                            Style::default().fg(logo_shimmer_color(row, column)),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
             .alignment(Alignment::Center)
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Grok-style logo shimmer: a raised-cosine sheen sweeps the braille mark
+/// diagonally every 4s, layered over a slow 5s breathing pulse.
+fn logo_shimmer_color(row: usize, column: usize) -> Color {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let tick = millis / 83; // ~12fps, grok's shimmer cadence
+    let diagonal = (row + column) as u64;
+    let sweep = (tick * 83) % 4000;
+    let mut brightness = 0.3_f64;
+    if sweep < 1300 {
+        let center = sweep as f64 / 1300.0 * 34.0 - 4.0;
+        let distance = (diagonal as f64 - center).abs();
+        if distance < 4.0 {
+            brightness += 0.7 * (0.5 + 0.5 * (std::f64::consts::PI * distance / 4.0).cos());
+        }
+    }
+    let breath = ((tick * 83) % 5000) as f64 / 5000.0 * std::f64::consts::TAU;
+    brightness *= 0.85 + 0.15 * breath.sin().abs();
+    blend_color(GRAY_DIM, TEXT_STRONG, brightness)
+}
+
+/// Linear RGB blend, the single primitive behind all grok-style animation.
+fn blend_color(from: Color, to: Color, t: f64) -> Color {
+    let (Color::Rgb(fr, fg, fb), Color::Rgb(tr, tg, tb)) = (from, to) else {
+        return to;
+    };
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * t).round() as u8;
+    Color::Rgb(lerp(fr, tr), lerp(fg, tg), lerp(fb, tb))
 }
 
 fn render_product_badge(frame: &mut Frame<'_>, area: Rect) {
@@ -1818,6 +1856,21 @@ fn header_row_style(selected: bool, hovered: bool) -> Style {
     Style::default().bg(row_highlight(selected, hovered))
 }
 
+/// Extend a banded line to the full content width: ratatui only paints line
+/// style over existing graphemes, so pad with background-colored spaces.
+fn pad_line_band(line: &mut Line<'static>, width: usize) {
+    let Some(bg) = line.style.bg else {
+        return;
+    };
+    let used = line.width();
+    if used < width {
+        line.spans.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(bg),
+        ));
+    }
+}
+
 fn transcript_text(app: &App, width: usize) -> TranscriptRender {
     let content_width = width.max(1);
     let mut lines = Vec::new();
@@ -1832,6 +1885,17 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                 let final_answer = app.is_final_answer(index);
                 let start_line = lines.len();
                 append_markdown_lines(&mut lines, content, *role, final_answer, content_width);
+                if *role == MessageRole::User {
+                    // Grok-style raised band: user turns get a full-width
+                    // surface background so they stay scannable in long
+                    // transcripts.
+                    for line in &mut lines[start_line..] {
+                        if line.style.bg.is_none() {
+                            line.style = line.style.patch(Style::default().bg(SURFACE));
+                        }
+                        pad_line_band(line, content_width);
+                    }
+                }
                 panels.push(TranscriptPanel {
                     start_line,
                     end_line: lines.len(),
@@ -2151,7 +2215,7 @@ fn append_markdown_lines(
             let language = trimmed.trim_start_matches('`').trim();
             if in_code_block {
                 let rail = message_rail(role, final_answer, &mut first_visual_line);
-                lines.push(Line::from(vec![
+                let mut band = Line::from(vec![
                     Span::styled(
                         rail,
                         Style::default().fg(message_rail_color(role, final_answer)),
@@ -2165,16 +2229,22 @@ fn append_markdown_lines(
                         },
                         Style::default().fg(TEXT_DIM),
                     ),
-                ]));
+                ])
+                .style(Style::default().bg(CODE_BG));
+                pad_line_band(&mut band, width);
+                lines.push(band);
             } else {
                 let rail = message_rail(role, final_answer, &mut first_visual_line);
-                lines.push(Line::from(vec![
+                let mut band = Line::from(vec![
                     Span::styled(
                         rail,
                         Style::default().fg(message_rail_color(role, final_answer)),
                     ),
                     Span::styled("▌", Style::default().fg(TEXT_FAINT)),
-                ]));
+                ])
+                .style(Style::default().bg(CODE_BG));
+                pad_line_band(&mut band, width);
+                lines.push(band);
             }
             continue;
         }
@@ -2182,14 +2252,17 @@ fn append_markdown_lines(
             let content_width = width.saturating_sub(4).max(1);
             for segment in wrap_display_hard(source_line, content_width) {
                 let rail = message_rail(role, final_answer, &mut first_visual_line);
-                lines.push(Line::from(vec![
+                let mut band = Line::from(vec![
                     Span::styled(
                         rail,
                         Style::default().fg(message_rail_color(role, final_answer)),
                     ),
                     Span::styled("▌ ", Style::default().fg(TEXT_DIM)),
                     Span::styled(segment, Style::default().fg(TEXT_STRONG)),
-                ]));
+                ])
+                .style(Style::default().bg(CODE_BG));
+                pad_line_band(&mut band, width);
+                lines.push(band);
             }
             continue;
         }
@@ -2202,13 +2275,10 @@ fn append_markdown_lines(
                 &mut first_visual_line,
                 width,
                 Style::default()
-                    .fg(TEXT_STRONG)
+                    .fg(ACCENT_SECONDARY)
                     .add_modifier(Modifier::BOLD),
             );
-        } else if let Some(heading) = trimmed
-            .strip_prefix("## ")
-            .or_else(|| trimmed.strip_prefix("# "))
-        {
+        } else if let Some(heading) = trimmed.strip_prefix("## ") {
             append_wrapped_message_lines(
                 lines,
                 heading,
@@ -2217,7 +2287,19 @@ fn append_markdown_lines(
                 &mut first_visual_line,
                 width,
                 Style::default()
-                    .fg(TEXT_STRONG)
+                    .fg(ACCENT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            );
+        } else if let Some(heading) = trimmed.strip_prefix("# ") {
+            append_wrapped_message_lines(
+                lines,
+                heading,
+                role,
+                final_answer,
+                &mut first_visual_line,
+                width,
+                Style::default()
+                    .fg(MODEL_ACCENT)
                     .add_modifier(Modifier::BOLD),
             );
         } else if let Some(item) = trimmed
@@ -2280,13 +2362,20 @@ fn role_accent(role: MessageRole) -> Color {
     }
 }
 
+/// User turns lead with a `❯` prompt (grok-style); continuation lines indent
+/// to the same column. Assistant turns keep the accent rail.
 fn message_rail(
-    _role: MessageRole,
+    role: MessageRole,
     _final_answer: bool,
     first_visual_line: &mut bool,
 ) -> String {
+    let first = *first_visual_line;
     *first_visual_line = false;
-    format!("{} ", crate::tui::glyphs::accent_bar())
+    match role {
+        MessageRole::User if first => crate::tui::glyphs::prompt_arrow().to_owned(),
+        MessageRole::User => "  ".to_owned(),
+        MessageRole::Assistant => format!("{} ", crate::tui::glyphs::accent_bar()),
+    }
 }
 
 fn message_rail_color(role: MessageRole, _final_answer: bool) -> Color {
@@ -2365,7 +2454,10 @@ fn inline_markdown_spans(value: &str, base: Style) -> Vec<Span<'static>> {
                 spans.push(Span::styled(std::mem::take(&mut buffer), base));
             }
             let code: String = chars[index + 1..index + 1 + end].iter().collect();
-            spans.push(Span::styled(code, base.fg(TEXT_STRONG)));
+            spans.push(Span::styled(
+                code,
+                base.fg(MD_CODE).add_modifier(Modifier::BOLD),
+            ));
             index += end + 2;
             continue;
         }
@@ -2442,15 +2534,25 @@ fn append_thinking_lines(
     };
     let mut header_spans = rail_spans(ACCENT_THINKING);
     header_spans.push(Span::styled(header, label_style));
+    if status == ThinkingStatus::Done && !thinking.expanded {
+        header_spans.push(Span::styled(
+            "  (ctrl+e to expand)",
+            Style::default().fg(GRAY_DIM),
+        ));
+    }
     lines.push(
         Line::from(truncate_spans(header_spans, width)).style(header_row_style(selected, false)),
     );
 
     if thinking.expanded {
+        // Grok-style de-emphasis: thinking bodies render dim + italic.
+        let body_style = Style::default()
+            .fg(TEXT_FAINT)
+            .add_modifier(Modifier::ITALIC);
         for line in thinking.content.split('\n') {
             for segment in wrap_display_hard(line, width.saturating_sub(2).max(1)) {
                 let mut row = rail_spans(ACCENT_THINKING);
-                row.push(Span::styled(segment, Style::default().fg(TEXT_DIM)));
+                row.push(Span::styled(segment, body_style));
                 lines.push(Line::from(row));
             }
         }
@@ -2707,6 +2809,15 @@ fn input_metadata_line(app: &App, width: usize) -> Line<'static> {
     let thinking = thinking_short_name(app.thinking_level.unwrap_or(app.thinking_preference));
     let mode = truncate_display(&format!("{model} · think {thinking}"), width);
     let mode_width = UnicodeWidthStr::width(mode.as_str());
+    // Grok-style chrome: the model name glows teal, the rest stays muted.
+    let mode_spans = if mode == format!("{model} · think {thinking}") {
+        vec![
+            Span::styled(model, Style::default().fg(MODEL_ACCENT)),
+            Span::styled(format!(" · think {thinking}"), Style::default().fg(TEXT_DIM)),
+        ]
+    } else {
+        vec![Span::styled(mode, Style::default().fg(MODEL_ACCENT))]
+    };
     let context = format!(
         "{:.0}%",
         app.context_chars as f64 * 100.0 / app.max_context_chars.max(1) as f64
@@ -2720,15 +2831,14 @@ fn input_metadata_line(app: &App, width: usize) -> Line<'static> {
     };
     let remaining = width.saturating_sub(mode_width);
     if remaining < 4 {
-        return Line::from(Span::styled(mode, Style::default().fg(TEXT_DIM)));
+        return Line::from(mode_spans);
     }
     let detail = truncate_display(&run, remaining.saturating_sub(2));
     let spacer = remaining.saturating_sub(UnicodeWidthStr::width(detail.as_str()));
-    Line::from(vec![
-        Span::styled(mode, Style::default().fg(TEXT_DIM)),
-        Span::raw(" ".repeat(spacer)),
-        Span::styled(detail, Style::default().fg(TEXT_FAINT)),
-    ])
+    let mut spans = mode_spans;
+    spans.push(Span::raw(" ".repeat(spacer)));
+    spans.push(Span::styled(detail, Style::default().fg(TEXT_FAINT)));
+    Line::from(spans)
 }
 
 fn register_input_metadata_hits(app: &mut App, area: Rect) {
@@ -2751,6 +2861,15 @@ fn register_input_metadata_hits(app: &mut App, area: Rect) {
         Rect::new(thinking_x, area.y, thinking_width, 1),
         HitTarget::StatusThinking,
     );
+}
+
+/// Grok-style prompt arrow: bright user gray when focused, dim when not.
+fn prompt_color(app: &App) -> Color {
+    if app.input_focused || app.busy {
+        ACCENT_USER
+    } else {
+        GRAY_DIM
+    }
 }
 
 fn render_input_buffer(
@@ -2776,7 +2895,7 @@ fn render_input_buffer(
         frame.render_widget(
             Paragraph::new(Span::styled(
                 prompt.to_owned(),
-                Style::default().fg(ACCENT_PRIMARY),
+                Style::default().fg(prompt_color(app)),
             ))
             .style(Style::default().bg(background)),
             area,
@@ -2788,7 +2907,7 @@ fn render_input_buffer(
         frame.render_widget(
             Paragraph::new(Span::styled(
                 prompt.to_owned(),
-                Style::default().fg(ACCENT_PRIMARY),
+                Style::default().fg(prompt_color(app)),
             ))
             .style(Style::default().bg(background)),
             prompt_area,
@@ -2954,10 +3073,13 @@ fn render_turn_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|started| started.elapsed().as_millis() as u64 / 33)
         .unwrap_or(0);
     let spinner = crate::tui::glyphs::spinner_frame(tick);
-    let activity = match app.status {
-        Status::Cancelling => "stopping",
-        Status::Error => "error",
-        Status::RunningTool | Status::Thinking | Status::Idle => "working",
+    // Grok-style activity coloring: tools green, thinking purple.
+    let (activity, accent) = match app.status {
+        Status::Cancelling => ("stopping", BAD),
+        Status::Error => ("error", BAD),
+        Status::RunningTool => ("working", OK),
+        Status::Thinking => ("thinking", ACCENT_SECONDARY),
+        Status::Idle => ("working", TEXT_FAINT),
     };
     let elapsed = app
         .turn_started
@@ -2968,14 +3090,18 @@ fn render_turn_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.turn_tool_count,
         if app.turn_tool_count == 1 { "" } else { "s" }
     );
-    let left = format!("{spinner} {activity}  {tools}  {elapsed}");
+    let left = format!("{spinner} {activity}");
+    let detail = format!("{tools}  {elapsed}");
     let right = "esc  interrupt";
     let spacer = (area.width as usize)
         .saturating_sub(UnicodeWidthStr::width(left.as_str()))
+        .saturating_sub(UnicodeWidthStr::width(detail.as_str()))
+        .saturating_sub(2)
         .saturating_sub(UnicodeWidthStr::width(right));
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(left, Style::default().fg(ACCENT_SECONDARY)),
+            Span::styled(left, Style::default().fg(accent)),
+            Span::styled(format!("  {detail}"), Style::default().fg(TEXT_FAINT)),
             Span::raw(" ".repeat(spacer)),
             Span::styled(right, Style::default().fg(TEXT_FAINT)),
         ])),

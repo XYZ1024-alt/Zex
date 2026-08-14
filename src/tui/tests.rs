@@ -4,12 +4,12 @@ use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
 use ratatui::{Terminal, backend::TestBackend, style::Color};
 
 use super::{
-    ACCENT_PRIMARY, App, AppContext, BACKGROUND, BAD, CommandOutput, HitTarget, InputAction,
-    InputBuffer, KeyBurst, PRODUCT_NAME, ProviderPane, SCROLL_STEP, SURFACE, SURFACE_RAISED,
-    Status, ThinkingEntry, ToolStatus, TranscriptEntry, command_specs, composer_editor_origin,
-    handle_key_event, handle_mouse_event, handle_terminal_event, input_metrics, landing_regions,
-    regions_inside_frame, regions_non_overlapping, render, sanitize_terminal_text, truncate_chars,
-    ui_regions,
+    ACCENT_PRIMARY, App, AppContext, BACKGROUND, BAD, CODE_BG, CommandOutput, HitTarget,
+    InputAction, InputBuffer, KeyBurst, PRODUCT_NAME, ProviderPane, SCROLL_STEP, SURFACE,
+    SURFACE_RAISED, Status, ThinkingEntry, ToolStatus, TranscriptEntry, command_specs,
+    composer_editor_origin, handle_key_event, handle_mouse_event, handle_terminal_event,
+    input_metrics, landing_regions, regions_inside_frame, regions_non_overlapping, render,
+    sanitize_terminal_text, truncate_chars, ui_regions,
 };
 use super::glyphs::{HERO_BOX_MIN_WIDTH, LogoTier, logo_tier};
 use crate::agent::{AgentEvent, Message, MessageRole};
@@ -273,7 +273,7 @@ fn thinking_statusline_hides_stale_rate_and_keeps_input_frame_empty() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
     let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 100, 18), &app);
-    assert!(screen.contains("working"));
+    assert!(screen.contains("thinking"));
     assert!(!screen.contains("42.7 tok/s"));
     assert!(!screen.contains("processing turn"));
     let (text_x, text_y) = composer_editor_origin(content_inset(regions.footer));
@@ -902,7 +902,7 @@ fn footer_is_a_full_input_band_in_idle_and_busy_states() {
         "╭"
     );
     assert!(busy.contains("interrupt"));
-    assert!(busy.contains("working"));
+    assert!(busy.contains("thinking"));
 }
 
 #[test]
@@ -921,7 +921,7 @@ fn busy_input_band_preserves_metadata_and_editor_context() {
     let screen = format!("{}", terminal.backend());
 
     assert!(screen.contains("test-model"));
-    assert!(screen.contains("working"));
+    assert!(screen.contains("thinking"));
     assert!(screen.contains("interrupt"));
 }
 
@@ -974,7 +974,10 @@ fn every_draw_paints_the_full_terminal_background() {
 
         for cell in terminal.backend().buffer().content() {
             assert!(
-                matches!(cell.style().bg, Some(BACKGROUND | SURFACE | SURFACE_RAISED)),
+                matches!(
+                    cell.style().bg,
+                    Some(BACKGROUND | SURFACE | SURFACE_RAISED | CODE_BG)
+                ),
                 "unpainted cell at {width}x{height}: {:?}",
                 cell.style()
             );
@@ -987,7 +990,7 @@ fn every_draw_paints_the_full_terminal_background() {
         ] {
             assert!(matches!(
                 style_at(&terminal, x, y).bg,
-                Some(BACKGROUND | SURFACE | SURFACE_RAISED)
+                Some(BACKGROUND | SURFACE | SURFACE_RAISED | CODE_BG)
             ));
         }
     }
@@ -1028,7 +1031,7 @@ fn first_turn_switches_to_a_top_anchored_work_timeline() {
         .expect("message should be visible") as u16;
     assert!(!app.landing_visible());
     assert!(!screen.contains("Ask anything"));
-    assert!(screen.contains("working"));
+    assert!(screen.contains("thinking"));
     assert!(!screen.contains("precision, without noise"));
     assert_eq!(message_row, regions.transcript.y);
     assert_no_banned_branding(&screen);
@@ -1058,7 +1061,7 @@ fn clearing_the_timeline_restores_the_landing_layout() {
 }
 
 #[test]
-fn tool_and_code_surfaces_do_not_color_the_transcript_background() {
+fn code_blocks_use_a_raised_band_and_tools_stay_on_the_base_background() {
     let mut app = app();
     app.apply_agent_event(AgentEvent::MessageDelta {
         role: MessageRole::Assistant,
@@ -1084,13 +1087,22 @@ fn tool_and_code_surfaces_do_not_color_the_transcript_background() {
     let buffer = terminal.backend().buffer();
     for cell in buffer.content() {
         assert!(
-            matches!(cell.style().bg, Some(BACKGROUND | SURFACE | SURFACE_RAISED)),
+            matches!(
+                cell.style().bg,
+                Some(BACKGROUND | SURFACE | SURFACE_RAISED | CODE_BG)
+            ),
             "unexpected background {:?}",
             cell.style().bg
         );
     }
 
-    assert!(format!("{}", terminal.backend()).contains("fn main() {}"));
+    let screen = format!("{}", terminal.backend());
+    assert!(screen.contains("fn main() {}"));
+    let code_row = screen
+        .lines()
+        .position(|row| row.contains("fn main() {}"))
+        .expect("code block should be visible") as u16;
+    assert_eq!(style_at(&terminal, 40, code_row).bg, Some(CODE_BG));
     assert!(
         format!("{}", terminal.backend())
             .lines()
@@ -1145,7 +1157,7 @@ fn idle_thinking_and_running_states_are_clear_in_the_footer() {
     app.start_turn();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let thinking = format!("{}", terminal.backend());
-    assert!(thinking.contains("working"));
+    assert!(thinking.contains("thinking"));
     assert!(thinking.contains("interrupt"));
 
     app.apply_agent_event(AgentEvent::ToolStart {
@@ -1544,8 +1556,8 @@ fn completed_turn_status_precedes_the_final_answer() {
         .expect("missing final answer");
     let rail = terminal.backend().buffer()[(super::HORIZONTAL_GUTTER, user_row as u16)].symbol();
     assert!(
-        rail == "\u{2503}" || rail == "┃" || rail == "\u{2502}" || rail == "│",
-        "expected accent rail, got {rail:?}"
+        rail == "\u{276F}" || rail == "❯" || rail == ">",
+        "expected user prompt arrow, got {rail:?}"
     );
     assert!(user_row < tool_row);
     assert!(status_row < answer_row);
@@ -1597,14 +1609,14 @@ fn active_turn_status_surface_ends_after_its_content() {
     let screen = format!("{}", terminal.backend());
     let detail_row = screen
         .lines()
-        .position(|row| row.contains("working"))
+        .position(|row| row.contains("thinking"))
         .expect("running detail should be visible") as u16;
     let regions = ui_regions(area, &app);
     assert!(
         detail_row >= regions.turn_status.y || detail_row < regions.transcript.bottom(),
         "turn status should sit in the turn-status row or transcript"
     );
-    assert!(screen.contains("working"));
+    assert!(screen.contains("thinking"));
 }
 
 #[test]
@@ -4417,12 +4429,12 @@ fn idle_and_busy_footers_stay_identifiable() {
     assert!(idle.contains("gpt-5"));
     assert!(idle.contains("high"));
     assert!(idle.contains("enter") && idle.contains("send"));
-    assert!(!idle.contains("working"));
+    assert!(!idle.contains("thinking"));
 
     app.start_turn();
     let (terminal, busy) = draw(&mut app, 80, 24);
     write_screen_dump("busy-80x24", &busy);
-    assert!(busy.contains("working"));
+    assert!(busy.contains("thinking"));
     assert!(busy.contains("interrupt"));
     assert!(busy.contains("gpt-5"));
     assert!(busy.contains("high"));
@@ -4933,4 +4945,122 @@ fn session_picker_is_a_highlight_list_not_raised_cards() {
         .area;
     assert_eq!(selected.height, 1);
     assert_no_banned_branding(&screen);
+}
+
+#[test]
+fn grok_style_visual_regression() {
+    let mut app = app();
+    app.transcript.extend([
+        TranscriptEntry::Message {
+            role: MessageRole::User,
+            content: "Refactor the renderer to match grok.".to_owned(),
+        },
+        TranscriptEntry::Thinking(ThinkingEntry {
+            content: "compare themes".to_owned(),
+            expanded: false,
+            elapsed: Some(Duration::from_millis(2400)),
+        }),
+        TranscriptEntry::Tool(super::ToolEntry {
+            call_id: "tool-edit".to_owned(),
+            name: "edit".to_owned(),
+            arguments: r#"{"path":"src/tui.rs","old_text":"let a = 1;","new_text":"let a = 2;"}"#
+                .to_owned(),
+            output: String::new(),
+            status: ToolStatus::Done,
+            expanded: true,
+            show_full_output: false,
+            started_at: None,
+            elapsed: Some(Duration::from_millis(12)),
+            timeout: Duration::from_secs(30),
+        }),
+        TranscriptEntry::Message {
+            role: MessageRole::Assistant,
+            content: "## Plan\n- one\n- two\n```rust\nfn main() {}\n```\nDone with `cargo test`."
+                .to_owned(),
+        },
+    ]);
+    app.start_turn();
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let screen = format!("{}", terminal.backend());
+    write_screen_dump("grok-style-regression-100x30", &screen);
+
+    // User turn: ❯ prompt plus a full-width raised band.
+    let user_row = screen
+        .lines()
+        .position(|row| row.contains("Refactor the renderer"))
+        .expect("user message visible") as u16;
+    let buffer = terminal.backend().buffer();
+    let transcript_x = super::HORIZONTAL_GUTTER;
+    assert_eq!(buffer[(transcript_x, user_row)].symbol(), "❯");
+    let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 100, 30), &app);
+    let band_right = regions.transcript.right().saturating_sub(3);
+    assert_eq!(
+        style_at(&terminal, band_right, user_row).bg,
+        Some(SURFACE),
+        "user band must span the full transcript width"
+    );
+
+    // Diff rows: full-width delete/insert bands.
+    let del_row = screen
+        .lines()
+        .position(|row| row.contains("- let a = 1;"))
+        .expect("delete row visible") as u16;
+    let add_row = screen
+        .lines()
+        .position(|row| row.contains("+ let a = 2;"))
+        .expect("insert row visible") as u16;
+    assert_eq!(
+        style_at(&terminal, band_right, del_row).bg,
+        Some(super::DIFF_DEL_BG)
+    );
+    assert_eq!(
+        style_at(&terminal, band_right, add_row).bg,
+        Some(super::DIFF_ADD_BG)
+    );
+
+    // Code block rows sit on the raised code surface.
+    let code_row = screen
+        .lines()
+        .position(|row| row.contains("fn main() {}"))
+        .expect("code row visible") as u16;
+    assert_eq!(style_at(&terminal, band_right, code_row).bg, Some(CODE_BG));
+
+    // Tool header: orange path subject.
+    let tool_row = screen
+        .lines()
+        .position(|row| row.contains("edit") && row.contains("src/tui.rs"))
+        .expect("tool header visible") as u16;
+    let path_col = screen
+        .lines()
+        .nth(tool_row as usize)
+        .unwrap()
+        .find("src/tui.rs")
+        .unwrap() as u16;
+    assert_eq!(
+        style_at(&terminal, path_col, tool_row).fg,
+        Some(super::PATH)
+    );
+
+    // Composer chrome: teal model name.
+    assert!(screen.contains("test-model"));
+    let model_row = screen
+        .lines()
+        .position(|row| row.contains("test-model"))
+        .expect("model caption visible") as u16;
+    let model_col = screen
+        .lines()
+        .nth(model_row as usize)
+        .unwrap()
+        .find("test-model")
+        .unwrap() as u16;
+    assert_eq!(
+        style_at(&terminal, model_col, model_row).fg,
+        Some(super::MODEL_ACCENT)
+    );
+
+    // Thinking status label replaces the generic "working".
+    assert!(screen.contains("thinking"));
+    assert!(screen.contains("Thought for 2s"));
 }
