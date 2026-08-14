@@ -1337,7 +1337,7 @@ pub(super) fn landing_regions(area: Rect, app: &App) -> LandingRegions {
     let hero_box_height = 2 + HERO_V_PAD * 2 + hero_inner;
     let want_hero = stage.width >= crate::tui::glyphs::HERO_BOX_MIN_WIDTH
         && hero_art.is_some()
-        && stage.height >= hero_box_height + card_height + 1
+        && stage.height > hero_box_height + card_height
         && completion_desired == 0
         && menu_height > 0;
 
@@ -1562,6 +1562,8 @@ fn render_logo_art(frame: &mut Frame<'_>, area: Rect, art: Option<&str>) {
     if area.is_empty() {
         return;
     }
+    // Wordmark grid: one char per pixel, each pixel two columns wide.
+    // `S` = ink pixel (shimmering), anything else = empty.
     let lines: Vec<Line> = art
         .lines()
         .filter(|line| !line.is_empty())
@@ -1571,11 +1573,16 @@ fn render_logo_art(frame: &mut Frame<'_>, area: Rect, art: Option<&str>) {
             Line::from(
                 line.chars()
                     .enumerate()
-                    .map(|(column, character)| {
-                        Span::styled(
-                            character.to_string(),
-                            Style::default().fg(logo_shimmer_color(row, column)),
-                        )
+                    .map(|(pixel, role)| {
+                        let column = pixel * 2;
+                        match role {
+                            'S' => Span::styled(
+                                "██",
+                                Style::default()
+                                    .fg(logo_shimmer_color(WORDMARK_INK, row, column)),
+                            ),
+                            _ => Span::raw("  "),
+                        }
                     })
                     .collect::<Vec<_>>(),
             )
@@ -1585,9 +1592,10 @@ fn render_logo_art(frame: &mut Frame<'_>, area: Rect, art: Option<&str>) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Grok-style logo shimmer: a raised-cosine sheen sweeps the mascot
-/// diagonally every 4s, layered over a slow 5s breathing pulse.
-fn logo_shimmer_color(row: usize, column: usize) -> Color {
+/// Grok-style logo shimmer: a raised-cosine sheen sweeps the wordmark
+/// diagonally every 4s, layered over a slow 5s breathing pulse. The sweep
+/// modulates the letters between dimmed and lit variants of their base tone.
+fn logo_shimmer_color(base: Color, row: usize, column: usize) -> Color {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -1597,7 +1605,7 @@ fn logo_shimmer_color(row: usize, column: usize) -> Color {
     let sweep = (tick * 83) % 4000;
     let mut brightness = 0.3_f64;
     if sweep < 1300 {
-        let center = sweep as f64 / 1300.0 * 34.0 - 4.0;
+        let center = sweep as f64 / 1300.0 * 56.0 - 4.0;
         let distance = (diagonal as f64 - center).abs();
         if distance < 4.0 {
             brightness += 0.7 * (0.5 + 0.5 * (std::f64::consts::PI * distance / 4.0).cos());
@@ -1605,7 +1613,11 @@ fn logo_shimmer_color(row: usize, column: usize) -> Color {
     }
     let breath = ((tick * 83) % 5000) as f64 / 5000.0 * std::f64::consts::TAU;
     brightness *= 0.85 + 0.15 * breath.sin().abs();
-    blend_color(GRAY_DIM, TEXT_STRONG, brightness)
+    blend_color(
+        blend_color(base, BACKGROUND, 0.45),
+        blend_color(base, TEXT_STRONG, 0.35),
+        brightness,
+    )
 }
 
 /// Linear RGB blend, the single primitive behind all grok-style animation.

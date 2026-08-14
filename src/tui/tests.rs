@@ -685,13 +685,13 @@ fn empty_state_centers_a_large_zex_wordmark_and_focused_prompt_surface() {
     });
     app.thinking_level = Some(ThinkingLevel::High);
     app.context_chars = 30_000;
-    let backend = TestBackend::new(100, 24);
+    let backend = TestBackend::new(104, 24);
     let mut terminal = Terminal::new(backend).unwrap();
 
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
     write_screen_dump("landing", &screen);
-    let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 100, 24), &app);
+    let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 104, 24), &app);
 
     assert_zex_welcome_identity(&screen);
     assert!(!screen.contains("Ask anything"));
@@ -702,7 +702,7 @@ fn empty_state_centers_a_large_zex_wordmark_and_focused_prompt_surface() {
     assert_eq!(BACKGROUND, Color::Rgb(20, 20, 20));
     assert!(
         !regions.hero.is_empty(),
-        "width 100 should use the hero box"
+        "width 104 should use the hero box"
     );
     assert!(regions.menu.height >= 2);
     assert!(regions.card.bottom() <= regions.status.y || regions.status.is_empty());
@@ -4725,14 +4725,14 @@ fn welcome_wide_uses_hero_box_and_night_palette() {
         dirty_count: 0,
     });
     app.input_focused = false;
-    let backend = TestBackend::new(100, 24);
+    let backend = TestBackend::new(104, 24);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
     write_screen_dump("welcome-wide", &screen);
-    let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 100, 24), &app);
+    let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 104, 24), &app);
 
-    assert!(100 >= HERO_BOX_MIN_WIDTH);
+    assert!(104 >= HERO_BOX_MIN_WIDTH);
     assert!(!regions.hero.is_empty(), "wide welcome must use the hero box");
     assert_zex_welcome_identity(&screen);
     assert!(screen.contains("Type a message..."));
@@ -4757,8 +4757,8 @@ fn welcome_narrow_stacks_without_hero_box() {
     let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 24), &app);
 
     assert!(regions.hero.is_empty(), "narrow welcome must stack");
-    assert!(!regions.logo.is_empty(), "24-row stacked welcome shows the small logo");
-    assert_eq!(logo_tier(24), LogoTier::Small);
+    assert!(!regions.logo.is_empty(), "24-row stacked welcome shows the wordmark");
+    assert_eq!(logo_tier(24), LogoTier::Full);
     assert!(screen.contains(PRODUCT_NAME));
     assert!(screen.contains("Type a message..."));
     assert!(screen.contains("Resume sessions"));

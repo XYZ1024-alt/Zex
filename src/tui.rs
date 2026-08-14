@@ -90,6 +90,9 @@ const CODE_BG: Color = Color::Rgb(28, 28, 28);
 const DIFF_ADD_BG: Color = Color::Rgb(6, 56, 6);
 const DIFF_DEL_BG: Color = Color::Rgb(66, 14, 20);
 const PRODUCT_NAME: &str = "ZEX";
+// Wordmark palette: a single silver tone for the block letters,
+// animated by the shimmer sweep.
+const WORDMARK_INK: Color = Color::Rgb(150, 152, 164);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WelcomeActionKind {

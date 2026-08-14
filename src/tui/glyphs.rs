@@ -1,8 +1,8 @@
-//! Chrome glyphs and the static block-glyph logo, with legacy-console fallbacks.
+//! Chrome glyphs and the ZEX wordmark, with legacy-console fallbacks.
 //!
-//! Chrome glyphs: prompt arrow, left accent rail, height-tiered mascot art.
-
-use unicode_width::UnicodeWidthStr;
+//! Chrome glyphs: prompt arrow, left accent rail, height-tiered wordmark art.
+//! Wordmark grids use one char per pixel, rendered two terminal columns wide:
+//! `S` = ink pixel, `.` = empty.
 
 /// `"❯ "` (U+276F) normally, `"> "` on legacy Windows consoles. Always 2 columns.
 pub(super) fn prompt_arrow() -> &'static str {
@@ -37,34 +37,28 @@ pub(super) fn is_legacy_windows_console() -> bool {
 /// Height at or above which the small logo is shown (below it, no logo).
 pub(super) const SMALL_LOGO_MIN_HEIGHT: u16 = 22;
 /// Height at or above which the full logo is shown (stacked layout).
-pub(super) const FULL_LOGO_MIN_HEIGHT: u16 = 26;
+pub(super) const FULL_LOGO_MIN_HEIGHT: u16 = 24;
 /// Minimum terminal width for the side-by-side hero box.
 pub(super) const HERO_BOX_MIN_WIDTH: u16 = 90;
 
-/// Full-size ZEX mascot: a round little spark sprite with a lightning-bolt
-/// crest (12 rows, double-width block pixels so every pixel stays square).
+/// Full-size ZEX wordmark: chunky block letters (22px x 7 rows).
+/// `S` = ink pixel, `.` = empty.
 const LOGO_FULL: &str = "\
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀██████⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀██████⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀██████████⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀██████⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀██████████████████⠀⠀⠀⠀
-⠀⠀⠀⠀██████████████████████⠀⠀
-⠀⠀██████████      ██████████
-⠀⠀██████████      ██████████
-⠀⠀██████████████████████████
-⠀⠀██████████████████████████
-⠀⠀⠀⠀██████████████████████⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀██████████████⠀⠀⠀⠀⠀⠀";
+SSSSSS..SSSSSS..SS..SS
+SSSSSS..SSSSSS..SS..SS
+...SS...SS.......SSSS.
+..SS....SSSSS.....SS..
+.SS.....SS.......SSSS.
+SSSSSS..SSSSSS..SS..SS
+SSSSSS..SSSSSS..SS..SS";
 
-/// Compact mascot face (6 rows) for mid-height terminals.
+/// Compact ZEX wordmark (19px x 5 rows) for mid-height terminals.
 const LOGO_SMALL: &str = "\
-⠀⠀██████████████████████⠀⠀
-██████████      ██████████
-██████████████████████████
-██████████████████████████
-⠀⠀██████████████████████⠀⠀
-⠀⠀⠀⠀⠀⠀██████████████⠀⠀⠀⠀⠀⠀";
+SSSSS..SSSSS..S...S
+...S...SS......S.S.
+..S....SSSS.....S..
+.S.....SS......S.S.
+SSSSS..SSSSS..S...S";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LogoTier {
@@ -105,9 +99,10 @@ pub(super) fn logo_line_count(art: &str) -> u16 {
 }
 
 pub(super) fn logo_visual_width(art: &str) -> u16 {
+    // One sprite char per pixel, each pixel rendered two columns wide.
     art.lines()
         .filter(|line| !line.is_empty())
-        .map(UnicodeWidthStr::width)
+        .map(|line| line.chars().count() * 2)
         .max()
         .unwrap_or(16) as u16
 }
