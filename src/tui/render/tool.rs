@@ -11,13 +11,24 @@ pub(super) fn append_tool_lines(
     let elapsed = tool_elapsed(tool);
     let result = tool_result(tool);
     let duration = format_duration(elapsed);
+    let running_millis = match tool.status {
+        ToolStatus::Running => Some(
+            tool.started_at
+                .map(|started| started.elapsed().as_millis() as u64)
+                .unwrap_or(0),
+        ),
+        _ => None,
+    };
     lines.push(tool_header_line(
         &tool_verb(&tool.name),
         tool_subject_spans(tool, &subject),
         &result,
         &duration,
-        selected,
-        tool_result_color(tool),
+        ToolHeaderState {
+            selected,
+            result_color: tool_result_color(tool),
+            running_millis,
+        },
         width,
     ));
 
@@ -51,7 +62,7 @@ pub(super) fn append_tool_lines(
                 .map_or_else(|| body_lines.len(), Vec::len)
                 .min(TOOL_OUTPUT_PREVIEW_LINES)
         };
-        let mut push = |lines: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>| {
+        let push = |lines: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>| {
             let mut row = rail_spans(ACCENT_TOOL);
             row.push(Span::raw("  "));
             row.extend(spans);
@@ -179,15 +190,23 @@ fn tool_subject_spans(tool: &ToolEntry, subject: &str) -> Vec<Span<'static>> {
     vec![Span::styled(subject.to_owned(), Style::default().fg(TEXT_DIM))]
 }
 
+struct ToolHeaderState {
+    selected: bool,
+    result_color: Color,
+    running_millis: Option<u64>,
+}
+
 fn tool_header_line(
     verb: &str,
     subject: Vec<Span<'static>>,
     result: &str,
     duration: &str,
-    selected: bool,
-    result_color: Color,
+    state: ToolHeaderState,
     width: usize,
 ) -> Line<'static> {
+    let selected = state.selected;
+    let result_color = state.result_color;
+    let running_millis = state.running_millis;
     let verb_style = Style::default()
         .fg(if selected { TEXT_STRONG } else { TEXT })
         .add_modifier(Modifier::BOLD);
@@ -195,10 +214,15 @@ fn tool_header_line(
     spans.extend([Span::styled(verb.to_owned(), verb_style), Span::raw(" ")]);
     spans.extend(subject);
     if width >= 36 && !result.is_empty() {
-        spans.extend([
-            Span::styled("  ", Style::default().fg(TEXT_FAINT)),
-            Span::styled(result.to_owned(), Style::default().fg(result_color)),
-        ]);
+        spans.push(Span::styled("  ", Style::default().fg(TEXT_FAINT)));
+        // Live braille spinner on running tools, at the shared 80ms cadence.
+        if let Some(millis) = running_millis {
+            spans.push(Span::styled(
+                format!("{} ", crate::tui::glyphs::spinner_frame(millis)),
+                Style::default().fg(result_color),
+            ));
+        }
+        spans.push(Span::styled(result.to_owned(), Style::default().fg(result_color)));
     }
     if width >= 48 && !duration.is_empty() {
         spans.extend([

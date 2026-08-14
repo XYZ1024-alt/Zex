@@ -107,7 +107,9 @@ pub(super) fn logo_visual_width(art: &str) -> u16 {
         .unwrap_or(16) as u16
 }
 
-pub(super) fn spinner_frame(tick: u64) -> &'static str {
+/// Braille spinner at the opencode/pi cadence: one frame every 80ms.
+/// `millis` is wall-clock elapsed time.
+pub(super) fn spinner_frame(millis: u64) -> &'static str {
     const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    FRAMES[(tick as usize / 4) % FRAMES.len()]
+    FRAMES[(millis as usize / 80) % FRAMES.len()]
 }

@@ -234,6 +234,7 @@ async fn run_loop(
                 dirty |= app.expire_toast(Instant::now());
                 // Keep the welcome logo shimmer animating.
                 dirty |= app.landing_visible();
+                dirty |= app.tick_animations();
                 if dirty {
                     terminal
                         .draw(|frame| render(frame, &mut app))
@@ -527,6 +528,7 @@ where
             _ = redraw.tick() => {
                 dirty |= app.expire_toast(Instant::now());
                 dirty |= app.busy;
+                dirty |= app.tick_animations();
                 if dirty {
                     terminal
                         .draw(|frame| render(frame, app))
@@ -1406,16 +1408,35 @@ enum ToastTone {
 struct Toast {
     message: String,
     tone: ToastTone,
+    shown_at: Instant,
     expires_at: Instant,
 }
 
 impl Toast {
+    const FADE_IN: Duration = Duration::from_millis(160);
+    const FADE_OUT: Duration = Duration::from_millis(600);
+
     fn new(message: String, tone: ToastTone) -> Self {
+        let now = Instant::now();
         Self {
             message,
             tone,
-            expires_at: Instant::now() + TOAST_DURATION,
+            shown_at: now,
+            expires_at: now + TOAST_DURATION,
         }
+    }
+
+    /// Visibility 0.0..=1.0: fades in on arrival, out before expiry.
+    fn opacity(&self) -> f64 {
+        if anim::frozen() {
+            return 1.0;
+        }
+        let now = Instant::now();
+        let age = now.saturating_duration_since(self.shown_at);
+        let remaining = self.expires_at.saturating_duration_since(now);
+        let fade_in = age.as_secs_f64() / Self::FADE_IN.as_secs_f64();
+        let fade_out = remaining.as_secs_f64() / Self::FADE_OUT.as_secs_f64();
+        fade_in.min(fade_out).clamp(0.0, 1.0)
     }
 
     fn color(&self) -> Color {
@@ -1660,6 +1681,10 @@ struct App {
     max_scroll: usize,
     transcript_page_height: usize,
     follow_output: bool,
+    /// Eased on-screen scroll position; chases `scroll_top` each frame.
+    scroll_visual: f64,
+    /// Composer focus transition: 0.0 = unfocused, 1.0 = focused/busy.
+    focus_blend: f64,
     working_dir: PathBuf,
     git_status: Option<GitStatus>,
     thinking_level: Option<ThinkingLevel>,
@@ -1715,6 +1740,8 @@ impl App {
             max_scroll: 0,
             transcript_page_height: 1,
             follow_output: true,
+            scroll_visual: 0.0,
+            focus_blend: 1.0,
             working_dir: context.working_dir,
             git_status,
             thinking_level: context.thinking_level,
@@ -2228,6 +2255,61 @@ impl App {
     fn scroll_to_bottom(&mut self) {
         self.follow_output = true;
         self.scroll_top = self.max_scroll;
+    }
+
+    /// On-screen scroll position: eased toward `scroll_top` in production,
+    /// snapped in tests so layout assertions stay deterministic.
+    fn visual_scroll(&self) -> usize {
+        if anim::frozen() {
+            self.scroll_top
+        } else {
+            self.scroll_visual.round().max(0.0) as usize
+        }
+    }
+
+    /// Advances continuous motion by one frame; returns true while anything
+    /// is still moving so the caller keeps redrawing.
+    fn tick_animations(&mut self) -> bool {
+        if anim::frozen() {
+            return false;
+        }
+        let mut active = false;
+        // Scroll glide: huge jumps (session restore, jump-to-top) snap.
+        let target = self.scroll_top as f64;
+        let snap_distance = (2 * self.transcript_page_height.max(1)) as f64;
+        let diff = target - self.scroll_visual;
+        if diff.abs() > snap_distance {
+            self.scroll_visual = target;
+        } else if diff.abs() >= 0.5 {
+            self.scroll_visual = anim::chase(self.scroll_visual, target, 0.45);
+            active = true;
+        } else if self.scroll_visual != target {
+            self.scroll_visual = target;
+            active = true;
+        }
+        // Composer focus transition.
+        let focus_target = if self.busy || self.input_focused {
+            1.0
+        } else {
+            0.0
+        };
+        if (self.focus_blend - focus_target).abs() > 0.02 {
+            self.focus_blend = anim::chase(self.focus_blend, focus_target, 0.35);
+            active = true;
+        } else {
+            self.focus_blend = focus_target;
+        }
+        // Keep frames coming while a toast is fading in or out.
+        active |= self.toast_animating();
+        active
+    }
+
+    fn toast_animating(&self) -> bool {
+        self.toast.as_ref().is_some_and(|toast| {
+            let now = Instant::now();
+            now < toast.shown_at + Toast::FADE_IN
+                || now + Toast::FADE_OUT >= toast.expires_at
+        })
     }
 
     fn is_final_answer(&self, index: usize) -> bool {
@@ -3582,6 +3664,7 @@ fn git_output(working_dir: &Path, arguments: &[&str]) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+mod anim;
 mod glyphs;
 mod render;
 

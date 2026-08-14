@@ -1152,6 +1152,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         app.transcript_page_height = 0;
         app.max_scroll = 0;
         app.scroll_top = 0;
+        app.scroll_visual = 0.0;
         return;
     }
     let area = content_area(area);
@@ -1166,6 +1167,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         app.transcript_page_height = area.height as usize;
         app.max_scroll = 0;
         app.scroll_top = 0;
+        app.scroll_visual = 0.0;
         return;
     }
 
@@ -1183,11 +1185,15 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         app.scroll_top = app.scroll_top.min(app.max_scroll);
     }
 
-    let paragraph = paragraph.scroll((app.scroll_top.min(u16::MAX as usize) as u16, 0));
+    // Painted rows and hit regions follow the eased position so mouse
+    // targeting stays aligned with what is on screen mid-glide.
+    let scroll = app.visual_scroll().min(app.max_scroll);
+
+    let paragraph = paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, area);
     for (index, line) in transcript.card_lines {
         let Some(y) = line
-            .checked_sub(app.scroll_top)
+            .checked_sub(scroll)
             .and_then(|line| u16::try_from(line).ok())
             .filter(|line| *line < area.height)
             .map(|line| area.y.saturating_add(line))
@@ -1198,7 +1204,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
     for (index, line) in transcript.output_lines {
         let Some(y) = line
-            .checked_sub(app.scroll_top)
+            .checked_sub(scroll)
             .and_then(|line| u16::try_from(line).ok())
             .filter(|line| *line < area.height)
             .map(|line| area.y.saturating_add(line))
@@ -1211,13 +1217,13 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         );
     }
     for (index, start_line, end_line) in transcript.response_lines {
-        let visible_start = start_line.max(app.scroll_top);
-        let visible_end = end_line.min(app.scroll_top.saturating_add(area.height as usize));
+        let visible_start = start_line.max(scroll);
+        let visible_end = end_line.min(scroll.saturating_add(area.height as usize));
         if visible_start >= visible_end {
             continue;
         }
         let y = area.y.saturating_add(
-            u16::try_from(visible_start.saturating_sub(app.scroll_top)).unwrap_or(u16::MAX),
+            u16::try_from(visible_start.saturating_sub(scroll)).unwrap_or(u16::MAX),
         );
         let height = u16::try_from(visible_end.saturating_sub(visible_start)).unwrap_or(u16::MAX);
         app.register_hit(
@@ -1229,8 +1235,8 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if !app.follow_output && app.max_scroll > 0 {
         let indicator = format!(
             " {}–{} / {} ",
-            app.scroll_top.saturating_add(1),
-            app.scroll_top
+            scroll.saturating_add(1),
+            scroll
                 .saturating_add(app.transcript_page_height)
                 .min(line_count),
             line_count
@@ -1521,7 +1527,14 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn render_hero_box(frame: &mut Frame<'_>, regions: &LandingRegions, app: &mut App) {
-    let border = Style::default().fg(BORDER_ACTIVE);
+    // The hero border breathes on the same 4.6s ambient cycle as opencode's
+    // landing pulse: a whisper of accent rising and falling.
+    let border_color = crate::tui::anim::blend_color(
+        BORDER_ACTIVE,
+        ACCENT_PRIMARY,
+        crate::tui::anim::breath(4600) * 0.28,
+    );
+    let border = Style::default().fg(border_color);
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
@@ -1615,21 +1628,11 @@ fn logo_shimmer_color(base: Color, row: usize, column: usize) -> Color {
     }
     let breath = ((tick * 83) % 5000) as f64 / 5000.0 * std::f64::consts::TAU;
     brightness *= 0.85 + 0.15 * breath.sin().abs();
-    blend_color(
-        blend_color(base, BACKGROUND, 0.45),
-        blend_color(base, TEXT_STRONG, 0.35),
+    crate::tui::anim::blend_color(
+        crate::tui::anim::blend_color(base, BACKGROUND, 0.45),
+        crate::tui::anim::blend_color(base, TEXT_STRONG, 0.35),
         brightness,
     )
-}
-
-/// Linear RGB blend, the single primitive behind all grok-style animation.
-fn blend_color(from: Color, to: Color, t: f64) -> Color {
-    let (Color::Rgb(fr, fg, fb), Color::Rgb(tr, tg, tb)) = (from, to) else {
-        return to;
-    };
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * t).round() as u8;
-    Color::Rgb(lerp(fr, tr), lerp(fg, tg), lerp(fb, tb))
 }
 
 fn render_landing_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1760,7 +1763,10 @@ fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         "Type a message...",
         Style::default().fg(TEXT_FAINT),
     ));
-    paint_composer(frame, area, app, Some(placeholder), false);
+    // Show model/think metadata on the landing composer too, so the active
+    // configuration is visible before the first message (grok/opencode do
+    // the same on their home screens).
+    paint_composer(frame, area, app, Some(placeholder), true);
 }
 
 fn completion_height(app: &App, width: u16) -> u16 {
@@ -2097,6 +2103,22 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
         }
         append_transcript_gap(&mut lines, entry, next);
     }
+    // Breathing stream cursor: a soft block at the tip of the in-progress
+    // assistant reply, blinking on a slow cycle. Frozen (hidden) in tests.
+    if app.busy
+        && matches!(
+            app.transcript.last(),
+            Some(TranscriptEntry::Message {
+                role: MessageRole::Assistant,
+                content,
+            }) if !content.is_empty()
+        )
+        && let Some(cursor) = stream_cursor()
+        && let Some(last) = lines.last_mut()
+    {
+        last.spans.push(Span::raw(" "));
+        last.spans.push(cursor);
+    }
     let line_count = lines.len();
     TranscriptRender {
         text: Text::from(lines),
@@ -2106,6 +2128,16 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
         output_lines,
         response_lines,
     }
+}
+
+/// Blinking block cursor appended to the streaming assistant reply:
+/// visible 620ms, hidden 440ms, in the primary accent. None when frozen.
+fn stream_cursor() -> Option<Span<'static>> {
+    if crate::tui::anim::frozen() {
+        return None;
+    }
+    let phase = crate::tui::anim::clock_millis() % 1060;
+    (phase < 620).then(|| Span::styled("▍", Style::default().fg(ACCENT_PRIMARY)))
 }
 
 fn append_transcript_gap(
@@ -2476,9 +2508,9 @@ fn append_wrapped_message_lines(
         MessageRole::Assistant => 2,
     };
     let styled = inline_markdown_spans(content, content_style);
-    let plain = strip_inline_markdown(content);
-    let segments = wrap_display_words(&plain, width.saturating_sub(rail_width).max(1));
-    if segments.len() == 1 {
+    let wrap_width = width.saturating_sub(rail_width).max(1);
+    let plain_width = UnicodeWidthStr::width(strip_inline_markdown(content).as_str());
+    if plain_width <= wrap_width {
         let rail = message_rail(role, final_answer, first_visual_line);
         let mut row = vec![Span::styled(
             rail,
@@ -2488,16 +2520,140 @@ fn append_wrapped_message_lines(
         lines.push(Line::from(row));
         return;
     }
-    for segment in segments {
+    // Wrapped rows keep bold/code styling: wrap the styled spans directly
+    // instead of re-styling the stripped text with the base style.
+    for segment in wrap_styled_words(&styled, wrap_width) {
         let rail = message_rail(role, final_answer, first_visual_line);
-        lines.push(Line::from(vec![
-            Span::styled(
-                rail,
-                Style::default().fg(message_rail_color(role, final_answer)),
-            ),
-            Span::styled(segment, content_style),
-        ]));
+        let mut row = vec![Span::styled(
+            rail,
+            Style::default().fg(message_rail_color(role, final_answer)),
+        )];
+        row.extend(segment);
+        lines.push(Line::from(row));
     }
+}
+
+/// Word wrap over styled spans with the same semantics as
+/// `wrap_display_words`: whitespace collapses, long words hard-wrap.
+fn wrap_styled_words(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    // Split into styled words; a word may cross a style boundary.
+    let mut words: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current_word: Vec<Span<'static>> = Vec::new();
+    for span in spans {
+        let mut buffer = String::new();
+        for character in span.content.chars() {
+            if character.is_whitespace() {
+                if !buffer.is_empty() {
+                    current_word.push(Span::styled(std::mem::take(&mut buffer), span.style));
+                }
+                if !current_word.is_empty() {
+                    words.push(std::mem::take(&mut current_word));
+                }
+            } else {
+                buffer.push(character);
+            }
+        }
+        if !buffer.is_empty() {
+            current_word.push(Span::styled(buffer, span.style));
+        }
+    }
+    if !current_word.is_empty() {
+        words.push(current_word);
+    }
+
+    let spans_width = |spans: &[Span<'static>]| {
+        spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum::<usize>()
+    };
+    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0;
+    for word in words {
+        let word_width = spans_width(&word);
+        if word_width > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            let mut chunks = hard_wrap_styled(word, width);
+            if let Some(last) = chunks.pop() {
+                lines.extend(chunks);
+                current_width = spans_width(&last);
+                current = last;
+            }
+            continue;
+        }
+        let separator_width = usize::from(!current.is_empty());
+        if current_width + separator_width + word_width > width {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        if !current.is_empty() {
+            current.push(Span::raw(" "));
+            current_width += 1;
+        }
+        current.extend(word);
+        current_width += word_width;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
+    lines
+}
+
+/// Hard wrap a styled word at `width`, mirroring `wrap_display_hard`.
+fn hard_wrap_styled(word: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0;
+    for span in word {
+        let mut buffer = String::new();
+        macro_rules! flush {
+            () => {
+                if !buffer.is_empty() {
+                    current.push(Span::styled(std::mem::take(&mut buffer), span.style));
+                }
+            };
+        }
+        for character in span.content.chars() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if character_width > width {
+                flush!();
+                if !current.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                    current_width = 0;
+                }
+                lines.push(vec![Span::styled(
+                    truncate_display(&character.to_string(), width),
+                    span.style,
+                )]);
+                continue;
+            }
+            if current_width > 0 && current_width + character_width > width {
+                flush!();
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            buffer.push(character);
+            current_width += character_width;
+            if current_width >= width {
+                flush!();
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+        }
+        flush!();
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn strip_inline_markdown(value: &str) -> String {
@@ -2613,7 +2769,11 @@ fn append_thinking_lines(
         },
     };
     let mut header_spans = rail_spans(ACCENT_THINKING);
-    header_spans.push(Span::styled(header, label_style));
+    if status == ThinkingStatus::Active {
+        header_spans.extend(shimmer_word(&header, ACCENT_THINKING));
+    } else {
+        header_spans.push(Span::styled(header, label_style));
+    }
     if status == ThinkingStatus::Done && !thinking.expanded {
         header_spans.push(Span::styled(
             "  (ctrl+e to expand)",
@@ -2648,11 +2808,14 @@ fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn composer_border_color(app: &App) -> Color {
-    if app.busy || app.input_focused {
-        BORDER_ACTIVE
-    } else {
-        BORDER
+    if crate::tui::anim::frozen() {
+        return if app.busy || app.input_focused {
+            BORDER_ACTIVE
+        } else {
+            BORDER
+        };
     }
+    crate::tui::anim::blend_color(BORDER, BORDER_ACTIVE, app.focus_blend)
 }
 
 #[cfg(test)]
@@ -3042,10 +3205,12 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
     if let Some(toast) = &app.toast {
+        let opacity = toast.opacity();
+        let ink = |color: Color| crate::tui::anim::blend_color(BACKGROUND, color, opacity);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("● ", Style::default().fg(toast.color())),
-                Span::styled(toast.message.clone(), Style::default().fg(TEXT)),
+                Span::styled("● ", Style::default().fg(ink(toast.color()))),
+                Span::styled(toast.message.clone(), Style::default().fg(ink(TEXT))),
             ])),
             area,
         );
@@ -3145,11 +3310,11 @@ fn render_turn_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
-    let tick = app
+    let millis = app
         .turn_started
-        .map(|started| started.elapsed().as_millis() as u64 / 33)
+        .map(|started| started.elapsed().as_millis() as u64)
         .unwrap_or(0);
-    let spinner = crate::tui::glyphs::spinner_frame(tick);
+    let spinner = crate::tui::glyphs::spinner_frame(millis);
     // Grok-style activity coloring: tools green, thinking purple.
     let (activity, accent) = match app.status {
         Status::Cancelling => ("stopping", BAD),
@@ -3175,15 +3340,30 @@ fn render_turn_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .saturating_sub(UnicodeWidthStr::width(detail.as_str()))
         .saturating_sub(2)
         .saturating_sub(UnicodeWidthStr::width(right));
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(left, Style::default().fg(accent)),
-            Span::styled(format!("  {detail}"), Style::default().fg(TEXT_FAINT)),
-            Span::raw(" ".repeat(spacer)),
-            Span::styled(right, Style::default().fg(TEXT_FAINT)),
-        ])),
-        area,
-    );
+    let mut spans = vec![Span::styled(
+        format!("{spinner} "),
+        Style::default().fg(accent),
+    )];
+    spans.extend(shimmer_word(activity, accent));
+    spans.push(Span::styled(format!("  {detail}"), Style::default().fg(TEXT_FAINT)));
+    spans.push(Span::raw(" ".repeat(spacer)));
+    spans.push(Span::styled(right, Style::default().fg(TEXT_FAINT)));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Grok-style status shimmer: a raised-cosine sheen sweeps the activity word,
+/// lifting letters from the accent tone toward bright ink as it passes.
+/// Frozen flat in tests.
+fn shimmer_word(word: &str, accent: Color) -> Vec<Span<'static>> {
+    let span = word.chars().count() as f64;
+    word.chars()
+        .enumerate()
+        .map(|(index, character)| {
+            let glow = crate::tui::anim::sheen(index as f64, span, 2400, 3.0);
+            let color = crate::tui::anim::blend_color(accent, TEXT_STRONG, glow * 0.85);
+            Span::styled(character.to_string(), Style::default().fg(color))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

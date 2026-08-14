@@ -172,18 +172,20 @@ zex
 
 TUI 占满 terminal 工作区，但不铺自定义整屏背景。它保持单列时间流，不使用左侧对话、右侧工具的仪表盘分栏：
 
-1. 主区：可滚动时间流，按发生顺序显示 user/assistant 文本、思考卡片和 tool 卡片。短时间流靠近输入区向上生长，长时间流占满主区并正常滚动；当前 core 未生产 planning/todo 事件，因此不会为不存在的数据预留面板。
+1. 主区：可滚动时间流，按发生顺序显示 user/assistant 文本、思考卡片和 tool 卡片。短时间流靠近输入区向上生长，长时间流占满主区并正常滚动；当前 core 未生产 planning/todo 事件，因此不会为不存在的数据预留面板。滚轮与翻页采用缓动平滑滚动，鼠标命中区域跟随视觉位置。
 2. 斜杠补全：输入 `/` 时从输入框上方弹出，不打断 statusline，也不占永久分区。
-3. 固定底栏：上方是一条不换行的高密度 statusline，按 `ZEX → model → think → cwd → git → session/commit` 排列左侧上下文，右侧显示真实 Provider 输出速率、字符上下文占用与 `idle/thinking/tool` 运行态。空间不足时优先移除 session、折叠路径与 git，再移除速率；model、think 与 context 最后保留。
-4. 输入区位于 statusline 下方，由低亮度 `┌─┐ / │ │ / └─┘` 框架夹住。正文和光标保持最高可读层级，占位符明显更淡；多行输入会把框架增高到最多五行，statusline 始终保持单行。
+3. 顶栏单行显示 git 分支、脏文件数与折叠后的 cwd；turn 运行中在主区下方出现一条状态行：80ms 节奏的 braille spinner、带扫光的活动词（thinking 紫 / working 绿 / error 红）、工具计数与耗时，右侧 `esc interrupt` 提示。
+4. 固定底栏：圆角输入框顶边内嵌会话标题，底边内嵌 `model · think` 与真实 Provider 输出速率、上下文占用百分比；再往下是一条不换行的快捷键提示行，toast 在同一行淡入淡出（约 4 秒）。多行输入把框架增高到最多五行。输入框边框在聚焦/忙碌与空闲之间做 ~120ms 颜色过渡。
 
-根区域、空状态、用户消息和 assistant 正文都使用终端原生背景；近黑 surface 只用于代码块、展开的 tool 输出和斜杠补全。界面使用冷中性正文、明显更暗的次要文本、单一 Zex 钢青 accent，以及低饱和 success/error 色。用户消息使用轻量 `›` 引导，assistant 正文使用低亮度 `│` 连成单一时间流；两者都不显示 `YOU` / `ASSISTANT` 标签。基础 Markdown 标题、列表、引用和代码围栏形成清楚但克制的层级。
+根区域、空状态、用户消息和 assistant 正文都使用终端原生背景；近黑 surface 只用于用户消息带、代码块、展开的 tool 输出和斜杠补全。界面使用 Ink Indigo 调色板：冷近黑底色、四级灰阶正文、柔和蓝主 accent 与紫色次 accent，低饱和 success/error 色，同一屏幕至多三个色相。用户消息使用 `❯` 引导加全宽 surface 带，assistant 正文与卡片使用低亮度 `┃` 左轨连成单一时间流；两者都不显示 `YOU` / `ASSISTANT` 标签。基础 Markdown 标题、列表、引用和代码围栏形成清楚但克制的层级。
+
+动效语言集中在"有事发生"的时刻：assistant 流式回复末尾跟随一枚慢速呼吸的 `▍` 光标，运行中的 tool 卡头部带实时 spinner，landing 页 ZEX 字标有 4 秒对角扫光叠加 5 秒呼吸脉冲、hero 边框以 4.6 秒周期向主 accent 呼吸。工作区空闲时不运行任何常驻动画。所有环境动效由 wall clock 在渲染时推导，连续状态（滚动、焦点、toast 透明度）每帧指数趋近目标。
 
 思考内容优先读取 Provider 的 `reasoning_content`、`reasoning`、`reasoning_details` / `thinking_blocks` 或 Responses API reasoning summary；缺少显式字段时再解析完整的 `<think>...</think>`。思考与 assistant 最终回答、tool call 分开保存，并在单一时间流中显示为默认折叠卡片。`/thinking show|hide` 控制卡片可见性并持久化，隐藏期间数据仍保留，因此再次显示或恢复会话时可重新渲染；该开关独立于 `/think` 的模型思考强度。
 
 Provider 与模型都可声明 `[thinking]`（`min_level`、`max_level`、可选精确 `supported`、`mode = "effort"`）和 `[compat]`（`supports_reasoning_effort`、`supports_interleaved_thinking`、`reasoning_effort_map`）。合并优先级为安全默认 → models.dev → Provider 手动配置 → 模型手动配置。缺失能力时使用安全范围 `off/low/medium/high`，因此 `xhigh` 和 `max` 会降级到 `high`，不会原样发送未知值。工具调用轮次仅在目标模型声明支持 interleaved thinking 时回传 reasoning；最终回答及不支持该能力的模型历史会在请求层剥离 reasoning，但会话中的可查看内容仍保留。
 
-思考和 tool 卡片共用 Zex 摘要语法。思考卡为 `think · level · active|done · summary`；tool 卡为 `tool · subject · result · duration`，其中 `bash` 显示 `exit N`，`read` 显示行数，`grep` / `glob` 显示匹配数。默认折叠态严格占一行；点击标题行或选中后按 Enter / Space 可展开或折叠。`Ctrl-O` 批量展开或折叠全部卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 只在状态变化、输入、新事件或 toast 过期时按固定帧率差分重绘。
+思考和 tool 卡片共用 Zex 摘要语法。思考卡为 `think · level · active|done · summary`；tool 卡为 `tool · subject · result · duration`，其中 `bash` 显示 `exit N`，`read` 显示行数，`grep` / `glob` 显示匹配数。默认折叠态严格占一行；点击标题行或选中后按 Enter / Space 可展开或折叠。`Ctrl-O` 批量展开或折叠全部卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 按固定帧率差分重绘：状态变化、输入与新事件立即触发，进行中的动效（滚动缓动、spinner、扫光、toast 淡化）在活动期间逐帧推进，完全静止时不产生重绘。
 
 | 快捷键 | idle 模式 | turn 运行中 |
 | --- | --- | --- |

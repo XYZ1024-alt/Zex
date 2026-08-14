@@ -5066,3 +5066,34 @@ fn grok_style_visual_regression() {
     assert!(screen.contains("thinking"));
     assert!(screen.contains("Thought for 2s"));
 }
+
+#[test]
+fn wrapped_message_rows_keep_inline_markdown_styling() {
+    let mut app = app();
+    app.transcript.push(TranscriptEntry::Message {
+        role: MessageRole::Assistant,
+        content: format!(
+            "{} **marker** {}",
+            "plain ".repeat(20),
+            "tail ".repeat(20)
+        ),
+    });
+    let backend = TestBackend::new(60, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let screen = format!("{}", terminal.backend());
+
+    let row = screen
+        .lines()
+        .position(|line| line.contains("marker"))
+        .expect("bold word should render") as u16;
+    let column = screen
+        .lines()
+        .nth(row as usize)
+        .unwrap()
+        .find("marker")
+        .unwrap() as u16;
+    let style = style_at(&terminal, column, row);
+    assert_eq!(style.fg, Some(super::TEXT_STRONG));
+    assert!(style.add_modifier.contains(ratatui::style::Modifier::BOLD));
+}
