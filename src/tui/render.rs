@@ -3072,7 +3072,7 @@ fn input_metadata_line(app: &App, width: usize) -> Line<'static> {
     };
     let context = format!(
         "{:.0}%",
-        app.context_chars as f64 * 100.0 / app.max_context_chars.max(1) as f64
+        app.context_tokens as f64 * 100.0 / app.context_budget.max(1) as f64
     );
     let run = if app.landing_visible() || app.busy {
         String::new()

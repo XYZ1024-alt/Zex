@@ -14,8 +14,12 @@ use crate::{
 
 const SYSTEM_PROMPT: &str = "You are Zex, a minimal AI agent core. Be concise and accurate. Use grep to search file contents, glob to find files, and bash only for other system commands. Use read, write, and edit for file operations. Use tool results to finish the task.";
 const AUTO_COMPACT_PERCENT: usize = 85;
+const OUTPUT_RESERVE_TOKENS: u64 = 8_192;
 const SUMMARY_ITEM_CHARS: usize = 480;
 const TOOL_SUMMARY_EDGE_CHARS: usize = 180;
+const ANCHOR_MAX_CHARS: usize = 4_000;
+const PRUNE_KEEP_TOOL_RESULTS: usize = 4;
+const PRUNE_MIN_CHARS: usize = 2_000;
 
 pub struct Agent<P> {
     provider: P,
@@ -25,28 +29,38 @@ pub struct Agent<P> {
     events: EventSender,
     turn_timeout: Duration,
     max_turns: usize,
-    max_context_chars: usize,
+    fallback_context_tokens: usize,
     compact_keep_turns: usize,
     thinking_level: ThinkingLevel,
+    /// Server-reported input tokens for the message prefix sent with the last
+    /// completion; messages appended afterwards are estimated locally.
+    usage_baseline: Option<UsageBaseline>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsageBaseline {
+    message_len: usize,
+    input_tokens: usize,
 }
 
 pub struct AgentOptions {
     pub model: String,
     pub turn_timeout: Duration,
     pub max_turns: usize,
-    pub max_context_chars: usize,
+    pub max_context_tokens: usize,
     pub compact_keep_turns: usize,
     pub thinking_level: ThinkingLevel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactStats {
-    pub before_chars: usize,
-    pub after_chars: usize,
-    pub freed_chars: usize,
+    pub before_tokens: usize,
+    pub after_tokens: usize,
+    pub freed_tokens: usize,
     pub kept_turns: usize,
     pub summarized_turns: usize,
     pub summarized_tool_outputs: usize,
+    pub pruned_tool_outputs: usize,
 }
 
 impl<P> Agent<P>
@@ -68,9 +82,10 @@ where
             events,
             turn_timeout: options.turn_timeout,
             max_turns: options.max_turns,
-            max_context_chars: options.max_context_chars,
+            fallback_context_tokens: options.max_context_tokens,
             compact_keep_turns: options.compact_keep_turns,
             thinking_level: options.thinking_level,
+            usage_baseline: None,
         }
     }
 
@@ -106,8 +121,22 @@ where
         self.thinking_level = thinking_level;
     }
 
-    pub fn max_context_chars(&self) -> usize {
-        self.max_context_chars
+    /// Effective token budget for the active model: the model's context
+    /// window minus an output reserve, falling back to the configured
+    /// `max_context_tokens` when no limit is known.
+    pub fn context_budget(&self) -> usize {
+        self.provider
+            .context_limit(&self.model)
+            .and_then(|limit| {
+                let reserve = limit
+                    .output
+                    .unwrap_or(OUTPUT_RESERVE_TOKENS)
+                    .min(OUTPUT_RESERVE_TOKENS)
+                    .min(limit.context / 4);
+                usize::try_from(limit.context.saturating_sub(reserve)).ok()
+            })
+            .filter(|budget| *budget > 0)
+            .unwrap_or(self.fallback_context_tokens)
     }
 
     pub fn default_tool_timeout(&self) -> Duration {
@@ -116,26 +145,42 @@ where
 
     pub fn clear(&mut self) {
         self.messages = fresh_messages();
+        self.usage_baseline = None;
     }
 
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
         self.messages = normalize_messages(messages);
+        self.usage_baseline = None;
         self.compact_if_needed();
     }
 
-    pub fn context_chars(&self) -> usize {
-        context_chars(&self.messages)
+    /// Used context tokens: the server-reported input tokens of the last
+    /// completion (which also covers the system prompt, tool definitions, and
+    /// provider-side overhead) plus a local estimate for messages appended
+    /// since. Falls back to a purely local estimate before the first
+    /// completion and after compaction rewrote the history.
+    pub fn context_tokens(&self) -> usize {
+        match self.usage_baseline {
+            Some(baseline) if baseline.message_len <= self.messages.len() => {
+                baseline.input_tokens + context_tokens(&self.messages[baseline.message_len..])
+            }
+            _ => context_tokens(&self.messages),
+        }
     }
 
     pub fn compact(&mut self) -> CompactStats {
+        let budget = self.context_budget();
         let mut stats = compact_messages(&mut self.messages, self.compact_keep_turns);
-        while stats.after_chars > self.max_context_chars && stats.kept_turns > 1 {
+        while stats.after_tokens > budget && stats.kept_turns > 1 {
             let next = compact_messages(&mut self.messages, stats.kept_turns - 1);
-            stats.after_chars = next.after_chars;
-            stats.freed_chars = stats.before_chars.saturating_sub(next.after_chars);
+            stats.after_tokens = next.after_tokens;
+            stats.freed_tokens = stats.before_tokens.saturating_sub(next.after_tokens);
             stats.kept_turns = next.kept_turns;
             stats.summarized_turns += 1;
             stats.summarized_tool_outputs += next.summarized_tool_outputs;
+        }
+        if stats.freed_tokens > 0 {
+            self.usage_baseline = None;
         }
         stats
     }
@@ -237,6 +282,7 @@ where
 
         for _ in 0..self.max_turns {
             self.compact_if_needed();
+            let sent_len = self.messages.len();
             let assistant = match self
                 .provider
                 .complete(
@@ -256,6 +302,17 @@ where
                     return Err(error);
                 }
             };
+
+            if let Some(input_tokens) = assistant
+                .usage
+                .and_then(|usage| usage.input_tokens)
+                .and_then(|tokens| usize::try_from(tokens).ok())
+            {
+                self.usage_baseline = Some(UsageBaseline {
+                    message_len: sent_len,
+                    input_tokens,
+                });
+            }
 
             self.messages.push(Message::Assistant {
                 content: assistant.content.clone(),
@@ -324,12 +381,35 @@ where
     }
 
     fn compact_if_needed(&mut self) -> Option<CompactStats> {
-        let threshold = self.max_context_chars.saturating_mul(AUTO_COMPACT_PERCENT) / 100;
-        if self.context_chars() < threshold {
+        let threshold = self.context_budget().saturating_mul(AUTO_COMPACT_PERCENT) / 100;
+        if self.context_tokens() < threshold {
             return None;
         }
-        let stats = self.compact();
-        if stats.freed_chars > 0 {
+        let before_tokens = self.context_tokens();
+        let pruned_tool_outputs = prune_tool_outputs(&mut self.messages);
+        if pruned_tool_outputs > 0 {
+            // Pruning rewrote prefix messages, so the server baseline no
+            // longer describes the current history.
+            self.usage_baseline = None;
+        }
+        let mut stats = if self.context_tokens() >= threshold {
+            self.compact()
+        } else {
+            let after_tokens = self.context_tokens();
+            CompactStats {
+                before_tokens,
+                after_tokens,
+                freed_tokens: before_tokens.saturating_sub(after_tokens),
+                kept_turns: 0,
+                summarized_turns: 0,
+                summarized_tool_outputs: 0,
+                pruned_tool_outputs: 0,
+            }
+        };
+        stats.before_tokens = before_tokens;
+        stats.freed_tokens = before_tokens.saturating_sub(stats.after_tokens);
+        stats.pruned_tool_outputs = pruned_tool_outputs;
+        if stats.freed_tokens > 0 {
             let _ = self.events.send(AgentEvent::ContextCompacted {
                 stats: stats.clone(),
             });
@@ -365,12 +445,35 @@ fn normalize_messages(messages: Vec<Message>) -> Vec<Message> {
     }
 }
 
-fn context_chars(messages: &[Message]) -> usize {
-    messages.iter().map(Message::character_count).sum()
+fn context_tokens(messages: &[Message]) -> usize {
+    messages.iter().map(Message::token_estimate).sum()
+}
+
+/// Replaces older, large tool outputs with a placeholder, keeping the most
+/// recent `PRUNE_KEEP_TOOL_RESULTS` tool results intact. Returns how many
+/// tool outputs were pruned.
+fn prune_tool_outputs(messages: &mut [Message]) -> usize {
+    let tool_indices = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| matches!(message, Message::Tool { .. }).then_some(index))
+        .collect::<Vec<_>>();
+    let prunable = tool_indices.len().saturating_sub(PRUNE_KEEP_TOOL_RESULTS);
+    let mut pruned = 0;
+    for &index in &tool_indices[..prunable] {
+        if let Message::Tool { content, .. } = &mut messages[index] {
+            let chars = content.chars().count();
+            if chars > PRUNE_MIN_CHARS && !content.starts_with("[tool output cleared") {
+                *content = format!("[tool output cleared to free context: {chars} chars]");
+                pruned += 1;
+            }
+        }
+    }
+    pruned
 }
 
 fn compact_messages(messages: &mut Vec<Message>, keep_turns: usize) -> CompactStats {
-    let before_chars = context_chars(messages);
+    let before_tokens = context_tokens(messages);
     let user_indices = messages
         .iter()
         .enumerate()
@@ -385,18 +488,25 @@ fn compact_messages(messages: &mut Vec<Message>, keep_turns: usize) -> CompactSt
     let summarized_turns = user_indices.len().saturating_sub(kept_turns);
     if summarized_turns == 0 {
         return CompactStats {
-            before_chars,
-            after_chars: before_chars,
-            freed_chars: 0,
+            before_tokens,
+            after_tokens: before_tokens,
+            freed_tokens: 0,
             kept_turns,
             summarized_turns: 0,
             summarized_tool_outputs: 0,
+            pruned_tool_outputs: 0,
         };
     }
 
+    let anchor_index = user_indices[0];
     let keep_start = user_indices[summarized_turns];
     let mut tool_names = std::collections::HashMap::new();
     let mut summary_lines = Vec::new();
+    // Keep the original task statement visible across compactions instead of
+    // reducing it to a summary line.
+    if let Message::User { content } = &messages[anchor_index] {
+        summary_lines.push(format!("Original request:\n{}", anchor_text(content)));
+    }
     if existing_summary && let Message::System { content } = &messages[1] {
         let prior_body = content
             .split_once('\n')
@@ -405,7 +515,8 @@ fn compact_messages(messages: &mut Vec<Message>, keep_turns: usize) -> CompactSt
         summary_lines.push(prior_body.to_owned());
     }
     let mut summarized_tool_outputs = 0usize;
-    for message in &messages[1..keep_start] {
+    for (index, message) in messages[1..keep_start].iter().enumerate() {
+        let index = index + 1;
         match message {
             Message::System { content }
                 if !content.starts_with("[Compacted earlier conversation:") =>
@@ -413,9 +524,10 @@ fn compact_messages(messages: &mut Vec<Message>, keep_turns: usize) -> CompactSt
                 summary_lines.push(format!("Prior context: {}", summarize_text(content)));
             }
             Message::System { .. } => {}
-            Message::User { content } => {
+            Message::User { content } if index != anchor_index => {
                 summary_lines.push(format!("User: {}", summarize_text(content)));
             }
+            Message::User { .. } => {}
             Message::Assistant {
                 content,
                 thinking,
@@ -471,14 +583,15 @@ fn compact_messages(messages: &mut Vec<Message>, keep_turns: usize) -> CompactSt
     compacted.extend(messages[keep_start..].iter().cloned());
     *messages = compacted;
 
-    let after_chars = context_chars(messages);
+    let after_tokens = context_tokens(messages);
     CompactStats {
-        before_chars,
-        after_chars,
-        freed_chars: before_chars.saturating_sub(after_chars),
+        before_tokens,
+        after_tokens,
+        freed_tokens: before_tokens.saturating_sub(after_tokens),
         kept_turns,
         summarized_turns,
         summarized_tool_outputs,
+        pruned_tool_outputs: 0,
     }
 }
 
@@ -491,6 +604,10 @@ fn prior_summary_turns(messages: &[Message]) -> usize {
         .and_then(|content| content.split_once(" turn(s)]"))
         .and_then(|(turns, _)| turns.parse().ok())
         .unwrap_or(0)
+}
+
+fn anchor_text(content: &str) -> String {
+    truncate_middle(content.trim(), ANCHOR_MAX_CHARS)
 }
 
 fn summarize_text(content: &str) -> String {

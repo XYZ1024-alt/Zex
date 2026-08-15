@@ -339,6 +339,7 @@ mod execution_tests {
                     thinking: None,
                     tool_calls: Vec::new(),
                     provider_state: None,
+                    usage: None,
                 }))
         }
     }
@@ -368,7 +369,7 @@ mod execution_tests {
                 model: "model-a".to_owned(),
                 turn_timeout: Duration::from_secs(1),
                 max_turns: 1,
-                max_context_chars: 120_000,
+                max_context_tokens: 120_000,
                 compact_keep_turns: 1,
                 thinking_level: crate::provider::ThinkingLevel::Medium,
             },
@@ -676,7 +677,7 @@ mod execution_tests {
                 content: "recent task".to_owned(),
             },
         ]);
-        let before = agent.context_chars();
+        let before = agent.context_tokens();
         let mut session_id = None;
 
         let result = execute(
@@ -695,8 +696,8 @@ mod execution_tests {
         };
         assert!(message.contains("freed approximately"));
         assert!(message.contains(&before.to_string()));
-        assert!(message.contains(&agent.context_chars().to_string()));
-        assert!(agent.context_chars() < before);
+        assert!(message.contains(&agent.context_tokens().to_string()));
+        assert!(agent.context_tokens() < before);
         let _ = tokio::fs::remove_dir_all(directory).await;
     }
 
@@ -758,17 +759,17 @@ mod execution_tests {
 }
 
 fn compact_feedback(stats: &CompactStats) -> String {
-    if stats.freed_chars == 0 {
+    if stats.freed_tokens == 0 {
         return format!(
-            "Context already compact: {} chars, {} recent turn(s) kept.",
-            stats.after_chars, stats.kept_turns
+            "Context already compact: {} tokens, {} recent turn(s) kept.",
+            stats.after_tokens, stats.kept_turns
         );
     }
     format!(
-        "Compacted context: freed approximately {} chars ({} → {}); kept {} recent turn(s), summarized {} older turn(s) and {} tool output(s).",
-        stats.freed_chars,
-        stats.before_chars,
-        stats.after_chars,
+        "Compacted context: freed approximately {} tokens ({} → {}); kept {} recent turn(s), summarized {} older turn(s) and {} tool output(s).",
+        stats.freed_tokens,
+        stats.before_tokens,
+        stats.after_tokens,
         stats.kept_turns,
         stats.summarized_turns,
         stats.summarized_tool_outputs

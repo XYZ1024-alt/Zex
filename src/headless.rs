@@ -34,7 +34,7 @@ where
         Some(command) => {
             let result = execute(command, agent, session_store, session_id, working_dir).await?;
             if result.effect == CommandEffect::ReplaceView {
-                println!("[context] {} chars", agent.context_chars());
+                println!("[context] {} tokens", agent.context_tokens());
             }
             print_command_output(&result.output)?;
             Ok(())
@@ -86,7 +86,7 @@ where
                 match execute(command, agent, session_store, session_id, working_dir).await {
                     Ok(result) => {
                         if result.effect == CommandEffect::ReplaceView {
-                            println!("[context] {} chars", agent.context_chars());
+                            println!("[context] {} tokens", agent.context_tokens());
                         }
                         print_command_output(&result.output)?;
                     }
@@ -188,8 +188,8 @@ fn print_event(event: AgentEvent) -> Result<()> {
         }
         AgentEvent::Error { message } => eprintln!("\nZex error: {message}"),
         AgentEvent::ContextCompacted { stats } => eprintln!(
-            "\n[compact] freed approximately {} chars; kept {} recent turn(s)",
-            stats.freed_chars, stats.kept_turns
+            "\n[compact] freed approximately {} tokens; kept {} recent turn(s)",
+            stats.freed_tokens, stats.kept_turns
         ),
         AgentEvent::ProviderUsage { .. } => {}
         AgentEvent::TurnCancelled => eprintln!("\n[interrupted]"),

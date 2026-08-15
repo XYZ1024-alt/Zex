@@ -9,8 +9,8 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::{
-    ModelsDevCatalog, ModelsDevLoad, ModelsDevProviderAlias, OpenAiApi, ThinkingCapabilities,
-    ThinkingCompat, ThinkingConfig, ThinkingLevel,
+    ModelLimit, ModelsDevCatalog, ModelsDevLoad, ModelsDevProviderAlias, OpenAiApi,
+    ThinkingCapabilities, ThinkingCompat, ThinkingConfig, ThinkingLevel,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -18,7 +18,7 @@ const DEFAULT_TOOL_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_AGENT_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_MAX_TURNS: usize = 12;
 const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 32_000;
-const DEFAULT_MAX_CONTEXT_CHARS: usize = 120_000;
+const DEFAULT_MAX_CONTEXT_TOKENS: usize = 128_000;
 const DEFAULT_COMPACT_KEEP_TURNS: usize = 6;
 const PROJECT_CONFIG_PATH: &str = ".zex/config.toml";
 
@@ -74,6 +74,8 @@ pub struct ModelConfig {
     pub thinking: Option<ThinkingConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<ThinkingCompat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +155,20 @@ impl ProviderCatalog {
         self.model(target)
             .map(|(provider, model)| self.resolved_thinking(provider, model))
             .unwrap_or_default()
+    }
+
+    pub fn context_limit(&self, target: &ModelRef) -> Option<ModelLimit> {
+        let (provider, model) = self.model(target)?;
+        if let Some(context) = model.context_window {
+            return Some(ModelLimit {
+                context,
+                output: None,
+            });
+        }
+        self.models_dev.limits(&provider.id, &model.id).or_else(|| {
+            self.matched_models_dev_provider(provider)
+                .and_then(|provider_id| self.models_dev.limits(provider_id, &model.id))
+        })
     }
 
     fn resolved_thinking(
@@ -332,7 +348,7 @@ pub struct Config {
     pub agent_timeout: Duration,
     pub max_turns: usize,
     pub max_tool_output_chars: usize,
-    pub max_context_chars: usize,
+    pub max_context_tokens: usize,
     pub compact_keep_turns: usize,
     pub default_thinking_level: ThinkingLevel,
     pub hide_thinking_block: bool,
@@ -516,6 +532,7 @@ impl Config {
                     id: model.clone(),
                     thinking: None,
                     compat: None,
+                    context_window: None,
                 }],
             });
             providers.active_model = Some(ModelRef {
@@ -573,12 +590,13 @@ impl Config {
                     DEFAULT_MAX_TOOL_OUTPUT_CHARS,
                 )?,
             )?,
-            max_context_chars: positive(
-                "max_context_chars",
-                env_or_file(
+            max_context_tokens: positive(
+                "max_context_tokens",
+                env_or_file_legacy(
+                    "ZEX_MAX_CONTEXT_TOKENS",
                     "ZEX_MAX_CONTEXT_CHARS",
-                    file.max_context_chars,
-                    DEFAULT_MAX_CONTEXT_CHARS,
+                    file.max_context_tokens,
+                    DEFAULT_MAX_CONTEXT_TOKENS,
                 )?,
             )?,
             compact_keep_turns: positive(
@@ -628,7 +646,8 @@ struct FileConfig {
     tool_timeout_seconds: Option<u64>,
     agent_timeout_seconds: Option<u64>,
     max_tool_output_chars: Option<usize>,
-    max_context_chars: Option<usize>,
+    #[serde(alias = "max_context_chars")]
+    max_context_tokens: Option<usize>,
     compact_keep_turns: Option<usize>,
     default_thinking_level: Option<ThinkingLevel>,
     hide_thinking_block: Option<bool>,
@@ -654,7 +673,7 @@ impl FileConfig {
             tool_timeout_seconds: project.tool_timeout_seconds.or(self.tool_timeout_seconds),
             agent_timeout_seconds: project.agent_timeout_seconds.or(self.agent_timeout_seconds),
             max_tool_output_chars: project.max_tool_output_chars.or(self.max_tool_output_chars),
-            max_context_chars: project.max_context_chars.or(self.max_context_chars),
+            max_context_tokens: project.max_context_tokens.or(self.max_context_tokens),
             compact_keep_turns: project.compact_keep_turns.or(self.compact_keep_turns),
             default_thinking_level: project
                 .default_thinking_level
@@ -873,6 +892,23 @@ fn positive_u64(name: &str, value: u64) -> Result<u64> {
         bail!("{name} must be greater than zero");
     }
     Ok(value)
+}
+
+fn env_or_file_legacy<T>(
+    name: &str,
+    legacy_name: &str,
+    file_value: Option<T>,
+    default: T,
+) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    if matches!(env::var(name), Err(env::VarError::NotPresent)) {
+        env_or_file(legacy_name, file_value, default)
+    } else {
+        env_or_file(name, file_value, default)
+    }
 }
 
 fn env_or_file<T>(name: &str, file_value: Option<T>, default: T) -> Result<T>

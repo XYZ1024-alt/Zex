@@ -209,8 +209,8 @@ async fn run_loop(
             working_dir: context.working_dir.to_path_buf(),
             thinking_level: Some(agent.thinking_level()),
             thinking_preference: agent.thinking_preference(),
-            context_chars: agent.context_chars(),
-            max_context_chars: agent.max_context_chars(),
+            context_tokens: agent.context_tokens(),
+            context_budget: agent.context_budget(),
             default_tool_timeout: agent.default_tool_timeout(),
             show_thinking: !context.hide_thinking_block,
             providers: context.providers.clone(),
@@ -1644,8 +1644,8 @@ struct AppContext {
     working_dir: PathBuf,
     thinking_level: Option<ThinkingLevel>,
     thinking_preference: ThinkingLevel,
-    context_chars: usize,
-    max_context_chars: usize,
+    context_tokens: usize,
+    context_budget: usize,
     default_tool_timeout: Duration,
     show_thinking: bool,
     providers: ProviderCatalog,
@@ -1683,8 +1683,8 @@ struct App {
     git_status: Option<GitStatus>,
     thinking_level: Option<ThinkingLevel>,
     thinking_preference: ThinkingLevel,
-    context_chars: usize,
-    max_context_chars: usize,
+    context_tokens: usize,
+    context_budget: usize,
     tokens_per_second: Option<f64>,
     default_tool_timeout: Duration,
     show_thinking: bool,
@@ -1740,8 +1740,8 @@ impl App {
             git_status,
             thinking_level: context.thinking_level,
             thinking_preference: context.thinking_preference,
-            context_chars: context.context_chars,
-            max_context_chars: context.max_context_chars,
+            context_tokens: context.context_tokens,
+            context_budget: context.context_budget,
             tokens_per_second: None,
             default_tool_timeout: context.default_tool_timeout,
             show_thinking: context.show_thinking,
@@ -2023,10 +2023,15 @@ impl App {
                 self.status = Status::Error;
             }
             AgentEvent::ContextCompacted { stats } => {
+                let pruned = if stats.pruned_tool_outputs > 0 {
+                    format!(" · {} tool outputs pruned", stats.pruned_tool_outputs)
+                } else {
+                    String::new()
+                };
                 self.show_toast(
                     format!(
-                        "Context compacted · −{} chars · {} recent turns kept",
-                        stats.freed_chars, stats.kept_turns
+                        "Context compacted · −{} tokens · {} recent turns kept{pruned}",
+                        stats.freed_tokens, stats.kept_turns
                     ),
                     ToastTone::Neutral,
                 );
@@ -2142,8 +2147,8 @@ impl App {
                 working_dir: self.working_dir.clone(),
                 thinking_level: self.thinking_level,
                 thinking_preference: self.thinking_preference,
-                context_chars: self.context_chars,
-                max_context_chars: self.max_context_chars,
+                context_tokens: self.context_tokens,
+                context_budget: self.context_budget,
                 default_tool_timeout: self.default_tool_timeout,
                 show_thinking: self.show_thinking,
                 providers: self.providers.clone(),
@@ -2609,8 +2614,8 @@ impl App {
         self.session_id = session_id.map(str::to_owned);
         self.thinking_level = Some(agent.thinking_level());
         self.thinking_preference = agent.thinking_preference();
-        self.context_chars = agent.context_chars();
-        self.max_context_chars = agent.max_context_chars();
+        self.context_tokens = agent.context_tokens();
+        self.context_budget = agent.context_budget();
     }
 
     fn open_session_picker(&mut self, sessions: Vec<SessionSummary>) {
@@ -3269,6 +3274,7 @@ impl App {
                 id: model_id,
                 thinking: None,
                 compat: None,
+                context_window: None,
             })
             .collect::<Vec<_>>();
         let imported_count = imported.len();
@@ -3323,6 +3329,7 @@ impl App {
                     display_name: format!("Model {number}"),
                     thinking: None,
                     compat: None,
+                    context_window: None,
                 });
                 let model_selected = provider.models.len() - 1;
                 let model_id = provider.models[model_selected].id.clone();

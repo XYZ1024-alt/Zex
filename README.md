@@ -41,7 +41,7 @@ max_turns = 12
 tool_timeout_seconds = 60
 agent_timeout_seconds = 600
 max_tool_output_chars = 32000
-max_context_chars = 120000
+max_context_tokens = 128000
 compact_keep_turns = 6
 default_thinking_level = "medium"
 hide_thinking_block = false
@@ -84,8 +84,8 @@ max = "max"
 | `max_turns` | `12` | 单轮最大 Provider 调用次数 |
 | `tool_timeout_seconds` | `60` | 所有内置工具的默认单次超时；每次调用可用 `timeout_seconds` 覆盖 |
 | `agent_timeout_seconds` | `600` | 单轮 Agent 总超时 |
-| `max_tool_output_chars` | `32000` | 所有内置工具返回内容的统一字符上限 |
-| `max_context_chars` | `120000` | 上下文字符预算近似值；达到 85% 时自动 compact |
+| `max_tool_output_chars` | `32000` | 所有内置工具返回内容的统一字符上限；超限时保留头尾 |
+| `max_context_tokens` | `128000` | 上下文 token 预算兜底值；模型窗口已知（models.dev 或模型的 `context_window` 覆盖）时优先使用模型窗口并预留输出空间，达到 85% 时自动 compact。旧键 `max_context_chars` 仍被接受 |
 | `compact_keep_turns` | `6` | compact 时完整保留的最近用户轮次数 |
 | `default_thinking_level` | `medium` | 新会话默认思考强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
 | `hide_thinking_block` | `false` | 是否隐藏 TUI 中默认折叠的思考卡片；隐藏不删除会话数据，也不影响模型实际思考 |
@@ -126,7 +126,7 @@ Zex 启动时从 `https://models.dev/api.json` 刷新模型思考能力，并把
 | `ZEX_TOOL_TIMEOUT_SECONDS` | 无 | `tool_timeout_seconds` |
 | `ZEX_AGENT_TIMEOUT_SECONDS` | 无 | `agent_timeout_seconds` |
 | `ZEX_MAX_TOOL_OUTPUT_CHARS` | 无 | `max_tool_output_chars` |
-| `ZEX_MAX_CONTEXT_CHARS` | 无 | `max_context_chars` |
+| `ZEX_MAX_CONTEXT_TOKENS` | 无 | `max_context_tokens`（旧变量 `ZEX_MAX_CONTEXT_CHARS` 仍被接受） |
 | `ZEX_COMPACT_KEEP_TURNS` | 无 | `compact_keep_turns` |
 | `ZEX_DEFAULT_THINKING_LEVEL` | 无 | `default_thinking_level` |
 | `ZEX_HIDE_THINKING_BLOCK` | 无 | `hide_thinking_block` |
@@ -302,13 +302,13 @@ zex resume -p "继续上一轮工作并给出结论"
 
 ### 上下文 compact
 
-Compact 是 core 的确定性规则，不调用外部总结模型：
+Compact 是 core 的确定性规则，不调用外部总结模型。已用 tokens ≈ 最近一次 API 返回的 usage（chat 的 `prompt_tokens` / responses 的 `input_tokens`，含 system prompt 与工具定义等开销）+ 之后新增消息用内置 tiktoken o200k_base 的本地估算；会话开始或 compact 后没有基线时退化为全量本地估算，tokenizer 不可用时再回退字符启发式。历史 thinking 不计入本地估算；预算取模型 context window（models.dev `limit.context` 或模型配置的 `context_window` 覆盖）扣除输出预留，未知时用 `max_context_tokens` 兜底：
 
 1. system prompt 始终完整保留。
 2. 最近 `compact_keep_turns` 个用户轮次及其 assistant/tool 消息完整保留。
-3. 更早轮次压成一条 system 摘要：用户和 assistant 文本保留首尾关键片段；旧 tool 输出优先压成工具名、首尾各 180 字符、原省略长度。
-4. 上下文字符数达到 `max_context_chars` 的 85% 时，在 TUI 和 headless 共用的 Agent core 中自动 compact；`/compact` 可随时手动触发。若保留配置轮数后仍超过预算，会逐步减少完整保留轮次，但至少保留最近 1 轮。
-5. TUI/REPL 反馈约释放字符数、compact 前后字符数、保留完整轮次、摘要旧轮次和 tool 输出数量。Compact 后的消息直接用于后续 Provider 请求和会话持久化。
+3. 更早轮次压成一条 system 摘要：首条用户消息作为 Original request 原文锚点保留；其余用户和 assistant 文本保留首尾关键片段；旧 tool 输出优先压成工具名、首尾各 180 字符、原省略长度。
+4. 上下文达到预算的 85% 时，先把较旧的超长 tool 输出替换为占位符（保留最近 4 条原文）；仍超阈值再走全量 compact。`/compact` 可随时手动触发；若保留配置轮数后仍超过预算，会逐步减少完整保留轮次，但至少保留最近 1 轮。
+5. TUI/REPL 反馈约释放 token 数、compact 前后占用、保留完整轮次、摘要旧轮次和清理的 tool 输出数量。Compact 后的消息直接用于后续 Provider 请求和会话持久化。
 
 OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两种协议都优先请求流式响应，并兼容网关忽略 `stream` 后返回普通 JSON。Responses 模式使用扁平 function tool 定义、`function_call`/`function_call_output` 输入项，并保留 Provider 输出项以支持推理模型的连续工具调用。
 
@@ -428,9 +428,9 @@ Zex 第一版信任本地用户，不提供 OS 级沙箱、权限弹窗或命令
 12. 验证 `/compact` 前后上下文变化：
 
     1. 临时设置 `compact_keep_turns = 2`，进行至少 4 轮对话，其中早期一轮让模型读取一个较长文件。
-    2. 输入 `/compact`。预期底部 toast 显示类似 `freed approximately N chars (before → after); kept 2 recent turn(s)`，主 feed 不新增配置行；其中有足够旧内容时 `N > 0`。
+    2. 输入 `/compact`。预期底部 toast 显示类似 `Context compacted · −N tokens · kept 2 recent turn(s)`，主 feed 不新增配置行；其中有足够旧内容时 `N > 0`。
     3. 再询问最近两轮的信息，预期能完整回答；询问早期任务时应基于 compact 摘要回答。退出后检查会话 JSONL，可看到一条以 `[Compacted earlier conversation:` 开头的 system 消息，旧的大段 tool 输出不再完整保存。
-    4. 临时把 `max_context_chars` 调低后重复长输出，预期无需输入 `/compact` 即出现自动 compact 反馈；TUI 与非 TTY REPL 行为一致。
+    4. 临时把 `max_context_tokens` 调低后重复长输出，预期无需输入 `/compact` 即出现自动 compact 反馈；TUI 与非 TTY REPL 行为一致。
 
 13. 验证本次 TUI 交互：
 

@@ -31,8 +31,9 @@ fn rejects_invalid_model_list_response() {
 
 use super::{
     ChatProviderState, ResponsesRequest, ToolCallAccumulator, consume_sse_line, finish_message,
-    parse_response_body, response_output_tokens,
+    parse_response_body, response_usage,
 };
+use crate::agent::CompletionUsage;
 
 #[test]
 fn assembles_streamed_text_and_tool_calls() {
@@ -136,30 +137,39 @@ fn detects_json_with_an_incorrect_content_type() {
 }
 
 #[test]
-fn extracts_output_tokens_from_chat_and_responses_usage() {
+fn extracts_usage_from_chat_and_responses_payloads() {
     assert_eq!(
-        response_output_tokens(
-            br#"{"usage":{"completion_tokens":37}}"#,
+        response_usage(
+            br#"{"usage":{"prompt_tokens":1200,"completion_tokens":37}}"#,
             "application/json",
             OpenAiApi::ChatCompletions,
         ),
-        Some(37)
+        Some(CompletionUsage {
+            input_tokens: Some(1200),
+            output_tokens: Some(37),
+        })
     );
     assert_eq!(
-            response_output_tokens(
-                b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":91}}}\n\ndata: [DONE]\n\n",
+            response_usage(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5300,\"output_tokens\":91}}}\n\ndata: [DONE]\n\n",
                 "text/event-stream",
                 OpenAiApi::Responses,
             ),
-            Some(91)
+            Some(CompletionUsage {
+                input_tokens: Some(5300),
+                output_tokens: Some(91),
+            })
         );
     assert_eq!(
-        response_output_tokens(
-            b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":42}}\n\ndata: [DONE]\n\n",
+        response_usage(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":42}}\n\ndata: [DONE]\n\n",
             "text/event-stream",
             OpenAiApi::ChatCompletions,
         ),
-        Some(42)
+        Some(CompletionUsage {
+            input_tokens: Some(900),
+            output_tokens: Some(42),
+        })
     );
 }
 
@@ -604,7 +614,10 @@ data: {"type":"response.completed","response":{"output":[{"type":"message","role
     }
 }
 
-fn parse_one_shot(api: OpenAiApi, body: &[u8]) -> (crate::agent::AssistantMessage, Vec<AgentEvent>) {
+fn parse_one_shot(
+    api: OpenAiApi,
+    body: &[u8],
+) -> (crate::agent::AssistantMessage, Vec<AgentEvent>) {
     let (events, mut receiver) = mpsc::unbounded_channel();
     let message = parse_response_body(body, "text/event-stream", api, &events).unwrap();
     let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
@@ -667,12 +680,14 @@ fn chunked_chat_stream_matches_one_shot_at_every_split_point() {
             parser.feed_line(&carry, &events).unwrap();
         }
         let message = parser.finish(&events).unwrap();
-        let collected: Vec<AgentEvent> =
-            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        let collected: Vec<AgentEvent> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
         assert_same_message(&expected, &(message, collected));
     }
     // Many small chunks exercise the carry buffer across partial lines.
-    assert_same_message(&expected, &parse_chunked(OpenAiApi::ChatCompletions, body, 5));
+    assert_same_message(
+        &expected,
+        &parse_chunked(OpenAiApi::ChatCompletions, body, 5),
+    );
 }
 
 #[test]
@@ -691,7 +706,10 @@ fn chunked_responses_stream_matches_one_shot() {
     let expected = parse_one_shot(OpenAiApi::Responses, body);
     assert_same_message(&expected, &parse_chunked(OpenAiApi::Responses, body, 1));
     assert_same_message(&expected, &parse_chunked(OpenAiApi::Responses, body, 7));
-    assert_same_message(&expected, &parse_chunked(OpenAiApi::Responses, body, body.len()));
+    assert_same_message(
+        &expected,
+        &parse_chunked(OpenAiApi::Responses, body, body.len()),
+    );
 }
 
 #[test]

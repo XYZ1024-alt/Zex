@@ -24,8 +24,8 @@ fn app() -> App {
             working_dir: PathBuf::from("."),
             thinking_level: None,
             thinking_preference: ThinkingLevel::Medium,
-            context_chars: 0,
-            max_context_chars: 120_000,
+            context_tokens: 0,
+            context_budget: 120_000,
             default_tool_timeout: Duration::from_secs(60),
             show_thinking: true,
             providers: ProviderCatalog::default(),
@@ -61,6 +61,7 @@ fn configured_app() -> App {
                         mode: crate::provider::ThinkingMode::Effort,
                     }),
                     compat: None,
+                    context_window: None,
                 },
                 ModelConfig {
                     id: "gpt-4.1-mini".to_owned(),
@@ -71,6 +72,7 @@ fn configured_app() -> App {
                         reasoning_effort_map: Default::default(),
                         supports_interleaved_thinking: Some(false),
                     }),
+                    context_window: None,
                 },
             ],
         }],
@@ -83,8 +85,8 @@ fn configured_app() -> App {
             working_dir: PathBuf::from("."),
             thinking_level: Some(ThinkingLevel::High),
             thinking_preference: ThinkingLevel::High,
-            context_chars: 0,
-            max_context_chars: 120_000,
+            context_tokens: 0,
+            context_budget: 120_000,
             default_tool_timeout: Duration::from_secs(60),
             show_thinking: true,
             providers,
@@ -105,7 +107,7 @@ fn registry_agent(
             model: active_model.key(),
             turn_timeout: Duration::from_secs(1),
             max_turns: 1,
-            max_context_chars: 120_000,
+            max_context_tokens: 120_000,
             compact_keep_turns: 6,
             thinking_level: ThinkingLevel::High,
         },
@@ -229,7 +231,7 @@ fn statusline_prefers_model_think_and_context_as_width_shrinks() {
         dirty_count: 3,
     });
     app.session_id = Some("20260813-120000-cafebabe".to_owned());
-    app.context_chars = 58_920;
+    app.context_tokens = 58_920;
     app.tokens_per_second = Some(42.7);
     app.transcript.push(TranscriptEntry::Message {
         role: MessageRole::Assistant,
@@ -468,6 +470,7 @@ fn model_picker_renders_models_dev_namespaced_thinking_levels() {
         display_name: "GPT-5.4 mini".to_owned(),
         thinking: None,
         compat: None,
+        context_window: None,
     });
     app.open_model_picker();
 
@@ -513,6 +516,7 @@ fn model_picker_renders_merged_xhigh_and_max_levels() {
         display_name: "GPT-5.6 Sol".to_owned(),
         thinking: None,
         compat: None,
+        context_window: None,
     });
     app.open_model_picker();
 
@@ -577,7 +581,7 @@ async fn provider_save_refreshes_runtime_registry_and_model_picker_catalog() {
             model: active.key(),
             turn_timeout: Duration::from_secs(1),
             max_turns: 1,
-            max_context_chars: 120_000,
+            max_context_tokens: 120_000,
             compact_keep_turns: 6,
             thinking_level: ThinkingLevel::High,
         },
@@ -595,6 +599,7 @@ async fn provider_save_refreshes_runtime_registry_and_model_picker_catalog() {
             mode: crate::provider::ThinkingMode::Effort,
         }),
         compat: None,
+        context_window: None,
     });
 
     super::save_provider_changes(&mut agent, &mut app, &root, &registry, draft)
@@ -640,7 +645,7 @@ async fn provider_save_remaps_the_active_target_when_ids_are_renamed() {
             model: active.key(),
             turn_timeout: Duration::from_secs(1),
             max_turns: 1,
-            max_context_chars: 120_000,
+            max_context_tokens: 120_000,
             compact_keep_turns: 6,
             thinking_level: ThinkingLevel::High,
         },
@@ -683,7 +688,7 @@ fn empty_state_centers_a_large_zex_wordmark_and_focused_prompt_surface() {
         dirty_count: 0,
     });
     app.thinking_level = Some(ThinkingLevel::High);
-    app.context_chars = 30_000;
+    app.context_tokens = 30_000;
     let backend = TestBackend::new(104, 24);
     let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1146,7 +1151,7 @@ fn narrow_status_truncates_without_wrapping_or_losing_core_fields() {
         dirty_count: 0,
     });
     app.thinking_level = Some(ThinkingLevel::Medium);
-    app.context_chars = 60_000;
+    app.context_tokens = 60_000;
     app.transcript.push(TranscriptEntry::Message {
         role: MessageRole::User,
         content: "statusline stays readable when narrow".to_owned(),
@@ -2075,7 +2080,7 @@ fn two_turn_conversation() -> App {
         dirty_count: 1,
     });
     app.tokens_per_second = Some(21.5);
-    app.context_chars = 1_800;
+    app.context_tokens = 1_800;
     app.start_turn();
     app.apply_agent_event(AgentEvent::MessageDelta {
         role: MessageRole::User,
@@ -2132,7 +2137,7 @@ fn visual_dump() {
         dirty_count: 1,
     });
     work.tokens_per_second = Some(21.5);
-    work.context_chars = 1800;
+    work.context_tokens = 1800;
     work.start_turn();
     work.apply_agent_event(AgentEvent::MessageDelta {
         role: MessageRole::User,
@@ -2262,8 +2267,8 @@ fn thinking_visibility_hides_live_and_restored_cards() {
             working_dir: PathBuf::from("."),
             thinking_level: Some(ThinkingLevel::Medium),
             thinking_preference: ThinkingLevel::Medium,
-            context_chars: 0,
-            max_context_chars: 120_000,
+            context_tokens: 0,
+            context_budget: 120_000,
             default_tool_timeout: Duration::from_secs(60),
             show_thinking: false,
             providers: ProviderCatalog::default(),
@@ -3346,12 +3351,13 @@ fn auto_compaction_and_interruption_use_toasts_not_feed_rows() {
     let mut app = app();
     app.apply_agent_event(AgentEvent::ContextCompacted {
         stats: crate::agent::CompactStats {
-            before_chars: 10_000,
-            after_chars: 6_000,
-            freed_chars: 4_000,
+            before_tokens: 10_000,
+            after_tokens: 6_000,
+            freed_tokens: 4_000,
             kept_turns: 6,
             summarized_turns: 2,
             summarized_tool_outputs: 3,
+            pruned_tool_outputs: 0,
         },
     });
 
@@ -3988,8 +3994,8 @@ fn help_renders_one_registered_command_per_row_on_wide_terminals() {
             working_dir: PathBuf::from("."),
             thinking_level: None,
             thinking_preference: ThinkingLevel::Medium,
-            context_chars: 0,
-            max_context_chars: 120_000,
+            context_tokens: 0,
+            context_budget: 120_000,
             default_tool_timeout: Duration::from_secs(60),
             show_thinking: true,
             providers: ProviderCatalog::default(),
@@ -4148,8 +4154,8 @@ fn renders_status_conversation_and_folded_tool_regions() {
             working_dir: PathBuf::from("."),
             thinking_level: None,
             thinking_preference: ThinkingLevel::Medium,
-            context_chars: 0,
-            max_context_chars: 120_000,
+            context_tokens: 0,
+            context_budget: 120_000,
             default_tool_timeout: Duration::from_secs(60),
             show_thinking: true,
             providers: ProviderCatalog::default(),

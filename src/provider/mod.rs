@@ -15,7 +15,7 @@ use std::{
 use crate::agent::{AssistantMessage, EventSender, Message};
 use crate::config::{ModelConfig, ModelRef, ProviderCatalog};
 
-pub use models_dev::{ModelsDevCatalog, ModelsDevLoad, ModelsDevProviderAlias};
+pub use models_dev::{ModelLimit, ModelsDevCatalog, ModelsDevLoad, ModelsDevProviderAlias};
 pub use openai::OpenAiProvider;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -696,6 +696,10 @@ pub trait Provider: Send + Sync {
         ThinkingCapabilities::default()
     }
 
+    fn context_limit(&self, _model: &str) -> Option<ModelLimit> {
+        None
+    }
+
     async fn complete(
         &self,
         model: &str,
@@ -714,7 +718,7 @@ pub struct ProviderRegistry {
 
 struct ProviderRegistryState {
     providers: BTreeMap<String, OpenAiProvider>,
-    models: BTreeMap<String, (ModelConfig, ThinkingCapabilities)>,
+    models: BTreeMap<String, (ModelConfig, ThinkingCapabilities, Option<ModelLimit>)>,
 }
 
 pub struct ProviderRegistryUpdate(ProviderRegistryState);
@@ -759,18 +763,13 @@ impl ProviderRegistry {
                 )?,
             );
             for model in &provider.models {
-                let capabilities = catalog.thinking_capabilities(&ModelRef {
+                let model_ref = ModelRef {
                     provider_id: provider.id.clone(),
                     model_id: model.id.clone(),
-                });
-                models.insert(
-                    ModelRef {
-                        provider_id: provider.id.clone(),
-                        model_id: model.id.clone(),
-                    }
-                    .key(),
-                    (model.clone(), capabilities),
-                );
+                };
+                let capabilities = catalog.thinking_capabilities(&model_ref);
+                let limit = catalog.context_limit(&model_ref);
+                models.insert(model_ref.key(), (model.clone(), capabilities, limit));
             }
         }
         Ok(ProviderRegistryState { providers, models })
@@ -786,9 +785,16 @@ impl Provider for ProviderRegistry {
                 state
                     .models
                     .get(model)
-                    .map(|(_, capabilities)| capabilities.clone())
+                    .map(|(_, capabilities, _)| capabilities.clone())
             })
             .unwrap_or_default()
+    }
+
+    fn context_limit(&self, model: &str) -> Option<ModelLimit> {
+        self.inner
+            .read()
+            .ok()
+            .and_then(|state| state.models.get(model).and_then(|(_, _, limit)| *limit))
     }
 
     async fn complete(
@@ -820,7 +826,7 @@ impl Provider for ProviderRegistry {
                     })?,
                 )
             };
-        let (_, capabilities) = configured;
+        let (_, capabilities, _) = configured;
         let normalized = normalize_thinking_level(&capabilities, thinking_level);
         let _ = events.send(crate::agent::AgentEvent::ThinkingNormalized {
             requested: normalized.requested,
@@ -899,6 +905,7 @@ mod tests {
                             mode: super::ThinkingMode::Effort,
                         }),
                         compat: None,
+                        context_window: None,
                     }],
                 },
                 ProviderConfig {
@@ -918,6 +925,7 @@ mod tests {
                         display_name: "Fast".to_owned(),
                         thinking: None,
                         compat: None,
+                        context_window: None,
                     }],
                 },
             ],
@@ -941,6 +949,27 @@ mod tests {
             registry.thinking_capabilities("one/fast").max_level,
             ThinkingLevel::High
         );
+    }
+
+    #[test]
+    fn registry_resolves_model_context_limits() {
+        let mut catalog = catalog();
+        catalog.models_dev = crate::provider::ModelsDevCatalog::from_json(
+            br#"{
+                "one": {
+                    "models": {
+                        "reasoning": {"limit": {"context": 200000, "output": 64000}}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let registry = ProviderRegistry::new(&catalog, Duration::from_secs(1)).unwrap();
+
+        let limit = registry.context_limit("one/reasoning").unwrap();
+        assert_eq!(limit.context, 200_000);
+        assert_eq!(limit.output, Some(64_000));
+        assert!(registry.context_limit("two/fast").is_none());
     }
 
     #[test]

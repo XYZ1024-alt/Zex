@@ -100,7 +100,7 @@ fn system_only_agent_has_no_conversation() {
             model: "test-model".to_owned(),
             turn_timeout: Duration::from_secs(1),
             max_turns: 1,
-            max_context_chars: 120_000,
+            max_context_tokens: 120_000,
             compact_keep_turns: 6,
             thinking_level: crate::provider::ThinkingLevel::Medium,
         },
@@ -154,12 +154,14 @@ async fn emits_message_tool_and_turn_events_in_order() {
                     arguments: r#"{"value":"observed"}"#.to_owned(),
                 }],
                 provider_state: None,
+                usage: None,
             },
             AssistantMessage {
                 content: "done".to_owned(),
                 thinking: Some("The tool returned the requested value.".to_owned()),
                 tool_calls: Vec::new(),
                 provider_state: None,
+                usage: None,
             },
         ])),
         requests: Arc::clone(&requests),
@@ -175,7 +177,7 @@ async fn emits_message_tool_and_turn_events_in_order() {
             model: "test-model".to_owned(),
             turn_timeout: Duration::from_secs(1),
             max_turns: 3,
-            max_context_chars: 120_000,
+            max_context_tokens: 120_000,
             compact_keep_turns: 6,
             thinking_level: crate::provider::ThinkingLevel::Medium,
         },
@@ -273,7 +275,7 @@ async fn emits_provider_errors() {
             model: "test-model".to_owned(),
             turn_timeout: Duration::from_secs(1),
             max_turns: 1,
-            max_context_chars: 120_000,
+            max_context_tokens: 120_000,
             compact_keep_turns: 6,
             thinking_level: crate::provider::ThinkingLevel::Medium,
         },
@@ -309,7 +311,7 @@ async fn cancellation_keeps_user_prompt_and_discards_partial_turn_state() {
             model: "test-model".to_owned(),
             turn_timeout: Duration::from_secs(60),
             max_turns: 1,
-            max_context_chars: 120_000,
+            max_context_tokens: 120_000,
             compact_keep_turns: 6,
             thinking_level: crate::provider::ThinkingLevel::Medium,
         },
@@ -359,7 +361,7 @@ fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
             model: "test-model".to_owned(),
             turn_timeout: Duration::from_secs(1),
             max_turns: 1,
-            max_context_chars: 120_000,
+            max_context_tokens: 120_000,
             compact_keep_turns: 2,
             thinking_level: crate::provider::ThinkingLevel::Medium,
         },
@@ -379,7 +381,7 @@ fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
             },
             crate::agent::Message::Tool {
                 tool_call_id: "old-call".to_owned(),
-                content: "x".repeat(4_000),
+                content: "x".repeat(16_000),
             },
             crate::agent::Message::User {
                 content: "recent one".to_owned(),
@@ -402,19 +404,19 @@ fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
         ]),
     );
 
-    let before = agent.context_chars();
+    let before = agent.context_tokens();
     let stats = agent.compact();
 
     assert_eq!(stats.kept_turns, 2);
     assert_eq!(stats.summarized_turns, 1);
     assert_eq!(stats.summarized_tool_outputs, 1);
-    assert!(stats.freed_chars > 3_000);
-    assert!(agent.context_chars() < before);
+    assert!(stats.freed_tokens > 0);
+    assert!(agent.context_tokens() * 2 < before);
     println!(
         "compact verification: before={} after={} freed={} kept={} summarized_turns={} summarized_tools={}",
-        stats.before_chars,
-        stats.after_chars,
-        stats.freed_chars,
+        stats.before_tokens,
+        stats.after_tokens,
+        stats.freed_tokens,
         stats.kept_turns,
         stats.summarized_turns,
         stats.summarized_tool_outputs
@@ -423,6 +425,8 @@ fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
         &agent.messages()[1],
         crate::agent::Message::System { content }
             if content.contains("Compacted earlier conversation")
+                && content.contains("Original request:\nold task")
+                && !content.contains("User: old task")
                 && content.contains("Assistant thinking")
                 && content.contains("Tool result read")
     ));
@@ -449,13 +453,13 @@ fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
             model: "test-model".to_owned(),
             turn_timeout: Duration::from_secs(1),
             max_turns: 1,
-            max_context_chars: 1_000,
+            max_context_tokens: 1_000,
             compact_keep_turns: 1,
             thinking_level: crate::provider::ThinkingLevel::Medium,
         },
         Some(vec![
             crate::agent::Message::User {
-                content: "old".repeat(AUTO_COMPACT_PERCENT * 5),
+                content: "old".repeat(AUTO_COMPACT_PERCENT * 50),
             },
             crate::agent::Message::Assistant {
                 content: "old answer".to_owned(),
@@ -471,7 +475,7 @@ fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
 
     let stats = agent.compact_if_needed().expect("context should compact");
 
-    assert!(stats.freed_chars > 0);
+    assert!(stats.freed_tokens > 0);
     assert!(matches!(
         receiver.try_recv().unwrap(),
         AgentEvent::ContextCompacted { stats: emitted } if emitted == stats
@@ -509,12 +513,14 @@ async fn tool_end_event_carries_the_file_change_for_mutations() {
                     },
                 ],
                 provider_state: None,
+                usage: None,
             },
             AssistantMessage {
                 content: "done".to_owned(),
                 thinking: None,
                 tool_calls: Vec::new(),
                 provider_state: None,
+                usage: None,
             },
         ])),
         requests: Arc::new(Mutex::new(Vec::new())),
@@ -531,7 +537,7 @@ async fn tool_end_event_carries_the_file_change_for_mutations() {
             model: "test-model".to_owned(),
             turn_timeout: Duration::from_secs(5),
             max_turns: 2,
-            max_context_chars: 120_000,
+            max_context_tokens: 120_000,
             compact_keep_turns: 6,
             thinking_level: crate::provider::ThinkingLevel::Medium,
         },
@@ -562,4 +568,237 @@ async fn tool_end_event_carries_the_file_change_for_mutations() {
     assert!(change.is_none(), "failed tools carry no change");
 
     tokio::fs::remove_dir_all(working_dir).await.unwrap();
+}
+
+struct LimitedProvider;
+
+impl Provider for LimitedProvider {
+    fn context_limit(&self, _model: &str) -> Option<crate::provider::ModelLimit> {
+        Some(crate::provider::ModelLimit {
+            context: 100_000,
+            output: Some(4_000),
+        })
+    }
+
+    async fn complete(
+        &self,
+        _model: &str,
+        _thinking_level: crate::provider::ThinkingLevel,
+        _messages: &[crate::agent::Message],
+        _tools: &[ToolDefinition],
+        _events: &crate::agent::EventSender,
+    ) -> Result<AssistantMessage> {
+        bail!("not used")
+    }
+}
+
+#[test]
+fn token_estimate_uses_bpe_and_skips_thinking() {
+    // o200k_base merges common ASCII runs into single tokens.
+    let ascii = crate::agent::Message::User {
+        content: "abcdefgh".repeat(8),
+    };
+    assert_eq!(ascii.token_estimate(), 8);
+
+    // CJK text tokenizes at roughly one token per two characters, far below
+    // the one-token-per-character worst case of the character heuristic.
+    let cjk = crate::agent::Message::User {
+        content: "你好".repeat(32),
+    };
+    assert_eq!(cjk.token_estimate(), 32);
+
+    let thinking = crate::agent::Message::Assistant {
+        content: "answer".to_owned(),
+        thinking: Some("long internal monologue ".repeat(1_000)),
+        tool_calls: Vec::new(),
+        provider_state: Some(json!({"reasoning_content": "stuffed"})),
+    };
+    let plain = crate::agent::Message::Assistant {
+        content: "answer".to_owned(),
+        thinking: None,
+        tool_calls: Vec::new(),
+        provider_state: None,
+    };
+    assert_eq!(thinking.token_estimate(), plain.token_estimate());
+}
+
+#[test]
+fn context_budget_uses_model_limit_minus_output_reserve() {
+    let (events, _) = mpsc::unbounded_channel();
+    let agent = Agent::new(
+        LimitedProvider,
+        ToolRegistry::new(Duration::from_secs(1), 32_000),
+        events,
+        AgentOptions {
+            model: "limited".to_owned(),
+            turn_timeout: Duration::from_secs(1),
+            max_turns: 1,
+            max_context_tokens: 120_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+
+    assert_eq!(agent.context_budget(), 96_000);
+}
+
+#[test]
+fn context_budget_falls_back_when_no_model_limit_is_known() {
+    let (events, _) = mpsc::unbounded_channel();
+    let agent = Agent::new(
+        FailingProvider,
+        ToolRegistry::new(Duration::from_secs(1), 32_000),
+        events,
+        AgentOptions {
+            model: "unknown".to_owned(),
+            turn_timeout: Duration::from_secs(1),
+            max_turns: 1,
+            max_context_tokens: 42_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+
+    assert_eq!(agent.context_budget(), 42_000);
+}
+
+#[test]
+fn prune_clears_old_tool_outputs_before_full_compaction() {
+    let (events, _) = mpsc::unbounded_channel();
+    let mut messages = vec![crate::agent::Message::User {
+        content: "task".to_owned(),
+    }];
+    for index in 0..6 {
+        messages.push(crate::agent::Message::Tool {
+            tool_call_id: format!("call-{index}"),
+            content: "x".repeat(4_000),
+        });
+    }
+    // Derive the budget from the measured size so the test does not depend on
+    // tokenizer internals: trigger above the threshold, but close enough that
+    // pruning two old outputs alone brings us back under it.
+    let total: usize = std::iter::once(crate::agent::Message::System {
+        content: super::SYSTEM_PROMPT.to_owned(),
+    })
+    .chain(messages.iter().cloned())
+    .map(|message| message.token_estimate())
+    .sum();
+    let per_tool = crate::agent::Message::Tool {
+        tool_call_id: "probe".to_owned(),
+        content: "x".repeat(4_000),
+    }
+    .token_estimate();
+    let budget = (total - per_tool / 2) * 100 / AUTO_COMPACT_PERCENT;
+    let mut agent = Agent::new(
+        FailingProvider,
+        ToolRegistry::new(Duration::from_secs(1), 32_000),
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(1),
+            max_turns: 1,
+            max_context_tokens: budget,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        Some(messages),
+    );
+
+    let stats = agent
+        .compact_if_needed()
+        .expect("context should cross the threshold");
+
+    assert_eq!(stats.pruned_tool_outputs, 2);
+    assert_eq!(stats.summarized_turns, 0, "pruning alone was enough");
+    let tools = agent
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            crate::agent::Message::Tool { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tools.len(), 6);
+    assert!(tools[..2].iter().all(|content| content
+        .starts_with("[tool output cleared to free context: 4000 chars]")));
+    assert!(tools[2..].iter().all(|content| content.len() == 4_000));
+    assert!(!agent.messages().iter().any(|message| matches!(
+        message,
+        crate::agent::Message::System { content }
+            if content.starts_with("[Compacted earlier conversation:")
+    )));
+}
+
+#[tokio::test]
+async fn server_usage_calibrates_context_and_compaction_resets_it() {
+    let provider = SequenceProvider {
+        messages: Mutex::new(VecDeque::from([AssistantMessage {
+            content: "ok".to_owned(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            provider_state: None,
+            usage: Some(crate::agent::CompletionUsage {
+                input_tokens: Some(5_000),
+                output_tokens: Some(2),
+            }),
+        }])),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(Duration::from_secs(1), 32_000),
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(5),
+            max_turns: 1,
+            max_context_tokens: 120_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        Some(vec![
+            crate::agent::Message::User {
+                content: "old task".to_owned(),
+            },
+            crate::agent::Message::Assistant {
+                content: "old answer".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+            },
+            crate::agent::Message::User {
+                content: "recent".to_owned(),
+            },
+        ]),
+    );
+
+    let local_sum = |agent: &Agent<SequenceProvider>| {
+        agent
+            .messages()
+            .iter()
+            .map(crate::agent::Message::token_estimate)
+            .sum::<usize>()
+    };
+    assert_eq!(agent.context_tokens(), local_sum(&agent));
+
+    agent.prompt("hello").await.unwrap();
+
+    // After a completion, context = server-reported input tokens + local
+    // estimate of the messages appended since (the assistant reply).
+    let assistant_tail = crate::agent::Message::Assistant {
+        content: "ok".to_owned(),
+        thinking: None,
+        tool_calls: Vec::new(),
+        provider_state: None,
+    }
+    .token_estimate();
+    assert_eq!(agent.context_tokens(), 5_000 + assistant_tail);
+
+    // Compaction rewrites the history, so the server baseline is dropped and
+    // the estimate becomes fully local again.
+    agent.compact();
+    assert_eq!(agent.context_tokens(), local_sum(&agent));
 }

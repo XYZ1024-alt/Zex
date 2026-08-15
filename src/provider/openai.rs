@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    agent::{AgentEvent, AssistantMessage, EventSender, Message, MessageRole, ToolCall},
+    agent::{
+        AgentEvent, AssistantMessage, CompletionUsage, EventSender, Message, MessageRole, ToolCall,
+    },
     provider::{NormalizedThinking, OpenAiApi, Provider, ThinkingLevel, ToolDefinition},
 };
 
@@ -90,11 +92,15 @@ impl OpenAiProvider {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_owned();
-        let (body, message) =
+        let (body, mut message) =
             read_response_body(response, &content_type, self.api, events).await?;
         let elapsed = started.elapsed();
-        let output_tokens = response_output_tokens(&body, &content_type, self.api);
-        if let Some(output_tokens) = output_tokens.filter(|tokens| *tokens > 0) {
+        message.usage = response_usage(&body, &content_type, self.api);
+        if let Some(output_tokens) = message
+            .usage
+            .and_then(|usage| usage.output_tokens)
+            .filter(|tokens| *tokens > 0)
+        {
             let _ = events.send(AgentEvent::ProviderUsage {
                 output_tokens,
                 elapsed,
@@ -688,7 +694,7 @@ fn parse_response_body(
     )
 }
 
-fn response_output_tokens(body: &[u8], content_type: &str, api: OpenAiApi) -> Option<u64> {
+fn response_usage(body: &[u8], content_type: &str, api: OpenAiApi) -> Option<CompletionUsage> {
     let body = strip_utf8_bom(body);
     let looks_like_sse = content_type.contains("text/event-stream")
         || body
@@ -706,16 +712,15 @@ fn response_output_tokens(body: &[u8], content_type: &str, api: OpenAiApi) -> Op
                     .then(|| serde_json::from_slice::<Value>(data).ok())
                     .flatten()
             })
-            .filter_map(|event| output_tokens_from_value(&event, api))
-            .next();
+            .find_map(|event| usage_from_value(&event, api));
     }
 
     serde_json::from_slice::<Value>(body)
         .ok()
-        .and_then(|response| output_tokens_from_value(&response, api))
+        .and_then(|response| usage_from_value(&response, api))
 }
 
-fn output_tokens_from_value(value: &Value, api: OpenAiApi) -> Option<u64> {
+fn usage_from_value(value: &Value, api: OpenAiApi) -> Option<CompletionUsage> {
     let usage = match api {
         OpenAiApi::ChatCompletions => value.get("usage"),
         OpenAiApi::Responses => value.get("usage").or_else(|| {
@@ -724,10 +729,16 @@ fn output_tokens_from_value(value: &Value, api: OpenAiApi) -> Option<u64> {
                 .and_then(|response| response.get("usage"))
         }),
     }?;
-    usage
-        .get("output_tokens")
-        .or_else(|| usage.get("completion_tokens"))
-        .and_then(Value::as_u64)
+    Some(CompletionUsage {
+        input_tokens: usage
+            .get("input_tokens")
+            .or_else(|| usage.get("prompt_tokens"))
+            .and_then(Value::as_u64),
+        output_tokens: usage
+            .get("output_tokens")
+            .or_else(|| usage.get("completion_tokens"))
+            .and_then(Value::as_u64),
+    })
 }
 
 fn parse_chat_stream_body(body: &[u8], events: &EventSender) -> Result<AssistantMessage> {
@@ -959,6 +970,7 @@ fn finish_message(
             })
             .collect(),
         provider_state,
+        usage: None,
     }
 }
 
@@ -1144,6 +1156,7 @@ fn parse_chat_non_stream_body(body: &[u8], events: &EventSender) -> Result<Assis
             })
             .collect(),
         provider_state: (!provider_state.is_empty()).then_some(Value::Object(provider_state)),
+        usage: None,
     })
 }
 
@@ -1355,6 +1368,7 @@ fn finish_responses_message(
         thinking: (!thinking.is_empty()).then_some(thinking),
         tool_calls,
         provider_state: Some(Value::Array(output)),
+        usage: None,
     })
 }
 

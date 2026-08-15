@@ -16,9 +16,21 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelsDevCatalog {
-    models: BTreeMap<(String, String), ThinkingCapabilities>,
-    canonical_models: BTreeMap<String, ThinkingCapabilities>,
+    models: BTreeMap<(String, String), ModelInfo>,
+    canonical_models: BTreeMap<String, ModelInfo>,
     unqualified_models: BTreeMap<String, BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelLimit {
+    pub context: u64,
+    pub output: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ModelInfo {
+    capabilities: ThinkingCapabilities,
+    limit: Option<ModelLimit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +62,15 @@ struct ApiModel {
     #[serde(default)]
     reasoning_options: Vec<ReasoningOption>,
     interleaved: Option<serde_json::Value>,
+    #[serde(default)]
+    limit: Option<ApiLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiLimit {
+    context: Option<u64>,
+    #[serde(default)]
+    output: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,21 +117,43 @@ impl ModelsDevCatalog {
     pub fn capabilities(&self, provider_id: &str, model_id: &str) -> Option<ThinkingCapabilities> {
         self.models
             .get(&(provider_id.to_owned(), model_id.to_owned()))
-            .cloned()
+            .map(|info| info.capabilities.clone())
             .or_else(|| self.unique_model_capabilities(model_id))
     }
 
-    fn unique_model_capabilities(&self, model_id: &str) -> Option<ThinkingCapabilities> {
-        let matches = self.unqualified_models.get(model_id).or_else(|| {
+    pub fn limits(&self, provider_id: &str, model_id: &str) -> Option<ModelLimit> {
+        self.models
+            .get(&(provider_id.to_owned(), model_id.to_owned()))
+            .and_then(|info| info.limit)
+            .or_else(|| self.unique_model_limit(model_id))
+    }
+
+    fn unqualified_matches(&self, model_id: &str) -> Option<&BTreeSet<String>> {
+        self.unqualified_models.get(model_id).or_else(|| {
             model_id
                 .rsplit_once('/')
                 .and_then(|(_, id)| self.unqualified_models.get(id))
-        })?;
+        })
+    }
+
+    fn unique_model_capabilities(&self, model_id: &str) -> Option<ThinkingCapabilities> {
+        let matches = self.unqualified_matches(model_id)?;
         let mut capabilities = matches
             .iter()
-            .filter_map(|canonical_id| self.canonical_models.get(canonical_id));
+            .filter_map(|canonical_id| self.canonical_models.get(canonical_id))
+            .map(|info| &info.capabilities);
         let first = capabilities.next()?.clone();
         Some(capabilities.fold(first, merge_capabilities))
+    }
+
+    fn unique_model_limit(&self, model_id: &str) -> Option<ModelLimit> {
+        let matches = self.unqualified_matches(model_id)?;
+        let mut limits = matches
+            .iter()
+            .filter_map(|canonical_id| self.canonical_models.get(canonical_id))
+            .filter_map(|info| info.limit);
+        let first = limits.next()?;
+        Some(limits.fold(first, merge_limits))
     }
 
     pub fn provider_aliases(content: &[u8]) -> Result<Vec<ModelsDevProviderAlias>> {
@@ -133,7 +176,7 @@ impl ModelsDevCatalog {
             let provider_id = provider.id.unwrap_or(provider_key);
             for (model_id, model) in provider.models {
                 let model_aliases = model_aliases(&model_id, &model.id);
-                let capabilities = capabilities_from_model(model);
+                let info = model_info_from_model(model);
                 let canonical_id = canonical_model_id(&provider_id, &model_id);
                 for alias in model_aliases {
                     catalog
@@ -145,10 +188,8 @@ impl ModelsDevCatalog {
                 catalog
                     .canonical_models
                     .entry(canonical_id)
-                    .or_insert_with(|| capabilities.clone());
-                catalog
-                    .models
-                    .insert((provider_id.clone(), model_id), capabilities);
+                    .or_insert_with(|| info.clone());
+                catalog.models.insert((provider_id.clone(), model_id), info);
             }
         }
         Ok(catalog)
@@ -268,6 +309,29 @@ async fn write_cache(cache_path: &Path, content: &[u8]) -> Result<()> {
 
 fn temporary_cache_path(cache_path: &Path) -> PathBuf {
     cache_path.with_extension("json.tmp")
+}
+
+fn merge_limits(merged: ModelLimit, candidate: ModelLimit) -> ModelLimit {
+    ModelLimit {
+        context: merged.context.min(candidate.context),
+        output: match (merged.output, candidate.output) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        },
+    }
+}
+
+fn model_info_from_model(model: ApiModel) -> ModelInfo {
+    let limit = model.limit.as_ref().and_then(|limit| {
+        limit.context.map(|context| ModelLimit {
+            context,
+            output: limit.output,
+        })
+    });
+    ModelInfo {
+        capabilities: capabilities_from_model(model),
+        limit,
+    }
 }
 
 fn capabilities_from_model(model: ApiModel) -> ThinkingCapabilities {
@@ -658,5 +722,44 @@ mod tests {
 
         assert_eq!(aliases[0].id, "openai");
         assert_eq!(aliases[0].api.as_deref(), Some("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn parses_context_limits_and_merges_unqualified_matches_conservatively() {
+        let catalog = ModelsDevCatalog::parse(
+            br#"{
+                "openai": {
+                    "models": {
+                        "gpt-5": {
+                            "reasoning": false,
+                            "limit": {"context": 400000, "output": 128000}
+                        }
+                    }
+                },
+                "azure": {
+                    "models": {
+                        "gpt-5": {
+                            "reasoning": false,
+                            "limit": {"context": 272000}
+                        },
+                        "other": {"reasoning": false}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let exact = catalog.limits("openai", "gpt-5").unwrap();
+        assert_eq!(exact.context, 400_000);
+        assert_eq!(exact.output, Some(128_000));
+
+        // Unknown provider falls back to unqualified matches and merges to
+        // the smallest window so the budget never overestimates.
+        let merged = catalog.limits("gateway", "gpt-5").unwrap();
+        assert_eq!(merged.context, 272_000);
+        assert_eq!(merged.output, Some(128_000));
+
+        assert!(catalog.limits("azure", "other").is_none());
+        assert!(catalog.limits("azure", "missing").is_none());
     }
 }

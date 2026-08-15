@@ -153,8 +153,21 @@ pub(crate) fn truncate_output(output: String, max_chars: usize) -> String {
         return output;
     }
 
-    let truncated = output.chars().take(max_chars).collect::<String>();
-    format!("{truncated}\n\n[truncated: {character_count} characters total]")
+    // Keep both edges: errors and summaries usually live at the tail, while
+    // headers and the start of listings live at the head.
+    let head_chars = max_chars * 7 / 10;
+    let tail_chars = max_chars - head_chars;
+    let head = output.chars().take(head_chars).collect::<String>();
+    let tail = output
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let omitted = character_count - head_chars - tail_chars;
+    format!("{head}\n\n[truncated: {omitted} of {character_count} characters omitted]\n\n{tail}")
 }
 
 pub(crate) fn resolve_path(working_dir: &Path, path: &Path) -> PathBuf {
@@ -360,7 +373,7 @@ mod tests {
             .await
             .unwrap()
             .output;
-        assert_eq!(output, "abc\n\n[truncated: 6 characters total]");
+        assert_eq!(output, "ab\n\n[truncated: 3 of 6 characters omitted]\n\nf");
         let error = tools
             .execute("read", json!({"path": "long.txt", "timeout_seconds": 0}))
             .await

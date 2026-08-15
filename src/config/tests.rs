@@ -23,6 +23,7 @@ const TEST_ENV: &[&str] = &[
     "ZEX_AGENT_TIMEOUT_SECONDS",
     "ZEX_MAX_TOOL_OUTPUT_CHARS",
     "ZEX_MAX_CONTEXT_CHARS",
+    "ZEX_MAX_CONTEXT_TOKENS",
     "ZEX_COMPACT_KEEP_TURNS",
     "ZEX_DEFAULT_THINKING_LEVEL",
     "ZEX_HIDE_THINKING_BLOCK",
@@ -208,6 +209,7 @@ async fn persists_provider_catalog_and_active_model_without_legacy_fields() {
                     mode: crate::provider::ThinkingMode::Effort,
                 }),
                 compat: None,
+                context_window: None,
             }],
         }],
     };
@@ -369,6 +371,7 @@ fn custom_provider_uses_namespaced_models_dev_capabilities() {
             display_name: "GPT-5.4 mini".to_owned(),
             thinking: None,
             compat: None,
+            context_window: None,
         }],
     });
 
@@ -521,4 +524,94 @@ accent_primary = "not-a-color"
 
     assert!(Config::load_from(&project, &global).await.is_err());
     tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_max_context_chars_key_and_environment_variable_still_work() {
+    let _environment = EnvGuard::clear();
+    let root = temp_directory("legacy-context");
+    let project = root.join("project");
+    let global = root.join("global");
+    write_config(
+        &project.join(".zex/config.toml"),
+        "max_context_chars = 64_000\n",
+    )
+    .await;
+
+    let config = Config::load_from(&project, &global).await.unwrap();
+    assert_eq!(config.max_context_tokens, 64_000);
+
+    unsafe {
+        std::env::set_var("ZEX_MAX_CONTEXT_CHARS", "80000");
+    }
+    let config = Config::load_from(&project, &global).await.unwrap();
+    assert_eq!(config.max_context_tokens, 80_000);
+
+    unsafe {
+        std::env::set_var("ZEX_MAX_CONTEXT_TOKENS", "96000");
+    }
+    let config = Config::load_from(&project, &global).await.unwrap();
+    assert_eq!(config.max_context_tokens, 96_000);
+
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[test]
+fn model_context_window_overrides_models_dev_limit() {
+    let mut catalog = super::ProviderCatalog {
+        models_dev: crate::provider::ModelsDevCatalog::from_json(
+            br#"{
+                "one": {
+                    "models": {
+                        "m": {"limit": {"context": 100000, "output": 32000}}
+                    }
+                }
+            }"#,
+        )
+        .unwrap(),
+        ..Default::default()
+    };
+    catalog.providers.push(super::ProviderConfig {
+        id: "one".to_owned(),
+        display_name: "One".to_owned(),
+        base_url: "https://one.example/v1".to_owned(),
+        api_key: super::SecretValue::new("secret".to_owned()),
+        openai_api: crate::provider::OpenAiApi::Responses,
+        thinking: None,
+        compat: None,
+        models: vec![
+            super::ModelConfig {
+                id: "m".to_owned(),
+                display_name: "M".to_owned(),
+                thinking: None,
+                compat: None,
+                context_window: None,
+            },
+            super::ModelConfig {
+                id: "big".to_owned(),
+                display_name: "Big".to_owned(),
+                thinking: None,
+                compat: None,
+                context_window: Some(500_000),
+            },
+        ],
+    });
+
+    let discovered = catalog
+        .context_limit(&super::ModelRef {
+            provider_id: "one".to_owned(),
+            model_id: "m".to_owned(),
+        })
+        .unwrap();
+    assert_eq!(discovered.context, 100_000);
+    assert_eq!(discovered.output, Some(32_000));
+
+    let overridden = catalog
+        .context_limit(&super::ModelRef {
+            provider_id: "one".to_owned(),
+            model_id: "big".to_owned(),
+        })
+        .unwrap();
+    assert_eq!(overridden.context, 500_000);
+    assert_eq!(overridden.output, None);
 }
