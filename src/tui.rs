@@ -14,7 +14,10 @@ use crossterm::{
         MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
 };
 use futures_util::StreamExt;
 use ratatui::{
@@ -43,6 +46,10 @@ use crate::{
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// Ambient redraw cadence for the landing screen: the logo shimmer itself
+/// runs at ~12fps (see `logo_shimmer_color`), so repainting faster only burns
+/// CPU and makes IME preedit text flicker against the constant repaints.
+const AMBIENT_INTERVAL: Duration = Duration::from_millis(83);
 const TOAST_DURATION: Duration = Duration::from_secs(4);
 const MAX_ERRORS: usize = 3;
 const MAX_ERROR_DETAIL_CHARS: usize = 4_000;
@@ -171,6 +178,20 @@ struct RunContext<'a> {
     provider_registry: ProviderRegistry,
 }
 
+/// Draw one frame inside a synchronized-update block so supporting terminals
+/// apply the frame atomically. Without it the cursor is repainted mid-frame at
+/// whatever cell the diff writer is visiting (on the landing screen that is
+/// the hero box's bottom-right corner), which shows up as a second,
+/// fast-flickering cursor and makes IME preedit text strobe.
+fn draw_frame(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+    let mut stdout = io::stdout();
+    execute!(stdout, BeginSynchronizedUpdate)?;
+    let result = terminal.draw(|frame| render(frame, app));
+    execute!(stdout, EndSynchronizedUpdate)?;
+    result.context("failed to draw TUI")?;
+    Ok(())
+}
+
 async fn run_loop(
     terminal: &mut DefaultTerminal,
     agent: &mut Agent<ProviderRegistry>,
@@ -199,18 +220,22 @@ async fn run_loop(
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     let mut burst = KeyBurst::default();
+    let mut last_ambient = Instant::now();
 
     loop {
         tokio::select! {
             _ = redraw.tick() => {
                 dirty |= app.expire_toast(Instant::now());
-                // Keep the welcome logo shimmer animating.
-                dirty |= app.landing_visible();
+                // Keep the welcome logo shimmer animating, throttled to the
+                // shimmer's own ~12fps cadence. Input/agent events still mark
+                // the frame dirty immediately, so typing stays responsive.
+                if app.landing_visible() && last_ambient.elapsed() >= AMBIENT_INTERVAL {
+                    dirty = true;
+                    last_ambient = Instant::now();
+                }
                 dirty |= app.tick_animations();
                 if dirty {
-                    terminal
-                        .draw(|frame| render(frame, &mut app))
-                        .context("failed to draw TUI")?;
+                    draw_frame(terminal, &mut app)?;
                     dirty = false;
                 }
             }
@@ -502,9 +527,7 @@ where
                 dirty |= app.busy;
                 dirty |= app.tick_animations();
                 if dirty {
-                    terminal
-                        .draw(|frame| render(frame, app))
-                        .context("failed to draw TUI")?;
+                    draw_frame(terminal, app)?;
                     dirty = false;
                 }
             }
@@ -526,9 +549,7 @@ where
                         app.finish_turn(Status::Error);
                     }
                 }
-                terminal
-                    .draw(|frame| render(frame, app))
-                    .context("failed to draw TUI")?;
+                draw_frame(terminal, app)?;
                 return Ok(());
             }
             event = event_receiver.recv() => {

@@ -3202,7 +3202,13 @@ fn render_input_buffer(
     }
 
     let cursor_y = metrics.cursor_row.saturating_sub(vertical_scroll) as u16;
-    if app.input_focused && !app.output_panel_open() {
+    // Keep the terminal cursor anchored inside the composer while the landing
+    // screen is visible, even when the input is unfocused. The landing redraws
+    // continuously for its ambient animations, so a hidden cursor would be
+    // left parked at the last-diffed cell (the hero box's bottom-right
+    // corner), which is where Windows IME then anchors its preedit
+    // composition instead of the input box.
+    if (app.input_focused || app.landing_visible()) && !app.output_panel_open() {
         frame.set_cursor_position((
             editor_area.x + metrics.cursor_column.min(editor_width - 1) as u16,
             editor_area.y + cursor_y.min(editor_area.height.saturating_sub(1)),

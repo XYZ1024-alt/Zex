@@ -781,6 +781,25 @@ fn typed_input_starts_at_the_empty_editor_cursor_origin() {
 }
 
 #[test]
+fn unfocused_landing_keeps_the_cursor_anchored_in_the_composer() {
+    // With the landing visible the ambient animations repaint every frame, so
+    // a hidden cursor would be left parked at the last-diffed cell (the hero
+    // box corner), where Windows IME then anchors its preedit composition.
+    let mut app = app();
+    app.input_focused = false;
+    let backend = TestBackend::new(80, 16);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 16), &app);
+    let (editor_x, editor_y) = composer_editor_origin(regions.card);
+
+    terminal
+        .backend_mut()
+        .assert_cursor_position((editor_x, editor_y));
+}
+
+#[test]
 fn empty_layout_remains_composed_across_terminal_sizes() {
     for (width, height) in [(120, 32), (70, 18), (38, 12), (16, 6), (6, 3)] {
         let mut app = app();
