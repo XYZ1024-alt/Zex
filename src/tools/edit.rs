@@ -5,8 +5,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
+    agent::FileChange,
     provider::ToolDefinition,
-    tools::{Tool, ToolFuture, resolve_path},
+    tools::{Tool, ToolFuture, ToolOutcome, resolve_path},
 };
 
 pub struct EditTool {
@@ -76,7 +77,10 @@ impl Tool for EditTool {
                 tokio::fs::write(&path, edited.as_bytes())
                     .await
                     .with_context(|| format!("failed to write {}", path.display()))?;
-                Ok(format!("edited {}", path.display()))
+                Ok(ToolOutcome {
+                    output: format!("edited {}", path.display()),
+                    change: FileChange::capture(path.clone(), Some(content), edited),
+                })
             })
             .await
             .with_context(|| {

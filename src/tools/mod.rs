@@ -17,7 +17,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::provider::ToolDefinition;
+use crate::{agent::FileChange, provider::ToolDefinition};
 
 pub use bash::BashTool;
 pub use edit::EditTool;
@@ -26,7 +26,25 @@ pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use write::WriteTool;
 
-pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+/// Tool execution result. `output` is fed back to the model; `change`
+/// carries the file mutation captured by `write`/`edit` for consumers that
+/// render diffs, and never enters the model context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutcome {
+    pub output: String,
+    pub change: Option<FileChange>,
+}
+
+impl ToolOutcome {
+    pub fn output_only(output: String) -> Self {
+        Self {
+            output,
+            change: None,
+        }
+    }
+}
+
+pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutcome>> + Send + 'a>>;
 
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
@@ -92,18 +110,19 @@ impl ToolRegistry {
         definitions
     }
 
-    pub async fn execute(&self, name: &str, arguments: Value) -> Result<String> {
+    pub async fn execute(&self, name: &str, arguments: Value) -> Result<ToolOutcome> {
         let Some(tool) = self.tools.get(name) else {
             bail!("unknown tool '{name}'");
         };
 
         let timeout = timeout_from_arguments(&arguments, self.default_timeout)
             .with_context(|| format!("tool '{name}' received invalid arguments"))?;
-        let result = tool
+        let mut outcome = tool
             .execute(arguments, timeout)
             .await
             .with_context(|| format!("tool '{name}' failed"))?;
-        Ok(truncate_output(result, self.max_output_chars))
+        outcome.output = truncate_output(outcome.output, self.max_output_chars);
+        Ok(outcome)
     }
 
     pub fn default_timeout(&self) -> Duration {
@@ -221,24 +240,28 @@ mod tests {
         let content = tools
             .execute("read", json!({"path": "sample.txt"}))
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(content, "beta");
 
         let grep = tools
             .execute("grep", json!({"pattern": "beta"}))
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         assert!(grep.contains("sample.txt:1:beta"));
         let glob = tools
             .execute("glob", json!({"pattern": "*.txt"}))
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         assert!(glob.contains("sample.txt"));
 
         let output = tools
             .execute("bash", json!({"command": "echo zex"}))
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         assert!(output.contains("exit_code: 0"));
         assert!(output.contains("zex"));
 
@@ -298,7 +321,8 @@ mod tests {
         let grep = tools
             .execute("grep", json!({"pattern": "needle", "max_results": 1}))
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         assert!(grep.contains("visible.rs:1:needle"));
         assert!(grep.contains("stopped at max_results=1"));
         assert!(!grep.contains("ignored"));
@@ -306,7 +330,8 @@ mod tests {
         let glob = tools
             .execute("glob", json!({"pattern": "**/*.rs"}))
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         assert!(glob.contains("visible.rs"));
         assert!(!glob.contains("ignored"));
 
@@ -333,7 +358,8 @@ mod tests {
         let output = tools
             .execute("read", json!({"path": "long.txt"}))
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(output, "abc\n\n[truncated: 6 characters total]");
         let error = tools
             .execute("read", json!({"path": "long.txt", "timeout_seconds": 0}))
@@ -361,7 +387,8 @@ mod tests {
                 json!({"path": "nested/file.txt", "content": "content"}),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         assert!(write.contains("[truncated:"));
 
         let edit = tools
@@ -374,8 +401,72 @@ mod tests {
                 }),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         assert!(edit.contains("[truncated:"));
+
+        tokio::fs::remove_dir_all(working_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_capture_file_changes() {
+        let working_dir = temporary_directory("change-capture");
+        tokio::fs::create_dir_all(&working_dir).await.unwrap();
+        tokio::fs::write(working_dir.join("existing.txt"), "old\nkeep\n")
+            .await
+            .unwrap();
+        let mut tools = ToolRegistry::new(Duration::from_secs(5), 32_000);
+        tools.register(WriteTool::new(working_dir.clone()));
+        tools.register(EditTool::new(working_dir.clone()));
+
+        let created = tools
+            .execute(
+                "write",
+                json!({"path": "fresh.txt", "content": "new file\n"}),
+            )
+            .await
+            .unwrap()
+            .change
+            .expect("write should capture a change");
+        assert_eq!(created.before, None);
+        assert_eq!(created.after, "new file\n");
+        assert!(created.path.ends_with("fresh.txt"));
+
+        let overwritten = tools
+            .execute(
+                "write",
+                json!({"path": "existing.txt", "content": "replaced\nkeep\n"}),
+            )
+            .await
+            .unwrap()
+            .change
+            .expect("overwrite should capture a change");
+        assert_eq!(overwritten.before.as_deref(), Some("old\nkeep\n"));
+        assert_eq!(overwritten.after, "replaced\nkeep\n");
+
+        let edited = tools
+            .execute(
+                "edit",
+                json!({
+                    "path": "existing.txt",
+                    "old_text": "replaced",
+                    "new_text": "edited"
+                }),
+            )
+            .await
+            .unwrap()
+            .change
+            .expect("edit should capture a change");
+        assert_eq!(edited.before.as_deref(), Some("replaced\nkeep\n"));
+        assert_eq!(edited.after, "edited\nkeep\n");
+
+        let oversized = "x".repeat(crate::agent::CHANGE_MAX_BYTES + 1);
+        let skipped = tools
+            .execute("write", json!({"path": "large.txt", "content": oversized}))
+            .await
+            .unwrap()
+            .change;
+        assert!(skipped.is_none(), "oversized files skip the change record");
 
         tokio::fs::remove_dir_all(working_dir).await.unwrap();
     }

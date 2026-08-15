@@ -1341,6 +1341,7 @@ struct ToolEntry {
     started_at: Option<Instant>,
     elapsed: Option<Duration>,
     timeout: Duration,
+    change: Option<crate::agent::FileChange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1824,6 +1825,7 @@ impl App {
                             started_at: None,
                             elapsed: None,
                             timeout: app.default_tool_timeout,
+                            change: None,
                         })
                     }));
                     if completes_turn {
@@ -1979,6 +1981,7 @@ impl App {
                     started_at: Some(Instant::now()),
                     elapsed: None,
                     timeout,
+                    change: None,
                 }));
             }
             AgentEvent::ToolEnd {
@@ -1987,6 +1990,7 @@ impl App {
                 output,
                 is_error,
                 elapsed,
+                change,
             } => {
                 let output = sanitize_terminal_text(&output);
                 let status = if is_error {
@@ -2003,6 +2007,7 @@ impl App {
                     tool.status = status;
                     tool.started_at = None;
                     tool.elapsed = Some(elapsed);
+                    tool.change = change;
                 }
                 self.active_tools.remove(&call_id);
                 self.status = if !self.active_tools.is_empty() {

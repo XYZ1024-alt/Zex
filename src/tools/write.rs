@@ -5,8 +5,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
+    agent::FileChange,
     provider::ToolDefinition,
-    tools::{Tool, ToolFuture, resolve_path},
+    tools::{Tool, ToolFuture, ToolOutcome, resolve_path},
 };
 
 pub struct WriteTool {
@@ -50,6 +51,7 @@ impl Tool for WriteTool {
             let path = resolve_path(&self.working_dir, &arguments.path);
 
             tokio::time::timeout(timeout, async {
+                let before = tokio::fs::read_to_string(&path).await.ok();
                 if let Some(parent) = path.parent() {
                     tokio::fs::create_dir_all(parent)
                         .await
@@ -59,11 +61,14 @@ impl Tool for WriteTool {
                     .await
                     .with_context(|| format!("failed to write {}", path.display()))?;
 
-                Ok(format!(
-                    "wrote {} bytes to {}",
-                    arguments.content.len(),
-                    path.display()
-                ))
+                Ok(ToolOutcome {
+                    output: format!(
+                        "wrote {} bytes to {}",
+                        arguments.content.len(),
+                        path.display()
+                    ),
+                    change: FileChange::capture(path.clone(), before, arguments.content),
+                })
             })
             .await
             .with_context(|| {

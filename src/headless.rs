@@ -163,9 +163,28 @@ fn print_event(event: AgentEvent) -> Result<()> {
             provider_value.as_deref().unwrap_or("<omitted>")
         ),
         AgentEvent::ToolStart { name, .. } => println!("\n[tool] {name}"),
-        AgentEvent::ToolEnd { name, is_error, .. } => {
+        AgentEvent::ToolEnd {
+            name,
+            is_error,
+            change,
+            ..
+        } => {
             let status = if is_error { "failed" } else { "done" };
             println!("\n[tool] {name}: {status}");
+            if let Some(change) = change {
+                let (added, removed) = crate::agent::change_counts(&change);
+                let counts = match (added, removed) {
+                    (added, 0) => format!("+{added}"),
+                    (0, removed) => format!("−{removed}"),
+                    (added, removed) => format!("+{added} −{removed}"),
+                };
+                let suffix = if change.before.is_none() {
+                    " (new file)"
+                } else {
+                    ""
+                };
+                println!("[change] {}: {counts}{suffix}", change.path.display());
+            }
         }
         AgentEvent::Error { message } => eprintln!("\nZex error: {message}"),
         AgentEvent::ContextCompacted { stats } => eprintln!(

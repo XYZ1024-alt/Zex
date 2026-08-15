@@ -293,20 +293,25 @@ fn tool_result(tool: &ToolEntry) -> String {
     match tool.name.as_str() {
         "read" => format!("{} lines", tool.output.lines().count()),
         "edit" => edit_change_counts(tool)
-            .map(|(added, removed)| match (added, removed) {
-                (added, 0) => format!("+{added}"),
-                (0, removed) => format!("−{removed}"),
-                (added, removed) => format!("+{added} −{removed}"),
-            })
+            .map(|(added, removed)| format_change_counts(added, removed))
             .unwrap_or_else(|| "edited".to_owned()),
-        "write" => tool_arguments(tool)
-            .and_then(|arguments| {
-                arguments
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(|content| content.lines().count().max(1))
+        "write" => tool
+            .change
+            .as_ref()
+            .map(|change| {
+                let (added, removed) = crate::agent::change_counts(change);
+                format_change_counts(added, removed)
             })
-            .map(|lines| format!("+{lines}"))
+            .or_else(|| {
+                tool_arguments(tool)
+                    .and_then(|arguments| {
+                        arguments
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .map(|content| content.lines().count().max(1))
+                    })
+                    .map(|lines| format!("+{lines}"))
+            })
             .unwrap_or_else(|| "written".to_owned()),
         "grep" if tool.output.starts_with("No matches found.") => "0 matches".to_owned(),
         "grep" => trailing_count_summary(&tool.output, "matching line(s)", "matches")
@@ -315,6 +320,14 @@ fn tool_result(tool: &ToolEntry) -> String {
         "glob" => trailing_count_summary(&tool.output, "matching path(s)", "paths")
             .unwrap_or_else(|| format!("{} paths", content_line_count(&tool.output))),
         _ => "ok".to_owned(),
+    }
+}
+
+fn format_change_counts(added: usize, removed: usize) -> String {
+    match (added, removed) {
+        (added, 0) => format!("+{added}"),
+        (0, removed) => format!("−{removed}"),
+        (added, removed) => format!("+{added} −{removed}"),
     }
 }
 

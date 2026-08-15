@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{
     provider::ToolDefinition,
-    tools::{Tool, ToolFuture, resolve_path},
+    tools::{Tool, ToolFuture, ToolOutcome, resolve_path},
 };
 
 const DEFAULT_MAX_RESULTS: usize = 100;
@@ -81,7 +81,7 @@ impl Tool for GrepTool {
             let output = tokio::task::spawn_blocking(move || search(root, arguments, timeout))
                 .await
                 .context("grep worker task failed")??;
-            Ok(output)
+            Ok(ToolOutcome::output_only(output))
         })
     }
 }

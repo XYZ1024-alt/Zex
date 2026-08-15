@@ -129,11 +129,13 @@ impl Tool for EchoTool {
 
     fn execute(&self, arguments: Value, _timeout: Duration) -> ToolFuture<'_> {
         Box::pin(async move {
-            Ok(arguments
-                .get("value")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned())
+            Ok(crate::tools::ToolOutcome::output_only(
+                arguments
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ))
         })
     }
 }
@@ -238,6 +240,7 @@ async fn emits_message_tool_and_turn_events_in_order() {
             output,
             is_error: false,
             elapsed,
+            change: None,
         } if call_id == "call-1"
             && name == "echo"
             && output == "observed"
@@ -473,4 +476,90 @@ fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
         receiver.try_recv().unwrap(),
         AgentEvent::ContextCompacted { stats: emitted } if emitted == stats
     ));
+}
+
+#[tokio::test]
+async fn tool_end_event_carries_the_file_change_for_mutations() {
+    let working_dir = std::env::temp_dir().join(format!(
+        "zex-change-event-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    tokio::fs::create_dir_all(&working_dir).await.unwrap();
+
+    let provider = SequenceProvider {
+        messages: Mutex::new(VecDeque::from([
+            AssistantMessage {
+                content: String::new(),
+                thinking: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-write".to_owned(),
+                        name: "write".to_owned(),
+                        arguments: r#"{"path":"note.txt","content":"alpha\n"}"#.to_owned(),
+                    },
+                    ToolCall {
+                        id: "call-edit".to_owned(),
+                        name: "edit".to_owned(),
+                        arguments: r#"{"path":"missing.txt","old_text":"a","new_text":"b"}"#
+                            .to_owned(),
+                    },
+                ],
+                provider_state: None,
+            },
+            AssistantMessage {
+                content: "done".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+            },
+        ])),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (events, mut receiver) = mpsc::unbounded_channel();
+    let mut tools = ToolRegistry::new(Duration::from_secs(5), 32_000);
+    tools.register(crate::tools::WriteTool::new(working_dir.clone()));
+    tools.register(crate::tools::EditTool::new(working_dir.clone()));
+    let mut agent = Agent::new(
+        provider,
+        tools,
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(5),
+            max_turns: 2,
+            max_context_chars: 120_000,
+            compact_keep_turns: 6,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+
+    agent.prompt("write then fail an edit").await.unwrap();
+
+    let mut changes = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        if let AgentEvent::ToolEnd {
+            call_id, change, ..
+        } = event
+        {
+            changes.push((call_id, change));
+        }
+    }
+
+    assert_eq!(changes.len(), 2);
+    let (call_id, change) = &changes[0];
+    assert_eq!(call_id, "call-write");
+    let change = change.as_ref().expect("successful write carries a change");
+    assert_eq!(change.before, None);
+    assert_eq!(change.after, "alpha\n");
+    assert!(change.path.ends_with("note.txt"));
+    let (call_id, change) = &changes[1];
+    assert_eq!(call_id, "call-edit");
+    assert!(change.is_none(), "failed tools carry no change");
+
+    tokio::fs::remove_dir_all(working_dir).await.unwrap();
 }

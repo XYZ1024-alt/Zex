@@ -205,7 +205,7 @@ TUI 占满 terminal 工作区，但不铺自定义整屏背景。它保持单列
 
 Provider 与模型都可声明 `[thinking]`（`min_level`、`max_level`、可选精确 `supported`、`mode = "effort"`）和 `[compat]`（`supports_reasoning_effort`、`supports_interleaved_thinking`、`reasoning_effort_map`）。合并优先级为安全默认 → models.dev → Provider 手动配置 → 模型手动配置。缺失能力时使用安全范围 `off/low/medium/high`，因此 `xhigh` 和 `max` 会降级到 `high`，不会原样发送未知值。工具调用轮次仅在目标模型声明支持 interleaved thinking 时回传 reasoning；最终回答及不支持该能力的模型历史会在请求层剥离 reasoning，但会话中的可查看内容仍保留。
 
-思考和 tool 卡片共用 Zex 摘要语法。思考卡为 `think · level · active|done · summary`；tool 卡为 `tool · subject · result · duration`，其中 `bash` 显示 `exit N`，`read` 显示行数，`grep` / `glob` 显示匹配数。默认折叠态严格占一行；点击标题行或选中后按 Enter / Space 可展开或折叠。`Ctrl-O` 批量展开或折叠全部卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 按固定帧率差分重绘：状态变化、输入与新事件立即触发，进行中的动效（滚动缓动、spinner、扫光、toast 淡化）在活动期间逐帧推进，完全静止时不产生重绘。
+思考和 tool 卡片共用 Zex 摘要语法。思考卡为 `think · level · active|done · summary`；tool 卡为 `tool · subject · result · duration`，其中 `bash` 显示 `exit N`，`read` 显示行数，`grep` / `glob` 显示匹配数，`write` / `edit` 显示真实 diff 计数 `+a −b`。默认折叠态严格占一行；点击标题行或选中后按 Enter / Space 可展开或折叠。`write` / `edit` 的展开卡片展示基于真实文件内容的 diff——覆盖写也能看到被删除的行（`+` / `-` 全宽色带）；超过 512 KiB 的文件或恢复的旧会话回退为按工具参数推导的 diff。`Ctrl-O` 批量展开或折叠全部卡片。错误默认只显示首行摘要，`Ctrl-E` 展开或收起详情。Assistant 流式增量合并到当前消息，工具结果保留在卡片内；assistant 结论继续作为普通 Markdown 正文呈现。TUI 按固定帧率差分重绘：状态变化、输入与新事件立即触发，进行中的动效（滚动缓动、spinner、扫光、toast 淡化）在活动期间逐帧推进，完全静止时不产生重绘。
 
 | 快捷键 | idle 模式 | turn 运行中 |
 | --- | --- | --- |
@@ -288,8 +288,8 @@ zex resume -p "继续上一轮工作并给出结论"
 工具通过统一的 `Tool` trait 注册，Agent loop 不包含工具名称分支。六个工具全部编译进 Zex，不调用 `rg`、`fd` 或其他可选外部二进制。每个 schema 都接受可选正整数 `timeout_seconds`；未指定时使用 `tool_timeout_seconds`。Registry 对所有成功输出统一执行 `max_tool_output_chars` 截断，并给参数、超时、I/O 和执行错误补充工具名上下文。
 
 - `read`：读取 UTF-8 文件；相对路径基于启动 Zex 时的工作目录。长内容会截断。
-- `write`：创建或完整覆盖 UTF-8 文件，并自动创建父目录。
-- `edit`：在 UTF-8 文件中执行一次精确文本替换；目标缺失或出现多次时拒绝修改，避免含糊编辑。
+- `write`：创建或完整覆盖 UTF-8 文件，并自动创建父目录。写入前捕获旧内容，供 TUI/headless 展示真实 diff（覆盖可见被删行）；变更记录不进入模型上下文。
+- `edit`：在 UTF-8 文件中执行一次精确文本替换；目标缺失或出现多次时拒绝修改，避免含糊编辑。与 `write` 一样捕获修改前后内容用于 diff 展示。
 - `grep`：使用 Rust `regex` + `ignore` 递归搜索 UTF-8 文件内容，返回 `path:line:content`。主要 schema：`pattern`、`path`、`case_sensitive`、`file_glob`、`hidden`、`max_results`。默认尊重 `.gitignore`、全局 gitignore 和 `.git/info/exclude`；二进制或非 UTF-8 文件跳过。
 - `glob`：使用 Rust `globset` + `ignore` 按路径 glob 查找文件或目录。主要 schema：`pattern`、`path`、`hidden`、`max_results`。无 `/` 的模式在任意深度匹配，目录结果带 `/`；默认尊重 Git ignore。
 - `bash`：仅用于其他系统命令。在启动工作目录中通过系统 shell 执行；Windows 使用 `cmd /D /S /C`，其他平台使用 `sh -c`。stdout/stderr 合并为结构化文本后执行统一截断。
@@ -318,7 +318,7 @@ OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两�
 
 - `MessageDelta { role, delta }`：用户消息或助手文本增量。
 - `ToolStart { call_id, name, arguments }`：工具开始；`call_id` 用于关联完成事件，参数仅由消费者决定是否展示。
-- `ToolEnd { call_id, name, output, is_error }`：工具完成、输出与失败状态。
+- `ToolEnd { call_id, name, output, is_error }`：工具完成、输出与失败状态；`write` / `edit` 成功时附带 `change`（修改前后内容），供消费者渲染真实 diff，不进入模型上下文。
 - `Error { message }`：Provider、超时、步数上限等轮次错误。
 - `ContextCompacted { stats }`：core 自动 compact 后的字符数、释放量和保留轮次统计。
 - `TurnCancelled`：调用方中断当前轮；核心丢弃未完成的 assistant/tool 上下文并恢复可继续输入状态。
@@ -329,7 +329,7 @@ OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两�
 - `src/agent/event.rs`：与 UI 无关的事件契约。
 - `src/agent/loop.rs`、`src/provider`：生产事件，完全不引用 TUI。
 - `src/tui.rs`：消费事件并维护只用于渲染的视图状态；使用 ratatui + crossterm，与 tokio `select!` 配合处理 Agent 事件、键盘输入和重绘。
-- `src/headless.rs`：同一事件流的纯文本消费者，供 `-p` 和无 TTY 场景使用。
+- `src/headless.rs`：同一事件流的纯文本消费者，供 `-p` 和无 TTY 场景使用；`write` / `edit` 完成后额外打印一行 `[change] path: +a −b` 变更统计。
 - `src/main.rs`：仅负责检测模式并装配 core、TUI 或 headless 消费者。
 
 TUI 不调用工具、不解析 Provider 响应，也不持有 Agent 业务状态；core 不知道事件由 TUI、headless 或其他消费者渲染。

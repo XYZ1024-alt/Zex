@@ -3542,20 +3542,41 @@ fn tool_arguments(tool: &ToolEntry) -> Option<Value> {
 }
 
 fn edit_change_counts(tool: &ToolEntry) -> Option<(usize, usize)> {
+    if let Some(change) = &tool.change {
+        return Some(crate::agent::change_counts(change));
+    }
     let arguments = tool_arguments(tool)?;
     let old = arguments.get("old_text")?.as_str()?;
     let new = arguments.get("new_text")?.as_str()?;
-    let (_, old_changed, new_changed, _) = changed_line_ranges(old, new);
+    let (_, old_changed, new_changed, _) = crate::agent::changed_line_ranges(old, new);
     Some((new_changed.len(), old_changed.len()))
 }
 
 fn file_change_body(tool: &ToolEntry) -> Option<Vec<String>> {
+    // Real before/after captured by the tool wins; argument-derived rendering
+    // is the fallback for restored sessions and oversized files.
+    if let Some(change) = &tool.change {
+        let before = change.before.as_deref().unwrap_or("");
+        let (prefix, old_changed, new_changed, suffix) =
+            crate::agent::changed_line_ranges(before, &change.after);
+        let mut lines = Vec::new();
+        if let Some(context) = prefix.last() {
+            lines.push(format!("  {context}"));
+        }
+        lines.extend(old_changed.iter().map(|line| format!("- {line}")));
+        lines.extend(new_changed.iter().map(|line| format!("+ {line}")));
+        if let Some(context) = suffix.first() {
+            lines.push(format!("  {context}"));
+        }
+        return Some(lines);
+    }
     let arguments = tool_arguments(tool)?;
     match tool.name.as_str() {
         "edit" => {
             let old = arguments.get("old_text")?.as_str()?;
             let new = arguments.get("new_text")?.as_str()?;
-            let (prefix, old_changed, new_changed, suffix) = changed_line_ranges(old, new);
+            let (prefix, old_changed, new_changed, suffix) =
+                crate::agent::changed_line_ranges(old, new);
             let mut lines = Vec::new();
             if let Some(context) = prefix.last() {
                 lines.push(format!("  {context}"));
@@ -3575,38 +3596,6 @@ fn file_change_body(tool: &ToolEntry) -> Option<Vec<String>> {
         }),
         _ => None,
     }
-}
-
-fn changed_line_ranges<'a>(
-    old: &'a str,
-    new: &'a str,
-) -> (Vec<&'a str>, Vec<&'a str>, Vec<&'a str>, Vec<&'a str>) {
-    let old_lines = old.lines().collect::<Vec<_>>();
-    let new_lines = new.lines().collect::<Vec<_>>();
-    let prefix_len = old_lines
-        .iter()
-        .zip(&new_lines)
-        .take_while(|(old, new)| old == new)
-        .count();
-    let shared_remaining = old_lines
-        .len()
-        .saturating_sub(prefix_len)
-        .min(new_lines.len().saturating_sub(prefix_len));
-    let suffix_len = old_lines[prefix_len..]
-        .iter()
-        .rev()
-        .zip(new_lines[prefix_len..].iter().rev())
-        .take(shared_remaining)
-        .take_while(|(old, new)| old == new)
-        .count();
-    let old_changed_end = old_lines.len().saturating_sub(suffix_len);
-    let new_changed_end = new_lines.len().saturating_sub(suffix_len);
-    (
-        old_lines[..prefix_len].to_vec(),
-        old_lines[prefix_len..old_changed_end].to_vec(),
-        new_lines[prefix_len..new_changed_end].to_vec(),
-        old_lines[old_changed_end..].to_vec(),
-    )
 }
 
 fn truncate_display(value: &str, width: usize) -> String {

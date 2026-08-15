@@ -292,9 +292,9 @@ where
                     Err(error) => Err(anyhow::Error::from(error)),
                 };
                 let elapsed = started.elapsed();
-                let (content, is_error) = match result {
-                    Ok(output) => (output, false),
-                    Err(error) => (format!("tool error: {error:#}"), true),
+                let (content, is_error, change) = match result {
+                    Ok(outcome) => (outcome.output, false, outcome.change),
+                    Err(error) => (format!("tool error: {error:#}"), true, None),
                 };
 
                 let _ = self.events.send(AgentEvent::ToolEnd {
@@ -303,6 +303,7 @@ where
                     output: content.clone(),
                     is_error,
                     elapsed,
+                    change,
                 });
                 self.messages.push(Message::Tool {
                     tool_call_id: call_id,

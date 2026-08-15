@@ -38,6 +38,7 @@ pub enum AgentEvent {
         output: String,
         is_error: bool,
         elapsed: Duration,
+        change: Option<crate::agent::FileChange>,
     },
     Error {
         message: String,

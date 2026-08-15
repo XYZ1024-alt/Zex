@@ -10,7 +10,7 @@ use tokio::{
 
 use crate::{
     provider::ToolDefinition,
-    tools::{Tool, ToolFuture},
+    tools::{Tool, ToolFuture, ToolOutcome},
 };
 
 pub struct BashTool {
@@ -95,7 +95,7 @@ impl Tool for BashTool {
                 stdout,
                 stderr
             );
-            Ok(result)
+            Ok(ToolOutcome::output_only(result))
         })
     }
 }

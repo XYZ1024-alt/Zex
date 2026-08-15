@@ -846,6 +846,7 @@ fn work_content_uses_contiguous_panel_backgrounds() {
         output: "line one\nline two".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(8),
+        change: None,
     });
     let TranscriptEntry::Tool(tool) = &mut app.transcript[2] else {
         panic!("expected tool");
@@ -957,6 +958,7 @@ fn browse_mode_uses_the_complete_navigation_footer() {
         started_at: None,
         elapsed: Some(Duration::from_millis(10)),
         timeout: Duration::from_secs(30),
+        change: None,
     }));
     app.selected_entry = Some(0);
     app.input_focused = false;
@@ -1100,6 +1102,7 @@ fn code_blocks_use_a_raised_band_and_tools_stay_on_the_base_background() {
         output: "Finished".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(24),
+        change: None,
     });
     let backend = TestBackend::new(100, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -1381,6 +1384,7 @@ fn folds_streamed_assistant_deltas_and_tracks_tool_details() {
         output: "Cargo.toml".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(12),
+        change: None,
     });
     app.apply_agent_event(AgentEvent::TurnEnd);
 
@@ -1500,6 +1504,7 @@ fn folded_trace_and_tool_cards_use_one_summary_row_each() {
         output: "package zex".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(12),
+        change: None,
     });
     let backend = TestBackend::new(100, 20);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -1544,6 +1549,7 @@ fn completed_turn_renders_in_order_without_status_noise() {
         output: "line one\nline two".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(12),
+        change: None,
     });
     app.apply_agent_event(AgentEvent::ProviderUsage {
         output_tokens: 1_234,
@@ -1653,6 +1659,7 @@ fn tool_cards_use_zex_subject_result_and_duration_summaries() {
         output: "exit_code: 0\nstdout:\nclean\nstderr:\n".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(8),
+        change: None,
     });
     app.apply_agent_event(AgentEvent::ToolStart {
         call_id: "call-grep".to_owned(),
@@ -1666,6 +1673,7 @@ fn tool_cards_use_zex_subject_result_and_duration_summaries() {
         output: "src/tui.rs:1:render_footer\n\n11 matching line(s) in 1 file(s)".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(14),
+        change: None,
     });
     let backend = TestBackend::new(110, 20);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -1719,6 +1727,7 @@ fn tool_cards_keep_verb_and_subject_on_one_line() {
             output,
             is_error: false,
             elapsed: Duration::from_millis(elapsed),
+            change: None,
         });
     }
     let backend = TestBackend::new(90, 20);
@@ -1754,6 +1763,7 @@ fn failed_tool_colors_only_the_status_field_as_error() {
         output: "exit_code: 1\nstdout:\n\nstderr:\nfailed".to_owned(),
         is_error: true,
         elapsed: Duration::from_millis(418),
+        change: None,
     });
     let backend = TestBackend::new(90, 16);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -1792,6 +1802,7 @@ fn long_tool_output_previews_then_expands_fully() {
             .join("\n"),
         is_error: false,
         elapsed: Duration::from_millis(12),
+        change: None,
     });
     let backend = TestBackend::new(90, 40);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -1833,6 +1844,7 @@ fn edit_card_renders_a_human_readable_diff_without_json() {
         output: "edited src/tui.rs".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(8),
+        change: None,
     });
     app.toggle_selected_tool();
     let backend = TestBackend::new(100, 24);
@@ -1865,6 +1877,7 @@ fn failed_bash_card_shows_exit_code_and_output() {
         output: "exit_code: 1\nstdout:\n\nstderr:\n'pwd' is not recognized\n".to_owned(),
         is_error: true,
         elapsed: Duration::from_millis(20),
+        change: None,
     });
     let backend = TestBackend::new(100, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -2087,6 +2100,7 @@ fn two_turn_conversation() -> App {
         output: "line one\nline two".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(14),
+        change: None,
     });
     app.apply_agent_event(AgentEvent::MessageDelta {
         role: MessageRole::Assistant,
@@ -2140,6 +2154,7 @@ fn visual_dump() {
         output: "exit_code: 0\nstdout:\n.git/\nsrc/\nCargo.toml\nstderr:\n".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(19),
+        change: None,
     });
     work.apply_agent_event(AgentEvent::ToolStart {
         call_id: "c2".to_owned(),
@@ -2153,6 +2168,7 @@ fn visual_dump() {
         output: "exit_code: 1\nstdout:\n\nstderr:\n'pwd' 不是内部或外部命令\n".to_owned(),
         is_error: true,
         elapsed: Duration::from_millis(20),
+        change: None,
     });
     work.apply_agent_event(AgentEvent::MessageDelta {
         role: MessageRole::Assistant,
@@ -2218,6 +2234,7 @@ fn garbled_tool_output_is_cleaned_before_it_reaches_the_screen() {
         output: "exit_code: 0\nstdout:\n\u{1b}[32mfile.txt\u{1b}[0m\r\nstderr:\n".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(5),
+        change: None,
     });
     app.toggle_selected_tool();
     let backend = TestBackend::new(90, 20);
@@ -2350,6 +2367,7 @@ fn tool_failures_use_the_tool_row_without_repeating_an_error_row() {
         output: "tool error: file not found".to_owned(),
         is_error: true,
         elapsed: Duration::from_millis(8),
+        change: None,
     });
 
     assert_eq!(
@@ -2527,6 +2545,7 @@ fn only_final_assistant_answers_are_openable() {
             started_at: None,
             elapsed: Some(Duration::from_millis(10)),
             timeout: Duration::from_secs(30),
+            change: None,
         }),
         TranscriptEntry::Turn(super::TurnEntry {
             outcome: super::TurnOutcome::Done,
@@ -3408,6 +3427,7 @@ fn mouse_click_toggles_tool_and_thinking_card_headers() {
             started_at: None,
             elapsed: Some(Duration::from_millis(10)),
             timeout: Duration::from_secs(30),
+            change: None,
         }),
     ]);
     let backend = TestBackend::new(100, 24);
@@ -3565,6 +3585,7 @@ fn ctrl_o_batches_card_expansion_and_collapse() {
             started_at: None,
             elapsed: Some(Duration::from_millis(10)),
             timeout: Duration::from_secs(30),
+            change: None,
         }),
     ]);
 
@@ -3902,6 +3923,7 @@ fn renders_multiple_shell_cards_and_completion_between_status_and_input() {
             output: "ok".to_owned(),
             is_error: false,
             elapsed: Duration::from_millis(20 + index as u64),
+            change: None,
         });
     }
     app.input.insert_str("/se");
@@ -4153,6 +4175,7 @@ fn renders_status_conversation_and_folded_tool_regions() {
         output: "package zex".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(14),
+        change: None,
     });
     app.input.insert_str("next prompt");
     let backend = TestBackend::new(120, 28);
@@ -4198,6 +4221,7 @@ fn git_status_tool_is_short_by_default_and_expands_in_place() {
                 .to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(18),
+        change: None,
     });
     app.apply_agent_event(AgentEvent::MessageDelta {
         role: MessageRole::Assistant,
@@ -4254,6 +4278,7 @@ fn quiet_shell_command_uses_completed_summary_without_metadata() {
         output: "exit_code: 0\nstdout:\n\nstderr:\n".to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(9),
+        change: None,
     });
     let backend = TestBackend::new(90, 16);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -4910,6 +4935,7 @@ fn expanded_tool_and_answer_keep_base_background_and_ascii_glyphs() {
             .to_owned(),
         is_error: false,
         elapsed: Duration::from_millis(20),
+        change: None,
     });
     app.apply_agent_event(AgentEvent::MessageDelta {
         role: MessageRole::Assistant,
@@ -5026,6 +5052,7 @@ fn grok_style_visual_regression() {
             started_at: None,
             elapsed: Some(Duration::from_millis(12)),
             timeout: Duration::from_secs(30),
+            change: None,
         }),
         TranscriptEntry::Message {
             role: MessageRole::Assistant,
@@ -5147,4 +5174,76 @@ fn wrapped_message_rows_keep_inline_markdown_styling() {
     let style = style_at(&terminal, column, row);
     assert_eq!(style.fg, Some(super::theme().text_strong));
     assert!(style.add_modifier.contains(ratatui::style::Modifier::BOLD));
+}
+
+#[test]
+fn write_overwrite_renders_the_real_file_diff() {
+    let mut app = app();
+    app.transcript.push(TranscriptEntry::Tool(super::ToolEntry {
+        call_id: "tool-write".to_owned(),
+        name: "write".to_owned(),
+        arguments: r#"{"path":"notes.txt","content":"keep\nnew\n"}"#.to_owned(),
+        output: "wrote 9 bytes to notes.txt".to_owned(),
+        status: ToolStatus::Done,
+        expanded: true,
+        show_full_output: false,
+        started_at: None,
+        elapsed: Some(Duration::from_millis(5)),
+        timeout: Duration::from_secs(30),
+        change: Some(crate::agent::FileChange {
+            path: std::path::PathBuf::from("notes.txt"),
+            before: Some("keep\nold\n".to_owned()),
+            after: "keep\nnew\n".to_owned(),
+        }),
+    }));
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let screen = format!("{}", terminal.backend());
+
+    let del_row = screen
+        .lines()
+        .position(|row| row.contains("- old"))
+        .expect("overwritten line must be visible as a delete row") as u16;
+    let add_row = screen
+        .lines()
+        .position(|row| row.contains("+ new"))
+        .expect("new line visible") as u16;
+    assert!(screen.contains("+1 −1"), "header shows real diff counts");
+    let regions = ui_regions(ratatui::layout::Rect::new(0, 0, 100, 24), &app);
+    let band_right = regions.transcript.right().saturating_sub(3);
+    assert_eq!(
+        style_at(&terminal, band_right, del_row).bg,
+        Some(super::theme().diff_del_bg)
+    );
+    assert_eq!(
+        style_at(&terminal, band_right, add_row).bg,
+        Some(super::theme().diff_add_bg)
+    );
+}
+
+#[test]
+fn write_without_a_change_falls_back_to_argument_derived_diff() {
+    let mut app = app();
+    app.transcript.push(TranscriptEntry::Tool(super::ToolEntry {
+        call_id: "tool-write".to_owned(),
+        name: "write".to_owned(),
+        arguments: r#"{"path":"notes.txt","content":"alpha\nbeta\n"}"#.to_owned(),
+        output: "wrote 11 bytes to notes.txt".to_owned(),
+        status: ToolStatus::Done,
+        expanded: true,
+        show_full_output: false,
+        started_at: None,
+        elapsed: Some(Duration::from_millis(5)),
+        timeout: Duration::from_secs(30),
+        change: None,
+    }));
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let screen = format!("{}", terminal.backend());
+
+    assert!(screen.contains("+ alpha"));
+    assert!(screen.contains("+ beta"));
+    assert!(screen.contains("+2"), "header counts the written lines");
 }

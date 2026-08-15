@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::{
     provider::ToolDefinition,
-    tools::{Tool, ToolFuture, resolve_path},
+    tools::{Tool, ToolFuture, ToolOutcome, resolve_path},
 };
 
 pub struct ReadTool {
@@ -44,7 +44,7 @@ impl Tool for ReadTool {
             let arguments: ReadArguments =
                 serde_json::from_value(arguments).context("invalid read arguments")?;
             let path = resolve_path(&self.working_dir, &arguments.path);
-            tokio::time::timeout(_timeout, tokio::fs::read_to_string(&path))
+            let content = tokio::time::timeout(_timeout, tokio::fs::read_to_string(&path))
                 .await
                 .with_context(|| {
                     format!(
@@ -53,7 +53,8 @@ impl Tool for ReadTool {
                         path.display()
                     )
                 })?
-                .with_context(|| format!("failed to read {}", path.display()))
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            Ok(ToolOutcome::output_only(content))
         })
     }
 }
