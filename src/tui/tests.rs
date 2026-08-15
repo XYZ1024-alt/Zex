@@ -3,6 +3,7 @@ use std::{path::PathBuf, time::Duration};
 use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
 use ratatui::{Terminal, backend::TestBackend, style::Color};
 
+use super::glyphs::{HERO_BOX_MIN_WIDTH, LogoTier, logo_tier};
 use super::{
     ACCENT_PRIMARY, App, AppContext, BACKGROUND, BAD, CODE_BG, CommandOutput, HitTarget,
     InputAction, InputBuffer, KeyBurst, PRODUCT_NAME, ProviderPane, SCROLL_STEP, SURFACE,
@@ -11,7 +12,6 @@ use super::{
     input_metrics, landing_regions, regions_inside_frame, regions_non_overlapping, render,
     sanitize_terminal_text, truncate_chars, ui_regions,
 };
-use super::glyphs::{HERO_BOX_MIN_WIDTH, LogoTier, logo_tier};
 use crate::agent::{AgentEvent, Message, MessageRole};
 use crate::config::{ModelConfig, ModelRef, ProviderCatalog, ProviderConfig, SecretValue};
 use crate::provider::{OpenAiApi, ThinkingLevel};
@@ -478,7 +478,7 @@ fn model_picker_renders_models_dev_namespaced_thinking_levels() {
     let screen = format!("{}", terminal.backend());
 
     assert!(screen.contains("GPT-5.4 mini"));
-    assert!(screen.contains("think off/low/medium/high/xhigh"));
+    assert!(screen.contains("think low–xhigh"));
 }
 
 #[test]
@@ -523,7 +523,7 @@ fn model_picker_renders_merged_xhigh_and_max_levels() {
     let screen = format!("{}", terminal.backend());
 
     assert!(screen.contains("GPT-5.6 Sol"));
-    assert!(screen.contains("think off/low/medium/high/xhigh/max"));
+    assert!(screen.contains("think low–max"));
 }
 
 #[tokio::test]
@@ -1108,7 +1108,7 @@ fn code_blocks_use_a_raised_band_and_tools_stay_on_the_base_background() {
     assert!(
         format!("{}", terminal.backend())
             .lines()
-            .any(|row| row.contains("bash") && row.contains("cargo check"))
+            .any(|row| row.contains("Bash") && row.contains("cargo check"))
     );
 }
 
@@ -1170,12 +1170,12 @@ fn idle_thinking_and_running_states_are_clear_in_the_footer() {
     });
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let running = format!("{}", terminal.backend());
-    assert!(running.contains("running"));
-    assert!(
-        running
-            .lines()
-            .any(|row| (row.contains("Read") || row.contains("read")) && row.contains("Cargo.toml"))
-    );
+    let tool_row = running
+        .lines()
+        .find(|row| (row.contains("Read") || row.contains("read")) && row.contains("Cargo.toml"))
+        .expect("missing running tool row");
+    // The spinner marks liveness; the meta tail shows live elapsed time.
+    assert!(tool_row.contains("ms"), "running tool shows live elapsed");
     assert!(running.contains("interrupt"));
 }
 
@@ -1328,13 +1328,11 @@ fn completion_panel_aligns_with_footer_and_highlights_selection() {
             .symbol(),
         "╭"
     );
-    let selected_row = regions.completion.y + 1;
-    assert!(
-        (regions.completion.x..regions.completion.right()).any(|x| {
-            let style = style_at(&terminal, x, selected_row);
-            style.fg == Some(ACCENT_PRIMARY) || style.bg == Some(SURFACE_RAISED)
-        })
-    );
+    let selected_row = regions.completion.y;
+    assert!((regions.completion.x..regions.completion.right()).any(|x| {
+        let style = style_at(&terminal, x, selected_row);
+        style.fg == Some(ACCENT_PRIMARY) || style.bg == Some(SURFACE_RAISED)
+    }));
     let screen = format!("{}", terminal.backend());
     assert!(screen.contains("/help") || screen.contains("/"));
     assert_no_banned_branding(&screen);
@@ -1499,14 +1497,16 @@ fn folded_trace_and_tool_cards_use_one_summary_row_each() {
     );
     assert_eq!(
         rows.iter()
-            .filter(|row| (row.contains("Read") || row.contains("read")) && row.contains("Cargo.toml"))
+            .filter(
+                |row| (row.contains("Read") || row.contains("read")) && row.contains("Cargo.toml")
+            )
             .count(),
         1
     );
 }
 
 #[test]
-fn completed_turn_status_precedes_the_final_answer() {
+fn completed_turn_renders_in_order_without_status_noise() {
     let mut app = app();
     app.start_turn();
     app.apply_agent_event(AgentEvent::MessageDelta {
@@ -1540,17 +1540,15 @@ fn completed_turn_status_precedes_the_final_answer() {
 
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
-    let status_row = screen
-        .lines()
-        .position(|row| row.contains("turn done"))
-        .expect("missing completed turn row");
     let user_row = screen
         .lines()
         .position(|row| row.contains("Inspect the project"))
         .expect("missing user message");
     let tool_row = screen
         .lines()
-        .position(|row| (row.contains("Read") || row.contains("read")) && row.contains("Cargo.toml"))
+        .position(|row| {
+            (row.contains("Read") || row.contains("read")) && row.contains("Cargo.toml")
+        })
         .expect("missing tool summary");
     let answer_row = screen
         .lines()
@@ -1562,10 +1560,10 @@ fn completed_turn_status_precedes_the_final_answer() {
         "expected user prompt arrow, got {rail:?}"
     );
     assert!(user_row < tool_row);
-    assert!(status_row < answer_row);
-    assert!(answer_row > status_row);
-    assert!(screen.contains("1 tool"));
-    assert!(screen.contains("1.2k"));
+    assert!(tool_row < answer_row);
+    // Turn bookkeeping stays out of the transcript: no status noise rows.
+    assert!(!screen.contains("turn done"));
+    assert!(!screen.contains("1.2k"));
 }
 
 #[test]
@@ -1656,15 +1654,19 @@ fn tool_cards_use_zex_subject_result_and_duration_summaries() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
 
-    assert!(screen.lines().any(|row| {
-        row.contains("bash") && row.contains("git status")
-    }));
-    assert!(screen.lines().any(|row| {
-        row.contains("grep") && row.contains("render_footer")
-    }));
+    assert!(
+        screen
+            .lines()
+            .any(|row| { row.contains("Bash") && row.contains("git status") })
+    );
+    assert!(
+        screen
+            .lines()
+            .any(|row| { row.contains("Grep") && row.contains("render_footer") })
+    );
     let tool_row = screen
         .lines()
-        .position(|row| row.contains("bash") && row.contains("git status"))
+        .position(|row| row.contains("Bash") && row.contains("git status"))
         .expect("tool row should be visible") as u16;
     assert!((0..110).any(|x| {
         let bg = style_at(&terminal, x, tool_row).bg;
@@ -1711,8 +1713,11 @@ fn tool_cards_keep_verb_and_subject_on_one_line() {
         .collect::<Vec<_>>();
 
     assert_eq!(rows.len(), 2);
-    assert!(rows.iter().any(|row| row.contains("bash") && row.contains("pwd")));
-    assert!(rows.iter().any(|row| row.contains("glob")));
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Bash") && row.contains("pwd"))
+    );
+    assert!(rows.iter().any(|row| row.contains("Glob")));
 }
 
 #[test]
@@ -1742,7 +1747,7 @@ fn failed_tool_colors_only_the_status_field_as_error() {
         .expect("missing failed tool row") as u16;
     let row_text = screen.lines().nth(row as usize).unwrap();
     let status_byte = row_text.find("exit 1").unwrap();
-    let name_byte = row_text.find("bash").unwrap();
+    let name_byte = row_text.find("Bash").unwrap();
     let status_x = unicode_width::UnicodeWidthStr::width(&row_text[..status_byte]) as u16;
     let name_x = unicode_width::UnicodeWidthStr::width(&row_text[..name_byte]) as u16;
 
@@ -1775,17 +1780,18 @@ fn long_tool_output_previews_then_expands_fully() {
     app.toggle_selected_tool();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let preview = format!("{}", terminal.backend());
-    assert!(preview.contains("path  long.txt"));
+    assert!(preview.contains("long.txt"));
+    assert!(preview.contains("20 lines"));
     assert!(!preview.contains("\"path\""));
     assert!(preview.contains("line 12"));
     assert!(!preview.contains("line 13"));
-    assert!(preview.contains("20 lines · 8 more · Ctrl+O expand"));
+    assert!(preview.contains("… 8 more · ctrl+o"));
 
     app.toggle_selected_tool_output();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let full = format!("{}", terminal.backend());
     assert!(full.contains("line 20"));
-    assert!(full.contains("20 lines · Ctrl+O collapse"));
+    assert!(full.contains("ctrl+o to collapse"));
 }
 
 #[test]
@@ -1815,7 +1821,7 @@ fn edit_card_renders_a_human_readable_diff_without_json() {
 
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
-    assert!(screen.contains("edit"));
+    assert!(screen.contains("Edit"));
     assert!(screen.contains("src/tui.rs"));
     assert!(screen.contains("+2 −1"));
     assert!(screen.contains("-     old();"));
@@ -1826,7 +1832,7 @@ fn edit_card_renders_a_human_readable_diff_without_json() {
 }
 
 #[test]
-fn failed_bash_card_shows_command_and_stderr_sections() {
+fn failed_bash_card_shows_exit_code_and_output() {
     let mut app = app();
     app.apply_agent_event(AgentEvent::ToolStart {
         call_id: "call-fail".to_owned(),
@@ -1848,9 +1854,9 @@ fn failed_bash_card_shows_command_and_stderr_sections() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let expanded = format!("{}", terminal.backend());
     assert!(expanded.contains("exit 1"));
-    assert!(expanded.contains("command"));
+    // The header carries the command; the expanded body shows raw output
+    // without labeled command/stderr sections.
     assert!(expanded.contains("pwd && find . -name '*.rs'"));
-    assert!(expanded.contains("stderr"));
     assert!(expanded.contains("'pwd' is not recognized"));
     assert!(!expanded.contains("exit_code:"));
     assert!(!expanded.contains("stdout:"));
@@ -2637,8 +2643,8 @@ fn output_panel_owns_space_and_scroll_until_escape() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let initial = format!("{}", terminal.backend());
-    assert!(initial.contains("ZEX / assistant output"));
-    assert!(initial.contains("Esc timeline"));
+    assert!(initial.contains("Response"));
+    assert!(initial.contains("esc"));
     assert!(initial.contains("line 0"));
     assert!(app.output_panel.as_ref().unwrap().max_scroll > 0);
 
@@ -3337,14 +3343,14 @@ fn errors_are_short_until_explicitly_expanded() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let folded = format!("{}", terminal.backend());
     assert!(folded.contains("provider failed"));
-    assert!(folded.contains("Ctrl+E details"));
+    assert!(folded.contains("ctrl+e"));
     assert!(!folded.contains("socket closed"));
 
     app.toggle_latest_error();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let expanded = format!("{}", terminal.backend());
     assert!(expanded.contains("socket closed"));
-    assert!(expanded.contains("Ctrl+E hide"));
+    assert!(expanded.contains("ctrl+e"));
 }
 
 #[test]
@@ -3887,12 +3893,16 @@ fn renders_multiple_shell_cards_and_completion_between_status_and_input() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
 
-    assert!(screen.lines().any(|row| {
-        row.contains("bash") && row.contains("git status")
-    }));
-    assert!(screen.lines().any(|row| {
-        row.contains("bash") && row.contains("git rev-parse --short HEAD")
-    }));
+    assert!(
+        screen
+            .lines()
+            .any(|row| { row.contains("Bash") && row.contains("git status") })
+    );
+    assert!(
+        screen
+            .lines()
+            .any(|row| { row.contains("Bash") && row.contains("git rev-parse --short HEAD") })
+    );
     assert!(!screen.contains("timeout 30.0s"));
     assert!(!screen.contains("Ctrl+O"));
     assert!(screen.contains("/sessions"));
@@ -4084,7 +4094,7 @@ fn session_records_and_multiline_feedback_keep_explicit_boundaries() {
     let error_screen = format!("{}", terminal.backend());
     assert!(error_screen.contains("First error line"));
     assert!(error_screen.contains("Second error line"));
-    assert_eq!(error_screen.matches("Ctrl+E hide").count(), 1);
+    assert_eq!(error_screen.matches("ctrl+e").count(), 1);
 }
 
 #[test]
@@ -4179,9 +4189,11 @@ fn git_status_tool_is_short_by_default_and_expands_in_place() {
 
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let folded = format!("{}", terminal.backend());
-    assert!(folded.lines().any(|row| {
-        row.contains("bash") && row.contains("git status --short --branch")
-    }));
+    assert!(
+        folded
+            .lines()
+            .any(|row| { row.contains("Bash") && row.contains("git status --short --branch") })
+    );
     assert_eq!(folded.matches("## main...origin/main [ahead 1]").count(), 0);
     assert_eq!(
         folded
@@ -4196,10 +4208,8 @@ fn git_status_tool_is_short_by_default_and_expands_in_place() {
     app.toggle_selected_tool();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let expanded = format!("{}", terminal.backend());
-    assert!(expanded.contains("command"));
     assert!(expanded.contains("git status --short --branch"));
     assert!(expanded.contains("M src/tui.rs"));
-    assert!(expanded.contains("2 lines"));
     assert!(!expanded.contains("input"));
     assert!(!expanded.contains("output {"));
     assert!(!expanded.contains("exit_code:"));
@@ -4231,9 +4241,11 @@ fn quiet_shell_command_uses_completed_summary_without_metadata() {
 
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
-    assert!(screen.lines().any(|row| {
-        row.contains("bash") && row.contains("git status --porcelain")
-    }));
+    assert!(
+        screen
+            .lines()
+            .any(|row| { row.contains("Bash") && row.contains("git status --porcelain") })
+    );
     assert!(!screen.contains("exit_code: 0"));
     assert!(!screen.contains("stdout:"));
     assert!(!screen.contains("stderr:"));
@@ -4256,10 +4268,14 @@ fn busy_state_lives_in_the_footer_without_feed_noise() {
     let screen = format!("{}", terminal.backend());
     assert!(screen.contains("working"));
     assert!(screen.contains("interrupt"));
-    assert!(screen.lines().any(|row| {
-        row.contains("bash") && row.contains("git status") && row.contains("running")
-    }));
-    assert!(screen.contains("running"));
+    // The running tool row leads with a spinner; the word "running" would be
+    // redundant next to it and the footer's activity label.
+    assert!(
+        screen
+            .lines()
+            .any(|row| { row.contains("Bash") && row.contains("git status") })
+    );
+    assert!(!screen.contains("running"));
 }
 
 #[test]
@@ -4278,7 +4294,11 @@ fn landing_and_workspace_regions_stay_inside_representative_frames() {
         assert!(regions.completion.bottom() <= area.bottom());
         assert!(regions.hero.bottom() <= area.bottom());
         assert!(regions.logo.bottom() <= area.bottom());
-        assert!(regions.menu.is_empty() || regions.card.y >= regions.menu.bottom() || !regions.hero.is_empty());
+        assert!(
+            regions.menu.is_empty()
+                || regions.card.y >= regions.menu.bottom()
+                || !regions.hero.is_empty()
+        );
         assert!(regions.completion.is_empty() || regions.completion.bottom() <= regions.card.y);
         assert_buffer_in_bounds(&terminal, width, height);
         assert_no_role_labels(&screen);
@@ -4311,7 +4331,9 @@ fn two_turn_transcript_folds_then_expands_the_tool_card() {
     assert_eq!(
         folded
             .lines()
-            .filter(|row| (row.contains("Read") || row.contains("read")) && row.contains("Cargo.toml"))
+            .filter(
+                |row| (row.contains("Read") || row.contains("read")) && row.contains("Cargo.toml")
+            )
             .count(),
         1
     );
@@ -4356,7 +4378,7 @@ fn two_turn_transcript_folds_then_expands_the_tool_card() {
     let (_, expanded) = draw(&mut app, 120, 32);
     write_screen_dump("two-turn-expanded-120x32", &expanded);
     assert!(expanded.contains("line one"));
-    assert!(expanded.contains("path  Cargo.toml"));
+    assert!(expanded.contains("line two"));
     assert_no_role_labels(&expanded);
 
     let (_, expanded_narrow) = draw(&mut app, 80, 24);
@@ -4460,7 +4482,10 @@ fn cjk_and_wide_text_truncate_instead_of_spilling() {
     assert_work_regions(&app, 38, 12);
     assert_buffer_in_bounds(&terminal, 38, 12);
     assert!(
-        screen.contains("当前") || screen.contains("Read") || screen.contains("read") || screen.contains("enter"),
+        screen.contains("当前")
+            || screen.contains("Read")
+            || screen.contains("read")
+            || screen.contains("enter"),
         "narrow CJK screen lost its primary chrome:\n{screen}"
     );
     assert!(!screen.contains("YOU"));
@@ -4516,9 +4541,7 @@ fn conversation_paint_shows_typed_scrollback_and_composer_metadata() {
     let (_, first) = draw(&mut app, 100, 24);
     write_screen_dump("conversation", &first);
     assert!(
-        first
-            .lines()
-            .any(|row| row.contains("当前目录有哪些文件")),
+        first.lines().any(|row| row.contains("当前目录有哪些文件")),
         "user message missing:\n{first}"
     );
     assert!(first.contains("我会先查看当前工作目录中的条目"));
@@ -4735,12 +4758,17 @@ fn welcome_wide_uses_hero_box_and_night_palette() {
     let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 104, 24), &app);
 
     assert!(104 >= HERO_BOX_MIN_WIDTH);
-    assert!(!regions.hero.is_empty(), "wide welcome must use the hero box");
+    assert!(
+        !regions.hero.is_empty(),
+        "wide welcome must use the hero box"
+    );
     assert_zex_welcome_identity(&screen);
     assert!(screen.contains("Type a message..."));
     assert!(screen.contains("main"));
     assert!(screen_has_glyph(&terminal, "╭"));
-    assert!(screen_has_glyph(&terminal, "\u{276F}") || screen.contains('❯') || screen.contains('>'));
+    assert!(
+        screen_has_glyph(&terminal, "\u{276F}") || screen.contains('❯') || screen.contains('>')
+    );
     assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
     assert!(!screen_has_rgb(&terminal, Color::Rgb(120, 158, 166)));
     assert_no_banned_branding(&screen);
@@ -4759,7 +4787,10 @@ fn welcome_narrow_stacks_without_hero_box() {
     let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 80, 24), &app);
 
     assert!(regions.hero.is_empty(), "narrow welcome must stack");
-    assert!(!regions.logo.is_empty(), "24-row stacked welcome shows the wordmark");
+    assert!(
+        !regions.logo.is_empty(),
+        "24-row stacked welcome shows the wordmark"
+    );
     assert_eq!(logo_tier(24), LogoTier::Full);
     assert!(screen.contains(PRODUCT_NAME));
     assert!(screen.contains("Type a message..."));
@@ -4838,7 +4869,8 @@ fn slash_completion_is_a_highlighted_label_description_dropdown() {
             .buffer()
             .content()
             .iter()
-            .any(|cell| cell.style().bg == Some(SURFACE_RAISED) || cell.style().fg == Some(ACCENT_PRIMARY))
+            .any(|cell| cell.style().bg == Some(SURFACE_RAISED)
+                || cell.style().fg == Some(ACCENT_PRIMARY))
     );
     assert_no_banned_branding(&screen);
 }
@@ -4877,7 +4909,7 @@ fn expanded_tool_and_answer_keep_base_background_and_ascii_glyphs() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let screen = format!("{}", terminal.backend());
 
-    assert!(screen.contains("glob"), "verb smashed:\n{screen}");
+    assert!(screen.contains("Glob"), "verb smashed:\n{screen}");
     assert!(screen.contains("Cargo.toml"), "path smashed:\n{screen}");
     assert!(screen.contains("Cargo.lock"));
     assert!(screen.contains("当前目录包含"));
@@ -4909,11 +4941,12 @@ fn expanded_tool_and_answer_keep_base_background_and_ascii_glyphs() {
 #[test]
 fn collapsed_thinking_uses_thought_for_when_elapsed_is_known() {
     let mut app = app();
-    app.transcript.push(TranscriptEntry::Thinking(ThinkingEntry {
-        content: "hidden body".to_owned(),
-        expanded: false,
-        elapsed: Some(Duration::from_secs(3)),
-    }));
+    app.transcript
+        .push(TranscriptEntry::Thinking(ThinkingEntry {
+            content: "hidden body".to_owned(),
+            expanded: false,
+            elapsed: Some(Duration::from_secs(3)),
+        }));
     let backend = TestBackend::new(80, 18);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -5032,7 +5065,7 @@ fn grok_style_visual_regression() {
     // Tool header: path subject stays on the quiet gray ramp.
     let tool_row = screen
         .lines()
-        .position(|row| row.contains("edit") && row.contains("src/tui.rs"))
+        .position(|row| row.contains("Edit") && row.contains("src/tui.rs"))
         .expect("tool header visible") as u16;
     let path_col = screen
         .lines()
@@ -5072,11 +5105,7 @@ fn wrapped_message_rows_keep_inline_markdown_styling() {
     let mut app = app();
     app.transcript.push(TranscriptEntry::Message {
         role: MessageRole::Assistant,
-        content: format!(
-            "{} **marker** {}",
-            "plain ".repeat(20),
-            "tail ".repeat(20)
-        ),
+        content: format!("{} **marker** {}", "plain ".repeat(20), "tail ".repeat(20)),
     });
     let backend = TestBackend::new(60, 20);
     let mut terminal = Terminal::new(backend).unwrap();

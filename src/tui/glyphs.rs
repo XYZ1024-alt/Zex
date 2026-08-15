@@ -13,12 +13,21 @@ pub(super) fn prompt_arrow() -> &'static str {
     }
 }
 
-/// `"┃"` (U+2503) normally, `"│"` (U+2502) on legacy Windows consoles.
-pub(super) fn accent_bar() -> &'static str {
+/// `"✻"` thinking mark normally, `"*"` on legacy Windows consoles.
+pub(super) fn thinking_mark() -> &'static str {
     if is_legacy_windows_console() {
-        "\u{2502}"
+        "\u{002A}"
     } else {
-        "\u{2503}"
+        "\u{273B}"
+    }
+}
+
+/// `"●"` status dot normally, `"*"` on legacy Windows consoles.
+pub(super) fn status_dot() -> &'static str {
+    if is_legacy_windows_console() {
+        "\u{002A}"
+    } else {
+        "\u{25CF}"
     }
 }
 

@@ -33,11 +33,10 @@ pub(super) fn append_tool_lines(
     ));
 
     if tool.expanded {
-        let label_style = Style::default().fg(TEXT_DIM);
-        let body_style = Style::default().fg(TEXT);
+        let label_style = Style::default().fg(TEXT_FAINT);
+        let body_style = Style::default().fg(TEXT_DIM);
         let added_style = Style::default().fg(OK);
         let removed_style = Style::default().fg(BAD);
-        let failed = tool_result_color(tool) == BAD;
         let arguments = serde_json::from_str::<Value>(&tool.arguments).ok();
         let param_key = match tool.name.as_str() {
             "bash" => "command",
@@ -62,58 +61,26 @@ pub(super) fn append_tool_lines(
                 .map_or_else(|| body_lines.len(), Vec::len)
                 .min(TOOL_OUTPUT_PREVIEW_LINES)
         };
+        // Body rows indent two columns to nest under the header.
         let push = |lines: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>| {
-            let mut row = rail_spans(ACCENT_TOOL);
-            row.push(Span::raw("  "));
+            let mut row = vec![Span::raw("  ")];
             row.extend(spans);
             lines.push(Line::from(row));
         };
 
-        push(lines, Vec::new());
-        if edit_diff.is_some() {
-            push(lines, vec![
-                Span::styled("diff  ", label_style),
-                Span::styled(param.to_owned(), body_style),
-            ]);
-        } else if tool.name == "bash" && !failed {
-            push(lines, vec![Span::styled("command", label_style)]);
+        // Re-show the invocation only when the header subject could not carry
+        // it (multi-line or truncated); otherwise that would repeat the header.
+        let invocation_overflow = param.lines().count() > 1 || param.chars().count() > 100;
+        if param_key.is_empty() {
+            push(
+                lines,
+                vec![Span::styled(single_line(&tool.arguments, 200), label_style)],
+            );
+        } else if invocation_overflow {
             for line in param.lines() {
-                push(lines, vec![
-                    Span::raw("  "),
-                    Span::styled(line.to_owned(), body_style),
-                ]);
-            }
-            push(lines, Vec::new());
-            push(lines, vec![Span::styled("output", label_style)]);
-        } else if param.is_empty() {
-            push(lines, vec![Span::styled(
-                single_line(&tool.arguments, 200),
-                label_style,
-            )]);
-        } else if tool.name == "bash" {
-            push(lines, vec![Span::styled("command", label_style)]);
-            for line in param.lines() {
-                push(lines, vec![
-                    Span::raw("  "),
-                    Span::styled(line.to_owned(), body_style),
-                ]);
-            }
-            push(lines, vec![]);
-            push(lines, vec![Span::styled("stderr", label_style)]);
-        } else {
-            let indent = " ".repeat(param_key.len() + 2);
-            for (index, line) in param.lines().enumerate() {
-                push(lines, vec![
-                    Span::styled(
-                        if index == 0 {
-                            format!("{param_key}  ")
-                        } else {
-                            indent.clone()
-                        },
-                        label_style,
-                    ),
-                    Span::styled(line.to_owned(), body_style),
-                ]);
+                for segment in wrap_display_hard(line, width.saturating_sub(2).max(1)) {
+                    push(lines, vec![Span::styled(segment, label_style)]);
+                }
             }
         }
 
@@ -124,13 +91,11 @@ pub(super) fn append_tool_lines(
                 } else if line.starts_with("- ") {
                     (removed_style, Some(DIFF_DEL_BG))
                 } else {
-                    (body_style, None)
+                    (Style::default().fg(TEXT), None)
                 };
-                for segment in wrap_display_hard(line, width.saturating_sub(4).max(1)) {
-                    let mut row = rail_spans(ACCENT_TOOL);
-                    row.push(Span::raw("  "));
-                    row.push(Span::styled(segment, style));
-                    let mut rendered = Line::from(row);
+                for segment in wrap_display_hard(line, width.saturating_sub(2).max(1)) {
+                    let mut rendered =
+                        Line::from(vec![Span::raw("  "), Span::styled(segment, style)]);
                     if let Some(band) = band {
                         // Full-width band, like grok's diff rows.
                         rendered = rendered.style(Style::default().bg(band));
@@ -145,7 +110,7 @@ pub(super) fn append_tool_lines(
             push(lines, vec![Span::styled("(no output)", label_style)]);
         } else {
             for line in body_lines.iter().take(visible_lines) {
-                for segment in wrap_display_hard(line, width.saturating_sub(4).max(1)) {
+                for segment in wrap_display_hard(line, width.saturating_sub(2).max(1)) {
                     push(lines, vec![Span::styled(segment, body_style)]);
                 }
             }
@@ -154,26 +119,38 @@ pub(super) fn append_tool_lines(
         let total = edit_diff
             .as_ref()
             .map_or_else(|| body_lines.len(), Vec::len);
-        let unit = if total == 1 { "line" } else { "lines" };
-        let footer = if !tool.show_full_output && total > TOOL_OUTPUT_PREVIEW_LINES {
-            format!(
-                "{total} {unit} · {} more · Ctrl+O expand",
-                total - TOOL_OUTPUT_PREVIEW_LINES
-            )
+        // Footer only earns its row when it adds information the header does
+        // not already carry: hidden overflow or a timeout.
+        if !tool.show_full_output && total > TOOL_OUTPUT_PREVIEW_LINES {
+            push(
+                lines,
+                vec![Span::styled(
+                    format!("… {} more · ctrl+o", total - TOOL_OUTPUT_PREVIEW_LINES),
+                    label_style,
+                )],
+            );
         } else if tool.show_full_output && total > TOOL_OUTPUT_PREVIEW_LINES {
-            format!("{total} {unit} · Ctrl+O collapse")
-        } else if total > 0 {
-            format!("{total} {unit}")
-        } else {
-            format!("timeout {}", format_duration(tool.timeout))
-        };
-        push(lines, vec![Span::styled(footer, label_style)]);
+            push(lines, vec![Span::styled("ctrl+o to collapse", label_style)]);
+        } else if total == 0 && !matches!(tool.status, ToolStatus::Running) {
+            push(
+                lines,
+                vec![Span::styled(
+                    format!("timeout {}", format_duration(tool.timeout)),
+                    label_style,
+                )],
+            );
+        }
     }
 }
 
 fn tool_verb(name: &str) -> String {
     match name {
+        "bash" => "Bash".to_owned(),
         "read" => "Read".to_owned(),
+        "write" => "Write".to_owned(),
+        "edit" => "Edit".to_owned(),
+        "grep" => "Grep".to_owned(),
+        "glob" => "Glob".to_owned(),
         other => other.to_owned(),
     }
 }
@@ -187,7 +164,10 @@ fn tool_subject_spans(tool: &ToolEntry, subject: &str) -> Vec<Span<'static>> {
             Span::styled(subject.to_owned(), Style::default().fg(COMMAND)),
         ];
     }
-    vec![Span::styled(subject.to_owned(), Style::default().fg(TEXT_DIM))]
+    vec![Span::styled(
+        subject.to_owned(),
+        Style::default().fg(TEXT_DIM),
+    )]
 }
 
 struct ToolHeaderState {
@@ -206,29 +186,43 @@ fn tool_header_line(
 ) -> Line<'static> {
     let selected = state.selected;
     let result_color = state.result_color;
-    let running_millis = state.running_millis;
     let verb_style = Style::default()
         .fg(if selected { TEXT_STRONG } else { TEXT })
         .add_modifier(Modifier::BOLD);
-    let mut spans = rail_spans(ACCENT_TOOL);
-    spans.extend([Span::styled(verb.to_owned(), verb_style), Span::raw(" ")]);
+    // Status glyph: a live braille spinner while running, otherwise a quiet
+    // dot colored by outcome (green ok, red failed, gray stopped).
+    let glyph = match state.running_millis {
+        Some(millis) => Span::styled(
+            crate::tui::glyphs::spinner_frame(millis).to_owned(),
+            Style::default().fg(RUNNING),
+        ),
+        None => Span::styled(
+            crate::tui::glyphs::status_dot().to_owned(),
+            Style::default().fg(result_color),
+        ),
+    };
+    let mut spans = vec![
+        glyph,
+        Span::raw(" "),
+        Span::styled(verb.to_owned(), verb_style),
+        Span::raw(" "),
+    ];
     spans.extend(subject);
-    if width >= 36 && !result.is_empty() {
-        spans.push(Span::styled("  ", Style::default().fg(TEXT_FAINT)));
-        // Live braille spinner on running tools, at the shared 80ms cadence.
-        if let Some(millis) = running_millis {
-            spans.push(Span::styled(
-                format!("{} ", crate::tui::glyphs::spinner_frame(millis)),
-                Style::default().fg(result_color),
-            ));
-        }
-        spans.push(Span::styled(result.to_owned(), Style::default().fg(result_color)));
+    // Meta tail: `· result · duration`, faint and red only on failure. The
+    // word "running" is redundant next to the spinner, so it is dropped.
+    let mut meta: Vec<String> = Vec::new();
+    if state.running_millis.is_none() && !result.is_empty() {
+        meta.push(result.to_owned());
     }
-    if width >= 48 && !duration.is_empty() {
-        spans.extend([
-            Span::styled("  ", Style::default().fg(TEXT_FAINT)),
-            Span::styled(duration.to_owned(), Style::default().fg(TEXT_FAINT)),
-        ]);
+    if !duration.is_empty() {
+        meta.push(duration.to_owned());
+    }
+    if !meta.is_empty() {
+        let meta_color = if result_color == BAD { BAD } else { TEXT_FAINT };
+        spans.push(Span::styled(
+            format!(" · {}", meta.join(" · ")),
+            Style::default().fg(meta_color),
+        ));
     }
     super::card_header_line(spans, selected, width)
 }

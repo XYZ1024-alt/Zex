@@ -2307,8 +2307,7 @@ impl App {
     fn toast_animating(&self) -> bool {
         self.toast.as_ref().is_some_and(|toast| {
             let now = Instant::now();
-            now < toast.shown_at + Toast::FADE_IN
-                || now + Toast::FADE_OUT >= toast.expires_at
+            now < toast.shown_at + Toast::FADE_IN || now + Toast::FADE_OUT >= toast.expires_at
         })
     }
 
