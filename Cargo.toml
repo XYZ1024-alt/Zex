@@ -26,3 +26,6 @@ time = { version = "0.3", features = ["formatting", "local-offset", "macros", "p
 tokio = { version = "1.47", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 toml = "1.0"
 unicode-width = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Globalization"] }

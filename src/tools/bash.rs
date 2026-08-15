@@ -84,8 +84,8 @@ impl Tool for BashTool {
                 .context("stderr reader task failed")?
                 .context("failed to read stderr")?;
 
-            let stdout = String::from_utf8_lossy(&stdout);
-            let stderr = String::from_utf8_lossy(&stderr);
+            let stdout = decode_shell_output(&stdout);
+            let stderr = decode_shell_output(&stderr);
             let result = format!(
                 "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
                 status.code().map_or_else(
@@ -112,6 +112,75 @@ where
     let mut output = Vec::new();
     reader.read_to_end(&mut output).await?;
     Ok(output)
+}
+
+/// Decode child-process output. Fast path: strict UTF-8 (unix shells,
+/// `chcp 65001`, cross-platform tools). Anything else falls back to the
+/// legacy console code page.
+fn decode_shell_output(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    decode_legacy_console(bytes)
+}
+
+/// Windows consoles write the active ANSI code page (GBK on zh-CN, CP932 on
+/// ja-JP, …); transcode through Win32 instead of emitting lossy mojibake.
+#[cfg(windows)]
+fn decode_legacy_console(bytes: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let length = bytes.len().min(i32::MAX as usize) as i32;
+    let lossy = || String::from_utf8_lossy(bytes).into_owned();
+    unsafe {
+        let needed =
+            MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), length, std::ptr::null_mut(), 0);
+        if needed <= 0 {
+            return lossy();
+        }
+        let mut wide = vec![0u16; needed as usize];
+        let written =
+            MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), length, wide.as_mut_ptr(), needed);
+        if written <= 0 {
+            return lossy();
+        }
+        String::from_utf16_lossy(&wide[..written as usize])
+    }
+}
+
+#[cfg(not(windows))]
+fn decode_legacy_console(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn utf8_output_passes_through_unchanged() {
+        assert_eq!(
+            super::decode_shell_output("héllo 中文\n".as_bytes()),
+            "héllo 中文\n"
+        );
+        assert_eq!(super::decode_shell_output(b"plain ascii"), "plain ascii");
+    }
+
+    /// `'pwd' 不是内部或外部命令…` arrives as GBK bytes on zh-CN Windows
+    /// (code page 936); it must decode to the original text, not mojibake.
+    #[cfg(windows)]
+    #[test]
+    fn gbk_console_output_decodes_on_chinese_windows() {
+        if unsafe { windows_sys::Win32::Globalization::GetACP() } != 936 {
+            return; // other locales decode via their own ANSI code page
+        }
+        let gbk = [
+            0x27, 0x70, 0x77, 0x64, 0x27, 0x20, // 'pwd'␠
+            0xB2, 0xBB, 0xCA, 0xC7, 0xC4, 0xDA, 0xB2, 0xBF, 0xBB, 0xF2, 0xCD, 0xE2, 0xB2, 0xBF,
+            0xC3, 0xFC, 0xC1, 0xEE, // 不是内部或外部命令
+        ];
+        assert_eq!(super::decode_shell_output(&gbk), "'pwd' 不是内部或外部命令");
+    }
 }
 
 #[cfg(windows)]
