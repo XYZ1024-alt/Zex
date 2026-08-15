@@ -58,40 +58,43 @@ const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-// Ink Indigo palette: cool near-black base with tinted surfaces and a
-// restrained soft-blue accent. Surfaces stay within ~6-14 RGB steps of the
-// base so background bands read as a whisper, not slabs.
-const BACKGROUND: Color = Color::Rgb(15, 17, 22);
-const SURFACE: Color = Color::Rgb(22, 25, 31);
-const SURFACE_HOVER: Color = Color::Rgb(29, 33, 41);
-const SURFACE_RAISED: Color = Color::Rgb(37, 42, 52);
-const TEXT: Color = Color::Rgb(207, 213, 224);
-const TEXT_STRONG: Color = Color::Rgb(235, 239, 246);
-const TEXT_DIM: Color = Color::Rgb(155, 163, 178);
-const TEXT_FAINT: Color = Color::Rgb(99, 107, 122);
-const GRAY_DIM: Color = Color::Rgb(80, 87, 100);
-const ACCENT_PRIMARY: Color = Color::Rgb(137, 171, 240);
-const ACCENT_SECONDARY: Color = Color::Rgb(188, 168, 232);
-const ACCENT_USER: Color = Color::Rgb(196, 201, 212);
+// Tokyo Night palette on a transparent base: the terminal's own background
+// shows through, foregrounds use the cool blue/violet ramp. Surface bands
+// stay low-contrast so highlights read as a whisper, not slabs.
+const BACKGROUND: Color = Color::Reset;
+// Fixed dark ink used only as the blend target for fades/shimmers; never
+// painted as a background.
+const BASE_INK: Color = Color::Rgb(26, 27, 38);
+const SURFACE: Color = Color::Rgb(31, 35, 53);
+const SURFACE_HOVER: Color = Color::Rgb(41, 46, 66);
+const SURFACE_RAISED: Color = Color::Rgb(55, 62, 92);
+const TEXT: Color = Color::Rgb(192, 202, 245);
+const TEXT_STRONG: Color = Color::Rgb(224, 230, 251);
+const TEXT_DIM: Color = Color::Rgb(115, 122, 162);
+const TEXT_FAINT: Color = Color::Rgb(86, 95, 137);
+const GRAY_DIM: Color = Color::Rgb(65, 72, 104);
+const ACCENT_PRIMARY: Color = Color::Rgb(56, 189, 248);
+const ACCENT_SECONDARY: Color = Color::Rgb(167, 139, 250);
+const ACCENT_USER: Color = Color::Rgb(200, 206, 230);
 const ACCENT_THINKING: Color = ACCENT_SECONDARY;
 // Tool chrome deliberately blends into the gray ramp; only status colors pop.
 const ACCENT_TOOL: Color = TEXT_FAINT;
-const BORDER: Color = Color::Rgb(38, 43, 53);
-const BORDER_ACTIVE: Color = Color::Rgb(66, 76, 94);
-const OK: Color = Color::Rgb(152, 195, 132);
-const BAD: Color = Color::Rgb(224, 122, 133);
-// Semantic accents, kept muted so at most three hues are on screen at once.
-const COMMAND: Color = Color::Rgb(196, 168, 124);
-const RUNNING: Color = Color::Rgb(125, 196, 222);
-const MODEL_ACCENT: Color = Color::Rgb(118, 196, 186);
-const MD_CODE: Color = Color::Rgb(148, 158, 210);
-const CODE_BG: Color = Color::Rgb(19, 22, 28);
-const DIFF_ADD_BG: Color = Color::Rgb(22, 40, 31);
-const DIFF_DEL_BG: Color = Color::Rgb(46, 26, 31);
+const BORDER: Color = Color::Rgb(41, 46, 66);
+const BORDER_ACTIVE: Color = Color::Rgb(84, 92, 126);
+const OK: Color = Color::Rgb(158, 206, 106);
+const BAD: Color = Color::Rgb(247, 118, 142);
+// Semantic accents: sky blue leads, violet thinks, orange runs commands.
+const COMMAND: Color = Color::Rgb(255, 166, 87);
+const RUNNING: Color = Color::Rgb(125, 207, 255);
+const MODEL_ACCENT: Color = Color::Rgb(255, 171, 112);
+const MD_CODE: Color = Color::Rgb(130, 170, 255);
+const CODE_BG: Color = Color::Rgb(24, 26, 38);
+const DIFF_ADD_BG: Color = Color::Rgb(26, 48, 38);
+const DIFF_DEL_BG: Color = Color::Rgb(61, 35, 42);
 const PRODUCT_NAME: &str = "ZEX";
-// Wordmark palette: a single silver tone for the block letters,
+// Wordmark palette: a single sky tone for the block letters,
 // animated by the shimmer sweep.
-const WORDMARK_INK: Color = Color::Rgb(148, 155, 172);
+const WORDMARK_INK: Color = Color::Rgb(125, 207, 255);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WelcomeActionKind {

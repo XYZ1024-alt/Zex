@@ -498,6 +498,16 @@ fn render_page_header(
             Rect::new(area.x, area.y + 1, area.width, 1),
         );
     }
+    if area.height >= 3 {
+        // Theme-tinted rule separating the header from the list below.
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "─".repeat(area.width as usize),
+                Style::default().fg(BORDER_ACTIVE),
+            )),
+            Rect::new(area.x, area.y + 2, area.width, 1),
+        );
+    }
 }
 
 fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -1635,7 +1645,7 @@ fn logo_shimmer_color(base: Color, row: usize, column: usize) -> Color {
     let breath = ((tick * 83) % 5000) as f64 / 5000.0 * std::f64::consts::TAU;
     brightness *= 0.85 + 0.15 * breath.sin().abs();
     crate::tui::anim::blend_color(
-        crate::tui::anim::blend_color(base, BACKGROUND, 0.45),
+        crate::tui::anim::blend_color(base, BASE_INK, 0.45),
         crate::tui::anim::blend_color(base, TEXT_STRONG, 0.35),
         brightness,
     )
@@ -2779,14 +2789,16 @@ fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn composer_border_color(app: &App) -> Color {
+    // Focused chrome picks up a whisper of the primary accent.
+    let focused = crate::tui::anim::blend_color(BORDER_ACTIVE, ACCENT_PRIMARY, 0.5);
     if crate::tui::anim::frozen() {
         return if app.busy || app.input_focused {
-            BORDER_ACTIVE
+            focused
         } else {
             BORDER
         };
     }
-    crate::tui::anim::blend_color(BORDER, BORDER_ACTIVE, app.focus_blend)
+    crate::tui::anim::blend_color(BORDER, focused, app.focus_blend)
 }
 
 #[cfg(test)]
@@ -3152,7 +3164,7 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     if let Some(toast) = &app.toast {
         let opacity = toast.opacity();
-        let ink = |color: Color| crate::tui::anim::blend_color(BACKGROUND, color, opacity);
+        let ink = |color: Color| crate::tui::anim::blend_color(BASE_INK, color, opacity);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("● ", Style::default().fg(ink(toast.color()))),

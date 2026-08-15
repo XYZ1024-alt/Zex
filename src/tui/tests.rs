@@ -699,7 +699,7 @@ fn empty_state_centers_a_large_zex_wordmark_and_focused_prompt_surface() {
     assert!(screen.contains("D:/workspaces/zex") || screen.contains("workspaces/zex"));
     assert!(!screen.contains("● idle"));
     assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
-    assert_eq!(BACKGROUND, Color::Rgb(15, 17, 22));
+    assert_eq!(BACKGROUND, Color::Reset);
     assert!(
         !regions.hero.is_empty(),
         "width 104 should use the hero box"
@@ -998,13 +998,13 @@ fn every_draw_paints_the_full_terminal_background() {
 
 #[test]
 fn night_palette_uses_shipped_default_rgb_values() {
-    assert_eq!(BACKGROUND, Color::Rgb(15, 17, 22));
-    assert_eq!(super::TEXT, Color::Rgb(207, 213, 224));
-    assert_eq!(SURFACE, Color::Rgb(22, 25, 31));
-    assert_eq!(SURFACE_RAISED, Color::Rgb(37, 42, 52));
-    assert_eq!(ACCENT_PRIMARY, Color::Rgb(137, 171, 240));
-    assert_eq!(super::ACCENT_SECONDARY, Color::Rgb(188, 168, 232));
-    assert_eq!(BAD, Color::Rgb(224, 122, 133));
+    assert_eq!(BACKGROUND, Color::Reset);
+    assert_eq!(super::TEXT, Color::Rgb(192, 202, 245));
+    assert_eq!(SURFACE, Color::Rgb(31, 35, 53));
+    assert_eq!(SURFACE_RAISED, Color::Rgb(55, 62, 92));
+    assert_eq!(ACCENT_PRIMARY, Color::Rgb(56, 189, 248));
+    assert_eq!(super::ACCENT_SECONDARY, Color::Rgb(167, 139, 250));
+    assert_eq!(BAD, Color::Rgb(247, 118, 142));
     assert_ne!(ACCENT_PRIMARY, Color::Rgb(120, 158, 166));
 }
 
