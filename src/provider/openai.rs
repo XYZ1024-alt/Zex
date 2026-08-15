@@ -90,13 +90,10 @@ impl OpenAiProvider {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_owned();
-        let body = response
-            .bytes()
-            .await
-            .context("failed to read provider response body")?;
+        let (body, message) =
+            read_response_body(response, &content_type, self.api, events).await?;
         let elapsed = started.elapsed();
         let output_tokens = response_output_tokens(&body, &content_type, self.api);
-        let message = parse_response_body(&body, &content_type, self.api, events)?;
         if let Some(output_tokens) = output_tokens.filter(|tokens| *tokens > 0) {
             let _ = events.send(AgentEvent::ProviderUsage {
                 output_tokens,
@@ -550,6 +547,106 @@ struct ToolCallAccumulator {
     arguments: String,
 }
 
+/// A stream that goes silent for this long is treated as wedged: relays keep
+/// SSE connections alive with ping/keep-alive bytes, so a complete stall means
+/// the upstream will never finish. Aborting here beats waiting out the (much
+/// longer) overall request timeout with a dead-looking UI.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+enum ResponseMode {
+    /// Nothing classifiable received yet (only whitespace so far).
+    Undecided,
+    /// SSE stream parsed incrementally, deltas forwarded live.
+    Stream(SseParser),
+    /// Non-SSE body; buffered whole and parsed at EOF.
+    Buffered,
+}
+
+/// Read the provider response. SSE bodies are parsed line by line as chunks
+/// arrive so thinking and text deltas reach the UI immediately; other bodies
+/// keep the old buffer-then-parse behavior.
+async fn read_response_body(
+    mut response: reqwest::Response,
+    content_type: &str,
+    api: OpenAiApi,
+    events: &EventSender,
+) -> Result<(Vec<u8>, AssistantMessage)> {
+    let mut body = Vec::new();
+    let mut carry = Vec::new();
+    let mut mode = if content_type.contains("text/event-stream") {
+        ResponseMode::Stream(SseParser::new(api))
+    } else {
+        ResponseMode::Undecided
+    };
+
+    loop {
+        let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                return Err(error).context("failed to read provider response body");
+            }
+            Err(_) => bail!(
+                "provider stream stalled: no data for {} seconds",
+                STREAM_IDLE_TIMEOUT.as_secs()
+            ),
+        };
+        body.extend_from_slice(&chunk);
+        match &mut mode {
+            ResponseMode::Undecided => {
+                carry.extend_from_slice(&chunk);
+                if body_looks_like_sse(&body) {
+                    mode = ResponseMode::Stream(SseParser::new(api));
+                } else if body.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    mode = ResponseMode::Buffered;
+                }
+                if let ResponseMode::Stream(parser) = &mut mode {
+                    feed_complete_lines(&mut carry, parser, events)?;
+                }
+            }
+            ResponseMode::Stream(parser) => {
+                carry.extend_from_slice(&chunk);
+                feed_complete_lines(&mut carry, parser, events)?;
+            }
+            ResponseMode::Buffered => {}
+        }
+    }
+
+    match mode {
+        ResponseMode::Stream(mut parser) => {
+            if !carry.is_empty() {
+                parser.feed_line(&carry, events)?;
+            }
+            let message = parser.finish(events)?;
+            Ok((body, message))
+        }
+        ResponseMode::Undecided | ResponseMode::Buffered => {
+            let message = parse_response_body(&body, content_type, api, events)?;
+            Ok((body, message))
+        }
+    }
+}
+
+fn body_looks_like_sse(body: &[u8]) -> bool {
+    body.split(|byte| *byte == b'\n')
+        .any(|line| line.trim_ascii_start().starts_with(b"data:"))
+}
+
+/// Feed every newline-terminated line currently in the carry buffer to the
+/// parser. A multibyte UTF-8 character split across chunks is reassembled
+/// inside the buffer before its line is parsed.
+fn feed_complete_lines(
+    carry: &mut Vec<u8>,
+    parser: &mut SseParser,
+    events: &EventSender,
+) -> Result<()> {
+    while let Some(pos) = carry.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<u8> = carry.drain(..=pos).collect();
+        parser.feed_line(&line[..line.len() - 1], events)?;
+    }
+    Ok(())
+}
+
 fn parse_response_body(
     body: &[u8],
     content_type: &str,
@@ -569,9 +666,7 @@ fn parse_response_body(
         .copied()
         .find(|byte| !byte.is_ascii_whitespace());
     let looks_like_json = matches!(first_byte, Some(b'{') | Some(b'['));
-    let looks_like_sse = body
-        .split(|byte| *byte == b'\n')
-        .any(|line| line.trim_ascii_start().starts_with(b"data:"));
+    let looks_like_sse = body_looks_like_sse(body);
 
     if content_type.contains("text/event-stream") || looks_like_sse {
         return match api {
@@ -636,67 +731,121 @@ fn output_tokens_from_value(value: &Value, api: OpenAiApi) -> Option<u64> {
 }
 
 fn parse_chat_stream_body(body: &[u8], events: &EventSender) -> Result<AssistantMessage> {
-    let mut content = String::new();
-    let mut thinking = String::new();
-    let mut provider_state = ChatProviderState::default();
-    let mut tool_calls = BTreeMap::<usize, ToolCallAccumulator>::new();
-    let (parsed_events, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
-
+    let mut parser = ChatStreamParser::new();
     for line in body.split(|byte| *byte == b'\n') {
-        consume_sse_line(
-            line,
-            &mut content,
-            &mut thinking,
-            &mut provider_state,
-            &mut tool_calls,
-            &parsed_events,
-        )?;
+        parser.feed_line(line, events)?;
     }
-
-    let message = finish_message(content, thinking, provider_state.finish(), tool_calls);
-    drop(parsed_events);
-    let parsed_events = std::iter::from_fn(|| event_receiver.try_recv().ok()).collect();
-    emit_separated_message(events, &message, parsed_events);
-    Ok(message)
+    parser.finish(events)
 }
 
-fn emit_separated_message(
-    events: &EventSender,
-    message: &AssistantMessage,
-    parsed_events: Vec<AgentEvent>,
-) {
-    let mut thinking_emitted = false;
-    let mut content_emitted = false;
-    for event in parsed_events {
-        match event {
-            AgentEvent::ThinkingDelta { delta } if message.thinking.is_some() => {
-                thinking_emitted = true;
-                let _ = events.send(AgentEvent::ThinkingDelta { delta });
-            }
-            AgentEvent::MessageDelta {
-                role: MessageRole::Assistant,
-                delta,
-            } if message.thinking.is_none() => {
-                content_emitted = true;
-                let _ = events.send(AgentEvent::MessageDelta {
-                    role: MessageRole::Assistant,
-                    delta,
-                });
-            }
-            _ => {}
+enum SseParser {
+    Chat(ChatStreamParser),
+    Responses(ResponsesStreamParser),
+}
+
+impl SseParser {
+    fn new(api: OpenAiApi) -> Self {
+        match api {
+            OpenAiApi::ChatCompletions => Self::Chat(ChatStreamParser::new()),
+            OpenAiApi::Responses => Self::Responses(ResponsesStreamParser::default()),
         }
     }
 
-    if !thinking_emitted && let Some(thinking) = &message.thinking {
-        let _ = events.send(AgentEvent::ThinkingDelta {
-            delta: thinking.clone(),
-        });
+    fn feed_line(&mut self, line: &[u8], events: &EventSender) -> Result<()> {
+        match self {
+            Self::Chat(parser) => parser.feed_line(line, events),
+            Self::Responses(parser) => parser.feed_line(line, events),
+        }
     }
-    if !content_emitted && !message.content.is_empty() {
-        let _ = events.send(AgentEvent::MessageDelta {
-            role: MessageRole::Assistant,
-            delta: message.content.clone(),
-        });
+
+    fn finish(self, events: &EventSender) -> Result<AssistantMessage> {
+        match self {
+            Self::Chat(parser) => parser.finish(events),
+            Self::Responses(parser) => parser.finish(events),
+        }
+    }
+}
+
+/// Incremental Chat Completions SSE parser. Thinking deltas are forwarded to
+/// the UI as they arrive (receiving one guarantees the final message has
+/// non-empty thinking); content deltas stay buffered until `finish` so
+/// `finish_message`'s `<think>` tag splitting still decides what is shown.
+struct ChatStreamParser {
+    content: String,
+    thinking: String,
+    provider_state: ChatProviderState,
+    tool_calls: BTreeMap<usize, ToolCallAccumulator>,
+    parsed_events: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+    parsed_event_receiver: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    pending_content: Vec<AgentEvent>,
+    thinking_emitted: bool,
+}
+
+impl ChatStreamParser {
+    fn new() -> Self {
+        let (parsed_events, parsed_event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            content: String::new(),
+            thinking: String::new(),
+            provider_state: ChatProviderState::default(),
+            tool_calls: BTreeMap::new(),
+            parsed_events,
+            parsed_event_receiver,
+            pending_content: Vec::new(),
+            thinking_emitted: false,
+        }
+    }
+
+    fn feed_line(&mut self, line: &[u8], events: &EventSender) -> Result<()> {
+        consume_sse_line(
+            line,
+            &mut self.content,
+            &mut self.thinking,
+            &mut self.provider_state,
+            &mut self.tool_calls,
+            &self.parsed_events,
+        )?;
+        while let Ok(event) = self.parsed_event_receiver.try_recv() {
+            match event {
+                AgentEvent::ThinkingDelta { .. } => {
+                    self.thinking_emitted = true;
+                    let _ = events.send(event);
+                }
+                event => self.pending_content.push(event),
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, events: &EventSender) -> Result<AssistantMessage> {
+        drop(self.parsed_events);
+        while let Ok(event) = self.parsed_event_receiver.try_recv() {
+            self.pending_content.push(event);
+        }
+        let message = finish_message(
+            self.content,
+            self.thinking,
+            self.provider_state.finish(),
+            self.tool_calls,
+        );
+        if let Some(thinking) = &message.thinking {
+            if !self.thinking_emitted {
+                let _ = events.send(AgentEvent::ThinkingDelta {
+                    delta: thinking.clone(),
+                });
+            }
+            if !message.content.is_empty() {
+                let _ = events.send(AgentEvent::MessageDelta {
+                    role: MessageRole::Assistant,
+                    delta: message.content.clone(),
+                });
+            }
+        } else {
+            for event in std::mem::take(&mut self.pending_content) {
+                let _ = events.send(event);
+            }
+        }
+        Ok(message)
     }
 }
 
@@ -1025,20 +1174,34 @@ fn parse_responses_non_stream_body(body: &[u8], events: &EventSender) -> Result<
 }
 
 fn parse_responses_stream_body(body: &[u8], events: &EventSender) -> Result<AssistantMessage> {
-    let mut content = String::new();
-    let mut thinking = String::new();
-    let mut output = Vec::<Value>::new();
-    let mut completed_output = None;
-    let mut response_error = None;
-
+    let mut parser = ResponsesStreamParser::default();
     for line in body.split(|byte| *byte == b'\n') {
+        parser.feed_line(line, events)?;
+    }
+    parser.finish(events)
+}
+
+/// Incremental Responses API SSE parser. Text and reasoning-summary deltas are
+/// forwarded to the UI as they arrive; the final message is assembled from the
+/// completed response output in `finish`.
+#[derive(Default)]
+struct ResponsesStreamParser {
+    content: String,
+    thinking: String,
+    output: Vec<Value>,
+    completed_output: Option<Vec<Value>>,
+    response_error: Option<String>,
+}
+
+impl ResponsesStreamParser {
+    fn feed_line(&mut self, line: &[u8], events: &EventSender) -> Result<()> {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         let Some(data) = line.strip_prefix(b"data:") else {
-            continue;
+            return Ok(());
         };
         let data = data.strip_prefix(b" ").unwrap_or(data);
         if data == b"[DONE]" || data.is_empty() {
-            continue;
+            return Ok(());
         }
 
         let event: Value = serde_json::from_slice(data)
@@ -1046,7 +1209,7 @@ fn parse_responses_stream_body(body: &[u8], events: &EventSender) -> Result<Assi
         match event.get("type").and_then(Value::as_str) {
             Some("response.output_text.delta") => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    content.push_str(delta);
+                    self.content.push_str(delta);
                     let _ = events.send(AgentEvent::MessageDelta {
                         role: MessageRole::Assistant,
                         delta: delta.to_owned(),
@@ -1055,7 +1218,7 @@ fn parse_responses_stream_body(body: &[u8], events: &EventSender) -> Result<Assi
             }
             Some("response.reasoning_summary_text.delta") => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    thinking.push_str(delta);
+                    self.thinking.push_str(delta);
                     let _ = events.send(AgentEvent::ThinkingDelta {
                         delta: delta.to_owned(),
                     });
@@ -1063,55 +1226,59 @@ fn parse_responses_stream_body(body: &[u8], events: &EventSender) -> Result<Assi
             }
             Some("response.output_item.done") => {
                 if let Some(item) = event.get("item") {
-                    output.push(item.clone());
+                    self.output.push(item.clone());
                 }
             }
             Some("response.completed") => {
-                completed_output = event
+                self.completed_output = event
                     .get("response")
                     .and_then(|response| response.get("output"))
                     .and_then(Value::as_array)
                     .cloned();
             }
             Some("response.failed") | Some("error") => {
-                response_error = response_stream_error(&event);
+                self.response_error = response_stream_error(&event);
             }
             _ => {}
         }
+        Ok(())
     }
 
-    if let Some(error) = response_error {
-        bail!("Responses API stream failed: {error}");
-    }
-    if let Some(completed_output) = completed_output {
-        output = completed_output;
-    }
+    fn finish(self, events: &EventSender) -> Result<AssistantMessage> {
+        if let Some(error) = self.response_error {
+            bail!("Responses API stream failed: {error}");
+        }
+        let output = self.completed_output.unwrap_or(self.output);
 
-    let (completion_events, mut completion_event_receiver) = tokio::sync::mpsc::unbounded_channel();
-    let mut message = finish_responses_message(output, &completion_events, !content.is_empty())?;
-    drop(completion_events);
-    let completion_events =
-        std::iter::from_fn(|| completion_event_receiver.try_recv().ok()).collect::<Vec<_>>();
-    if !content.is_empty() {
-        let (fallback_thinking, stripped_content) = split_think_tags(&content);
-        message.content = stripped_content;
-        if thinking.is_empty()
-            && message.thinking.is_none()
-            && let Some(fallback_thinking) = fallback_thinking
-        {
-            thinking = fallback_thinking;
+        let (completion_events, mut completion_event_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        let mut message =
+            finish_responses_message(output, &completion_events, !self.content.is_empty())?;
+        drop(completion_events);
+        let completion_events =
+            std::iter::from_fn(|| completion_event_receiver.try_recv().ok()).collect::<Vec<_>>();
+        let mut thinking = self.thinking;
+        if !self.content.is_empty() {
+            let (fallback_thinking, stripped_content) = split_think_tags(&self.content);
+            message.content = stripped_content;
+            if thinking.is_empty()
+                && message.thinking.is_none()
+                && let Some(fallback_thinking) = fallback_thinking
+            {
+                thinking = fallback_thinking;
+            }
         }
-    }
-    if !thinking.is_empty() {
-        message.thinking = Some(thinking);
-    }
-    for event in completion_events {
-        if matches!(event, AgentEvent::ThinkingDelta { .. }) && message.thinking.is_some() {
-            continue;
+        if !thinking.is_empty() {
+            message.thinking = Some(thinking);
         }
-        let _ = events.send(event);
+        for event in completion_events {
+            if matches!(event, AgentEvent::ThinkingDelta { .. }) && message.thinking.is_some() {
+                continue;
+            }
+            let _ = events.send(event);
+        }
+        Ok(message)
     }
-    Ok(message)
 }
 
 fn finish_responses_message(

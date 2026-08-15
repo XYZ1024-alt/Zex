@@ -603,3 +603,142 @@ data: {"type":"response.completed","response":{"output":[{"type":"message","role
         event => panic!("unexpected event: {event:?}"),
     }
 }
+
+fn parse_one_shot(api: OpenAiApi, body: &[u8]) -> (crate::agent::AssistantMessage, Vec<AgentEvent>) {
+    let (events, mut receiver) = mpsc::unbounded_channel();
+    let message = parse_response_body(body, "text/event-stream", api, &events).unwrap();
+    let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+    (message, events)
+}
+
+/// Feed the body through the incremental stream machinery in fixed-size
+/// chunks, mirroring how `read_response_body` drives it.
+fn parse_chunked(
+    api: OpenAiApi,
+    body: &[u8],
+    chunk_size: usize,
+) -> (crate::agent::AssistantMessage, Vec<AgentEvent>) {
+    let (events, mut receiver) = mpsc::unbounded_channel();
+    let mut parser = super::SseParser::new(api);
+    let mut carry = Vec::new();
+    for chunk in body.chunks(chunk_size.max(1)) {
+        carry.extend_from_slice(chunk);
+        super::feed_complete_lines(&mut carry, &mut parser, &events).unwrap();
+    }
+    if !carry.is_empty() {
+        parser.feed_line(&carry, &events).unwrap();
+    }
+    let message = parser.finish(&events).unwrap();
+    let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+    (message, events)
+}
+
+fn assert_same_message(
+    one_shot: &(crate::agent::AssistantMessage, Vec<AgentEvent>),
+    chunked: &(crate::agent::AssistantMessage, Vec<AgentEvent>),
+) {
+    assert_eq!(one_shot.0.content, chunked.0.content);
+    assert_eq!(one_shot.0.thinking, chunked.0.thinking);
+    assert_eq!(one_shot.0.tool_calls, chunked.0.tool_calls);
+    assert_eq!(one_shot.0.provider_state, chunked.0.provider_state);
+    assert_eq!(one_shot.1, chunked.1);
+}
+
+#[test]
+fn chunked_chat_stream_matches_one_shot_at_every_split_point() {
+    let body: &[u8] = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"思考一下\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"pa\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"x\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"你好，世界\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .as_bytes();
+    let expected = parse_one_shot(OpenAiApi::ChatCompletions, body);
+    // Every two-chunk split, including splits inside multibyte UTF-8.
+    for split in 0..=body.len() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let mut parser = super::SseParser::new(OpenAiApi::ChatCompletions);
+        let mut carry = body[..split].to_vec();
+        super::feed_complete_lines(&mut carry, &mut parser, &events).unwrap();
+        carry.extend_from_slice(&body[split..]);
+        super::feed_complete_lines(&mut carry, &mut parser, &events).unwrap();
+        if !carry.is_empty() {
+            parser.feed_line(&carry, &events).unwrap();
+        }
+        let message = parser.finish(&events).unwrap();
+        let collected: Vec<AgentEvent> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert_same_message(&expected, &(message, collected));
+    }
+    // Many small chunks exercise the carry buffer across partial lines.
+    assert_same_message(&expected, &parse_chunked(OpenAiApi::ChatCompletions, body, 5));
+}
+
+#[test]
+fn chunked_responses_stream_matches_one_shot() {
+    let body: &[u8] = concat!(
+        "event: response.reasoning_summary_text.delta\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"想\"}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你\"}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"好\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"想\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"你好\"}]}],\"usage\":{\"output_tokens\":9}}}\n\n",
+    )
+    .as_bytes();
+    let expected = parse_one_shot(OpenAiApi::Responses, body);
+    assert_same_message(&expected, &parse_chunked(OpenAiApi::Responses, body, 1));
+    assert_same_message(&expected, &parse_chunked(OpenAiApi::Responses, body, 7));
+    assert_same_message(&expected, &parse_chunked(OpenAiApi::Responses, body, body.len()));
+}
+
+#[test]
+fn incremental_parsers_emit_deltas_before_finish() {
+    let (events, mut receiver) = mpsc::unbounded_channel();
+
+    let mut responses = super::ResponsesStreamParser::default();
+    responses
+        .feed_line(
+            r#"data: {"type":"response.output_text.delta","delta":"你"}"#.as_bytes(),
+            &events,
+        )
+        .unwrap();
+    assert_eq!(
+        receiver.try_recv().unwrap(),
+        AgentEvent::MessageDelta {
+            role: MessageRole::Assistant,
+            delta: "你".to_owned(),
+        }
+    );
+
+    let mut chat = super::ChatStreamParser::new();
+    chat.feed_line(
+        r#"data: {"choices":[{"delta":{"reasoning_content":"想"}}]}"#.as_bytes(),
+        &events,
+    )
+    .unwrap();
+    assert_eq!(
+        receiver.try_recv().unwrap(),
+        AgentEvent::ThinkingDelta {
+            delta: "想".to_owned(),
+        }
+    );
+    // Chat content stays buffered until finish so <think> splitting applies.
+    chat.feed_line(
+        r#"data: {"choices":[{"delta":{"content":"答"}}]}"#.as_bytes(),
+        &events,
+    )
+    .unwrap();
+    assert!(receiver.try_recv().is_err());
+    let message = chat.finish(&events).unwrap();
+    assert_eq!(message.content, "答");
+    assert_eq!(
+        receiver.try_recv().unwrap(),
+        AgentEvent::MessageDelta {
+            role: MessageRole::Assistant,
+            delta: "答".to_owned(),
+        }
+    );
+}
