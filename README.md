@@ -90,6 +90,26 @@ max = "max"
 | `default_thinking_level` | `medium` | 新会话默认思考强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
 | `hide_thinking_block` | `false` | 是否隐藏 TUI 中默认折叠的思考卡片；隐藏不删除会话数据，也不影响模型实际思考 |
 | `session_dir` | 全局 `sessions` 目录 | 自定义会话目录；相对路径基于项目工作目录 |
+| `theme` | 内置配色 | TUI 配色覆盖，见下方 `[theme]` 说明 |
+
+### `[theme]` 自定义配色
+
+TUI 的全部颜色都可以在 `config.toml`（全局或项目，项目逐键覆盖全局）的 `[theme]` 段里覆盖。值为 `"#rgb"` 或 `"#rrggbb"` 十六进制颜色，或 `"default"` 表示跟随终端自身的颜色；未设置的键保持内置默认（青蓝主色 + 紫/琥珀点缀的中性灰配色）。
+
+```toml
+[theme]
+accent_primary = "#7dcfff"    # 主强调色（天蓝）：输入提示、选中项
+accent_secondary = "#bb9af7"  # 次强调色（紫）：思考块
+command = "#ff9e64"           # 命令/工具执行（橙）
+text = "#c0caf5"              # 正文
+text_dim = "#737aa2"          # 次要文字
+border = "#292e42"            # 边框
+ok = "#9ece6a"                # 成功
+bad = "#f7768e"               # 失败
+background = "default"        # 透明底座：跟随终端背景
+```
+
+全部可配置键：`background`、`surface`、`surface_hover`、`surface_raised`、`text`、`text_strong`、`text_dim`、`text_faint`、`gray_dim`、`accent_primary`、`accent_secondary`、`accent_user`、`accent_thinking`、`accent_tool`、`border`、`border_active`、`ok`、`bad`、`command`、`running`、`model_accent`、`md_code`、`code_bg`、`diff_add_bg`、`diff_del_bg`、`wordmark_ink`。其中 `accent_thinking` 默认跟随 `accent_secondary`，`accent_tool` 默认跟随 `text_faint`，可单独覆盖。
 
 Zex 启动时从 `https://models.dev/api.json` 刷新模型思考能力，并把原始响应缓存为全局目录下的 `models-dev-cache.json`。刷新失败时优先使用缓存；缓存也不可用时使用安全默认 `off/low/medium/high`。模型优先按 Provider ID 匹配；自定义 Provider ID 还会用配置的 API base URL 匹配 models.dev Provider；仍无法匹配时，只对全局唯一的模型 ID 使用发现结果。`reasoning_options` 中的 effort 值会映射到本地固定梯子；`reasoning = false` 强制为 `off`。只有 toggle 或 token-budget、但没有 effort 选项的模型不会被误发 `reasoning_effort`。Provider/模型的手动 `[thinking]` 与 `[compat]` 配置始终覆盖 models.dev 数据。
 

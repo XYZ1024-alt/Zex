@@ -439,3 +439,86 @@ fn explicit_global_config_directory_has_priority() {
 
     assert_eq!(super::global_config_dir().unwrap(), directory);
 }
+
+#[test]
+fn theme_color_parses_hex_and_terminal_keywords() {
+    use super::ThemeColor;
+
+    assert_eq!(
+        ThemeColor::parse("#7df").unwrap(),
+        ThemeColor::Rgb(0x77, 0xdd, 0xff)
+    );
+    assert_eq!(
+        ThemeColor::parse("#7DCFFF").unwrap(),
+        ThemeColor::Rgb(0x7d, 0xcf, 0xff)
+    );
+    assert_eq!(
+        ThemeColor::parse(" default ").unwrap(),
+        ThemeColor::Terminal
+    );
+    assert_eq!(ThemeColor::parse("RESET").unwrap(), ThemeColor::Terminal);
+
+    for invalid in ["", "red", "7dcfff", "#12", "#12345", "#1234567", "#zzzzzz"] {
+        assert!(
+            ThemeColor::parse(invalid).is_err(),
+            "{invalid:?} should fail"
+        );
+    }
+}
+
+#[tokio::test]
+async fn theme_overrides_merge_project_over_global() {
+    let _environment = EnvGuard::clear();
+    let root = temp_directory("theme");
+    let project = root.join("project");
+    let global = root.join("global");
+    write_config(
+        &global.join("config.toml"),
+        r##"
+[theme]
+accent_primary = "#111111"
+accent_secondary = "#222222"
+"##,
+    )
+    .await;
+    write_config(
+        &project.join(".zex/config.toml"),
+        r##"
+[theme]
+accent_primary = "#333333"
+"##,
+    )
+    .await;
+
+    let config = Config::load_from(&project, &global).await.unwrap();
+
+    assert_eq!(
+        config.theme.accent_primary,
+        Some(super::ThemeColor::Rgb(0x33, 0x33, 0x33))
+    );
+    assert_eq!(
+        config.theme.accent_secondary,
+        Some(super::ThemeColor::Rgb(0x22, 0x22, 0x22))
+    );
+    assert_eq!(config.theme.background, None);
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_theme_color_fails_config_load() {
+    let _environment = EnvGuard::clear();
+    let root = temp_directory("theme-invalid");
+    let project = root.join("project");
+    let global = root.join("global");
+    write_config(
+        &project.join(".zex/config.toml"),
+        r#"
+[theme]
+accent_primary = "not-a-color"
+"#,
+    )
+    .await;
+
+    assert!(Config::load_from(&project, &global).await.is_err());
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}

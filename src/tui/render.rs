@@ -4,9 +4,10 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     app.begin_render();
     frame.render_widget(Clear, area);
-    frame
-        .buffer_mut()
-        .set_style(area, Style::default().fg(TEXT).bg(BACKGROUND));
+    frame.buffer_mut().set_style(
+        area,
+        Style::default().fg(theme().text).bg(theme().background),
+    );
 
     if app.landing_visible() && !app.page_open() {
         render_landing(frame, area, app);
@@ -47,7 +48,7 @@ fn render_location_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     frame.render_widget(
         Paragraph::new(location_line(app, area.width as usize))
-            .style(Style::default().bg(BACKGROUND)),
+            .style(Style::default().bg(theme().background)),
         area,
     );
 }
@@ -63,12 +64,14 @@ fn location_line(app: &App, width: usize) -> Line<'static> {
         };
         spans.push(Span::styled(
             branch,
-            Style::default().fg(TEXT).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(theme().text)
+                .add_modifier(Modifier::DIM),
         ));
         if git.dirty_count > 0 {
             spans.push(Span::styled(
                 format!(" *{}", git.dirty_count),
-                Style::default().fg(TEXT_FAINT),
+                Style::default().fg(theme().text_faint),
             ));
         }
         spans.push(Span::raw("  "));
@@ -79,7 +82,7 @@ fn location_line(app: &App, width: usize) -> Line<'static> {
     } else {
         path
     };
-    spans.push(Span::styled(path, Style::default().fg(GRAY_DIM)));
+    spans.push(Span::styled(path, Style::default().fg(theme().gray_dim)));
     Line::from(truncate_spans(spans, width))
 }
 
@@ -177,7 +180,7 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
                 Paragraph::new(Span::styled(
                     "No saved sessions",
                     Style::default()
-                        .fg(TEXT_STRONG)
+                        .fg(theme().text_strong)
                         .add_modifier(Modifier::BOLD),
                 )),
                 Rect::new(list.x, list.y, list.width, 1),
@@ -187,7 +190,7 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     "Start a conversation and it will appear here.",
-                    Style::default().fg(TEXT_DIM),
+                    Style::default().fg(theme().text_dim),
                 )),
                 Rect::new(list.x, list.y + 1, list.width, 1),
             );
@@ -213,8 +216,16 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
             if item.is_empty() {
                 continue;
             }
-            let foreground = if selected { TEXT_STRONG } else { TEXT };
-            let secondary = if selected { TEXT } else { TEXT_DIM };
+            let foreground = if selected {
+                theme().text_strong
+            } else {
+                theme().text
+            };
+            let secondary = if selected {
+                theme().text
+            } else {
+                theme().text_dim
+            };
             let timestamp = format_session_time(session.updated_at);
             let metadata = format!(
                 "{} · {} message{}",
@@ -251,11 +262,11 @@ fn render_session_picker(frame: &mut Frame<'_>, viewport: Rect, app: &mut App) {
 
 fn row_highlight(selected: bool, hovered: bool) -> Color {
     if selected {
-        SURFACE_RAISED
+        theme().surface_raised
     } else if hovered {
-        SURFACE_HOVER
+        theme().surface_hover
     } else {
-        BACKGROUND
+        theme().background
     }
 }
 
@@ -308,11 +319,11 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         lines.extend([
             Line::from(Span::styled(
                 "No configured models",
-                Style::default().fg(TEXT_STRONG),
+                Style::default().fg(theme().text_strong),
             )),
             Line::from(Span::styled(
                 "Configure a provider with /provider.",
-                Style::default().fg(TEXT_DIM),
+                Style::default().fg(theme().text_dim),
             )),
         ]);
     } else {
@@ -324,11 +335,11 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 }
                 provider = &choice.provider_name;
                 lines.push(Line::from(vec![
-                    Span::styled("─ ", Style::default().fg(TEXT_FAINT)),
+                    Span::styled("─ ", Style::default().fg(theme().text_faint)),
                     Span::styled(
                         provider.to_owned(),
                         Style::default()
-                            .fg(ACCENT_PRIMARY)
+                            .fg(theme().accent_primary)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -356,22 +367,22 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         Span::styled(
                             format!("{marker} {current_marker} "),
                             Style::default().fg(if selected {
-                                ACCENT_PRIMARY
+                                theme().accent_primary
                             } else if current {
-                                OK
+                                theme().ok
                             } else {
-                                TEXT_FAINT
+                                theme().text_faint
                             }),
                         ),
                         Span::styled(
                             pad_display(&single_line(&choice.model_name, 30), 32),
-                            Style::default().fg(TEXT_STRONG),
+                            Style::default().fg(theme().text_strong),
                         ),
                         Span::styled(
                             pad_display(&single_line(&choice.target.model_id, 28), 30),
-                            Style::default().fg(TEXT_DIM),
+                            Style::default().fg(theme().text_dim),
                         ),
-                        Span::styled(think, Style::default().fg(TEXT_DIM)),
+                        Span::styled(think, Style::default().fg(theme().text_dim)),
                     ],
                     row_width,
                 ))
@@ -382,22 +393,22 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         Span::styled(
                             format!("{marker} {current_marker} "),
                             Style::default().fg(if selected {
-                                ACCENT_PRIMARY
+                                theme().accent_primary
                             } else if current {
-                                OK
+                                theme().ok
                             } else {
-                                TEXT_FAINT
+                                theme().text_faint
                             }),
                         ),
                         Span::styled(
                             pad_display(&single_line(&choice.model_name, 20), 22),
-                            Style::default().fg(TEXT_STRONG),
+                            Style::default().fg(theme().text_strong),
                         ),
                         Span::styled(
                             pad_display(&single_line(&choice.target.model_id, 14), 16),
-                            Style::default().fg(TEXT_DIM),
+                            Style::default().fg(theme().text_dim),
                         ),
-                        Span::styled(think, Style::default().fg(TEXT_DIM)),
+                        Span::styled(think, Style::default().fg(theme().text_dim)),
                     ],
                     row_width,
                 ))
@@ -408,18 +419,21 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         Span::styled(
                             format!("{marker} {current_marker} "),
                             Style::default().fg(if selected {
-                                ACCENT_PRIMARY
+                                theme().accent_primary
                             } else if current {
-                                OK
+                                theme().ok
                             } else {
-                                TEXT_FAINT
+                                theme().text_faint
                             }),
                         ),
                         Span::styled(
                             single_line(&choice.model_name, name_budget),
-                            Style::default().fg(TEXT_STRONG),
+                            Style::default().fg(theme().text_strong),
                         ),
-                        Span::styled(format!(" · {thinking}"), Style::default().fg(TEXT_DIM)),
+                        Span::styled(
+                            format!(" · {thinking}"),
+                            Style::default().fg(theme().text_dim),
+                        ),
                     ],
                     row_width,
                 ))
@@ -447,7 +461,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .style(Style::default().bg(BACKGROUND))
+            .style(Style::default().bg(theme().background))
             .wrap(Wrap { trim: false }),
         body,
     );
@@ -480,20 +494,20 @@ fn render_page_header(
             Span::styled(
                 title,
                 Style::default()
-                    .fg(TEXT_STRONG)
+                    .fg(theme().text_strong)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" ".repeat(spacer)),
-            Span::styled(meta, Style::default().fg(TEXT_FAINT)),
+            Span::styled(meta, Style::default().fg(theme().text_faint)),
         ]))
-        .style(Style::default().bg(BACKGROUND)),
+        .style(Style::default().bg(theme().background)),
         Rect::new(area.x, area.y, area.width, 1),
     );
     if area.height >= 2 {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 truncate_display(subtitle, area.width as usize),
-                Style::default().fg(TEXT_DIM),
+                Style::default().fg(theme().text_dim),
             )),
             Rect::new(area.x, area.y + 1, area.width, 1),
         );
@@ -503,7 +517,7 @@ fn render_page_header(
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "─".repeat(area.width as usize),
-                Style::default().fg(BORDER_ACTIVE),
+                Style::default().fg(theme().border_active),
             )),
             Rect::new(area.x, area.y + 2, area.width, 1),
         );
@@ -550,30 +564,30 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         area.height,
     );
     let left_style = if editor.pane == ProviderPane::Providers {
-        Style::default().fg(ACCENT_PRIMARY)
+        Style::default().fg(theme().accent_primary)
     } else {
-        Style::default().fg(TEXT_FAINT)
+        Style::default().fg(theme().text_faint)
     };
     let mut provider_lines = vec![
         Line::from(Span::styled(
             "Connections",
             Style::default()
-                .fg(TEXT_STRONG)
+                .fg(theme().text_strong)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             format!("{} configured", editor.draft.providers.len()),
-            Style::default().fg(TEXT_FAINT),
+            Style::default().fg(theme().text_faint),
         )),
     ];
     if editor.draft.providers.is_empty() {
         provider_lines.push(Line::from(Span::styled(
             "No Providers configured",
-            Style::default().fg(TEXT_DIM),
+            Style::default().fg(theme().text_dim),
         )));
         provider_lines.push(Line::from(Span::styled(
             "Press n to add one.",
-            Style::default().fg(TEXT_DIM),
+            Style::default().fg(theme().text_dim),
         )));
     } else {
         for (index, provider) in editor.draft.providers.iter().enumerate() {
@@ -585,11 +599,11 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             let hovered = app.hovered(&target);
             let armed = app.armed(&target);
             let background = if (selected && editor.pane == ProviderPane::Providers) || armed {
-                SURFACE_RAISED
+                theme().surface_raised
             } else if hovered {
-                SURFACE_HOVER
+                theme().surface_hover
             } else {
-                BACKGROUND
+                theme().background
             };
             let mut row = Line::from(vec![
                 Span::styled(
@@ -598,14 +612,18 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     } else {
                         "  ".to_owned()
                     },
-                    Style::default().fg(ACCENT_PRIMARY),
+                    Style::default().fg(theme().accent_primary),
                 ),
                 Span::styled(
                     single_line(
                         &provider.display_name,
                         left_width.saturating_sub(5) as usize,
                     ),
-                    Style::default().fg(if selected { TEXT_STRONG } else { TEXT }),
+                    Style::default().fg(if selected {
+                        theme().text_strong
+                    } else {
+                        theme().text
+                    }),
                 ),
             ]);
             paint_row_band(&mut row, left_width.saturating_sub(1) as usize, background);
@@ -633,13 +651,13 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Line::from(Span::styled(
                     "Provider details",
                     Style::default()
-                        .fg(TEXT_STRONG)
+                        .fg(theme().text_strong)
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::default(),
                 Line::from(Span::styled(
                     "Create a Provider to configure its endpoint and models.",
-                    Style::default().fg(TEXT_DIM),
+                    Style::default().fg(theme().text_dim),
                 )),
             ]),
             right,
@@ -678,9 +696,9 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         "Provider details",
         Style::default()
             .fg(if detail_active {
-                ACCENT_PRIMARY
+                theme().accent_primary
             } else {
-                TEXT_STRONG
+                theme().text_strong
             })
             .add_modifier(Modifier::BOLD),
     ))];
@@ -693,18 +711,25 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let hovered = app.hovered(&target);
         let armed = app.armed(&target);
         let background = if selected || armed {
-            SURFACE_RAISED
+            theme().surface_raised
         } else if hovered {
-            SURFACE_HOVER
+            theme().surface_hover
         } else {
-            BACKGROUND
+            theme().background
         };
         let mut row = Line::from(vec![
             Span::styled(
                 format!("{} {:<10}", if selected { "▌" } else { " " }, label),
-                Style::default().fg(if selected { ACCENT_PRIMARY } else { TEXT_DIM }),
+                Style::default().fg(if selected {
+                    theme().accent_primary
+                } else {
+                    theme().text_dim
+                }),
             ),
-            Span::styled(single_line(&value, 70), Style::default().fg(TEXT_STRONG)),
+            Span::styled(
+                single_line(&value, 70),
+                Style::default().fg(theme().text_strong),
+            ),
         ]);
         paint_row_band(&mut row, right.width as usize, background);
         lines.push(row);
@@ -715,9 +740,9 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             "Models",
             Style::default()
                 .fg(if model_active {
-                    ACCENT_PRIMARY
+                    theme().accent_primary
                 } else {
-                    TEXT_STRONG
+                    theme().text_strong
                 })
                 .add_modifier(Modifier::BOLD),
         )),
@@ -725,7 +750,7 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if provider.models.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No models · focus Models and press n",
-            Style::default().fg(TEXT_DIM),
+            Style::default().fg(theme().text_dim),
         )));
     } else {
         for (index, model) in provider.models.iter().enumerate() {
@@ -742,26 +767,26 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             });
             let thinking = thinking_range_label(&capabilities);
             let background = if selected || armed {
-                SURFACE_RAISED
+                theme().surface_raised
             } else if hovered {
-                SURFACE_HOVER
+                theme().surface_hover
             } else {
-                BACKGROUND
+                theme().background
             };
             let mut row = Line::from(vec![
                 Span::styled(
                     if selected { "▌ " } else { "  " },
-                    Style::default().fg(ACCENT_PRIMARY),
+                    Style::default().fg(theme().accent_primary),
                 ),
                 Span::styled(
                     pad_display(&single_line(&model.display_name, 28), 30),
-                    Style::default().fg(TEXT_STRONG),
+                    Style::default().fg(theme().text_strong),
                 ),
                 Span::styled(
                     pad_display(&single_line(&model.id, 24), 26),
-                    Style::default().fg(TEXT_DIM),
+                    Style::default().fg(theme().text_dim),
                 ),
-                Span::styled(thinking, Style::default().fg(TEXT_DIM)),
+                Span::styled(thinking, Style::default().fg(theme().text_dim)),
             ]);
             paint_row_band(&mut row, right.width as usize, background);
             lines.push(row);
@@ -777,21 +802,23 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             } else {
                 field_editor.input.content.clone()
             },
-            Style::default().fg(TEXT_STRONG).bg(SURFACE_RAISED),
+            Style::default()
+                .fg(theme().text_strong)
+                .bg(theme().surface_raised),
         ));
-        paint_row_band(&mut value_row, right.width as usize, SURFACE_RAISED);
+        paint_row_band(&mut value_row, right.width as usize, theme().surface_raised);
         lines.extend([
             Line::default(),
             Line::from(Span::styled(
                 "Edit value",
                 Style::default()
-                    .fg(ACCENT_PRIMARY)
+                    .fg(theme().accent_primary)
                     .add_modifier(Modifier::BOLD),
             )),
             value_row,
             Line::from(Span::styled(
                 "Enter apply field · Esc cancel",
-                Style::default().fg(TEXT_DIM),
+                Style::default().fg(theme().text_dim),
             )),
         ]);
     }
@@ -803,11 +830,13 @@ fn render_provider_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     ProviderDialog::Delete(_) => "Delete selected item?",
                     ProviderDialog::Discard => "Discard unsaved changes?",
                 },
-                Style::default().fg(BAD).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme().bad)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 "Enter/y confirm · Esc/n cancel",
-                Style::default().fg(TEXT_DIM),
+                Style::default().fg(theme().text_dim),
             )),
         ]);
     }
@@ -1023,9 +1052,10 @@ fn render_output_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.is_empty() {
         return;
     }
-    frame
-        .buffer_mut()
-        .set_style(area, Style::default().fg(TEXT_DIM).bg(BACKGROUND));
+    frame.buffer_mut().set_style(
+        area,
+        Style::default().fg(theme().text_dim).bg(theme().background),
+    );
 
     let panel_area = centered_rect(area, 84, 82);
     if panel_area.width < 4 || panel_area.height < 4 {
@@ -1037,8 +1067,8 @@ fn render_output_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT_PRIMARY))
-            .style(Style::default().bg(SURFACE)),
+            .border_style(Style::default().fg(theme().accent_primary))
+            .style(Style::default().bg(theme().surface)),
         panel_area,
     );
 
@@ -1065,12 +1095,12 @@ fn render_output_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Span::styled(
                 "◆ ",
                 Style::default()
-                    .fg(ACCENT_PRIMARY)
+                    .fg(theme().accent_primary)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("Response", Style::default().fg(TEXT_STRONG)),
+            Span::styled("Response", Style::default().fg(theme().text_strong)),
         ]))
-        .style(Style::default().bg(SURFACE)),
+        .style(Style::default().bg(theme().surface)),
         header,
     );
     frame.render_widget(
@@ -1078,11 +1108,11 @@ fn render_output_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             "[×]",
             Style::default()
                 .fg(if app.hovered(&HitTarget::OutputClose) {
-                    TEXT_STRONG
+                    theme().text_strong
                 } else {
-                    ACCENT_PRIMARY
+                    theme().accent_primary
                 })
-                .bg(SURFACE)
+                .bg(theme().surface)
                 .add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Right),
@@ -1109,7 +1139,7 @@ fn render_output_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         content.width.saturating_sub(2) as usize,
     );
     let paragraph = Paragraph::new(Text::from(lines))
-        .style(Style::default().fg(TEXT).bg(BACKGROUND))
+        .style(Style::default().fg(theme().text).bg(theme().background))
         .wrap(Wrap { trim: false });
     let line_count = paragraph.line_count(content.width.max(1));
     let page_height = content.height as usize;
@@ -1140,13 +1170,16 @@ fn render_output_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         footer.width as usize,
     );
     frame.render_widget(
-        Paragraph::new(keys).style(Style::default().bg(SURFACE)),
+        Paragraph::new(keys).style(Style::default().bg(theme().surface)),
         footer,
     );
     frame.render_widget(
-        Paragraph::new(Span::styled(position, Style::default().fg(TEXT_FAINT)))
-            .alignment(Alignment::Right)
-            .style(Style::default().bg(SURFACE)),
+        Paragraph::new(Span::styled(
+            position,
+            Style::default().fg(theme().text_faint),
+        ))
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(theme().surface)),
         footer,
     );
 }
@@ -1179,7 +1212,8 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let transcript = transcript_text(app, area.width as usize);
     // Pre-wrapped lines: do not wrap again or logical panel rows drift from
     // the painted rows (gray slabs / clipped bodies / smashed glyphs).
-    let paragraph = Paragraph::new(transcript.text).style(Style::default().fg(TEXT).bg(BACKGROUND));
+    let paragraph = Paragraph::new(transcript.text)
+        .style(Style::default().fg(theme().text).bg(theme().background));
     let line_count = transcript.line_count;
     app.transcript_page_height = area.height as usize;
     app.max_scroll = line_count.saturating_sub(area.height as usize);
@@ -1248,7 +1282,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let width = indicator.chars().count().min(area.width as usize) as u16;
         let x = area.right().saturating_sub(width);
         frame.render_widget(
-            Paragraph::new(indicator).style(Style::default().fg(TEXT_DIM)),
+            Paragraph::new(indicator).style(Style::default().fg(theme().text_dim)),
             Rect::new(x, area.y, width, 1),
         );
     }
@@ -1518,7 +1552,7 @@ fn render_landing(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let top = content_area(regions.top);
         frame.render_widget(
             Paragraph::new(location_line(app, top.width as usize))
-                .style(Style::default().bg(BACKGROUND)),
+                .style(Style::default().bg(theme().background)),
             top,
         );
     }
@@ -1547,8 +1581,8 @@ fn render_hero_box(frame: &mut Frame<'_>, regions: &LandingRegions, app: &mut Ap
     // The hero border breathes on the same 4.6s ambient cycle as opencode's
     // landing pulse: a whisper of accent rising and falling.
     let border_color = crate::tui::anim::blend_color(
-        BORDER_ACTIVE,
-        ACCENT_PRIMARY,
+        theme().border_active,
+        theme().accent_primary,
         crate::tui::anim::breath(4600) * 0.28,
     );
     let border = Style::default().fg(border_color);
@@ -1557,7 +1591,7 @@ fn render_hero_box(frame: &mut Frame<'_>, regions: &LandingRegions, app: &mut Ap
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border)
-            .style(Style::default().bg(BACKGROUND)),
+            .style(Style::default().bg(theme().background)),
         regions.hero,
     );
     render_logo_art(frame, regions.logo, crate::tui::glyphs::hero_logo_art());
@@ -1573,12 +1607,12 @@ fn render_hero_box(frame: &mut Frame<'_>, regions: &LandingRegions, app: &mut Ap
                 Span::styled(
                     PRODUCT_NAME,
                     Style::default()
-                        .fg(TEXT_STRONG)
+                        .fg(theme().text_strong)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("  {}", env!("CARGO_PKG_VERSION")),
-                    Style::default().fg(TEXT_FAINT),
+                    Style::default().fg(theme().text_faint),
                 ),
             ])),
             version_row,
@@ -1610,7 +1644,11 @@ fn render_logo_art(frame: &mut Frame<'_>, area: Rect, art: Option<&str>) {
                         match role {
                             'S' => Span::styled(
                                 "██",
-                                Style::default().fg(logo_shimmer_color(WORDMARK_INK, row, column)),
+                                Style::default().fg(logo_shimmer_color(
+                                    theme().wordmark_ink,
+                                    row,
+                                    column,
+                                )),
                             ),
                             _ => Span::raw("  "),
                         }
@@ -1646,7 +1684,7 @@ fn logo_shimmer_color(base: Color, row: usize, column: usize) -> Color {
     brightness *= 0.85 + 0.15 * breath.sin().abs();
     crate::tui::anim::blend_color(
         crate::tui::anim::blend_color(base, BASE_INK, 0.45),
-        crate::tui::anim::blend_color(base, TEXT_STRONG, 0.35),
+        crate::tui::anim::blend_color(base, theme().text_strong, 0.35),
         brightness,
     )
 }
@@ -1678,7 +1716,8 @@ fn render_landing_status(frame: &mut Frame<'_>, area: Rect, app: &App, show_badg
     let hint_width = (area.width as usize).saturating_sub(badge_width + 4);
     if hint_width >= 16 {
         frame.render_widget(
-            Paragraph::new(shortcut_bar(hints, hint_width)).style(Style::default().bg(BACKGROUND)),
+            Paragraph::new(shortcut_bar(hints, hint_width))
+                .style(Style::default().bg(theme().background)),
             Rect::new(area.x, area.y, hint_width as u16, 1),
         );
     }
@@ -1688,16 +1727,16 @@ fn render_landing_status(frame: &mut Frame<'_>, area: Rect, app: &App, show_badg
                 Span::styled(
                     PRODUCT_NAME,
                     Style::default()
-                        .fg(TEXT_STRONG)
+                        .fg(theme().text_strong)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("  {}", env!("CARGO_PKG_VERSION")),
-                    Style::default().fg(TEXT_FAINT),
+                    Style::default().fg(theme().text_faint),
                 ),
             ]))
             .alignment(Alignment::Right)
-            .style(Style::default().bg(BACKGROUND)),
+            .style(Style::default().bg(theme().background)),
             area,
         );
     }
@@ -1733,7 +1772,7 @@ fn render_landing_menu(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Span::styled(
                 crate::tui::glyphs::prompt_arrow().to_owned(),
                 Style::default()
-                    .fg(ACCENT_PRIMARY)
+                    .fg(theme().accent_primary)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
@@ -1742,16 +1781,18 @@ fn render_landing_menu(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let (label_style, shortcut_style, background) = if selected {
             (
                 Style::default()
-                    .fg(TEXT_STRONG)
+                    .fg(theme().text_strong)
                     .add_modifier(Modifier::BOLD),
-                Style::default().fg(TEXT_DIM),
-                SURFACE,
+                Style::default().fg(theme().text_dim),
+                theme().surface,
             )
         } else {
             (
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                Style::default().fg(TEXT_FAINT),
-                BACKGROUND,
+                Style::default()
+                    .fg(theme().text)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme().text_faint),
+                theme().background,
             )
         };
         frame.render_widget(
@@ -1782,7 +1823,7 @@ fn welcome_menu_width(actions: &[WelcomeAction], max_width: u16) -> u16 {
 fn render_landing_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let placeholder = Line::from(Span::styled(
         "Type a message...",
-        Style::default().fg(TEXT_FAINT),
+        Style::default().fg(theme().text_faint),
     ));
     // Show model/think metadata on the landing composer too, so the active
     // configuration is visible before the first message (grok/opencode do
@@ -1844,17 +1885,17 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             let hovered = app.hovered(&target);
             let armed = app.armed(&target);
             let background = if selected || armed {
-                SURFACE_RAISED
+                theme().surface_raised
             } else if hovered {
-                SURFACE_HOVER
+                theme().surface_hover
             } else {
-                SURFACE
+                theme().surface
             };
             let command_style = Style::default()
                 .fg(if selected {
-                    TEXT_STRONG
+                    theme().text_strong
                 } else {
-                    ACCENT_PRIMARY
+                    theme().accent_primary
                 })
                 .bg(background)
                 .add_modifier(if selected {
@@ -1863,7 +1904,11 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     Modifier::empty()
                 });
             let description_style = Style::default()
-                .fg(if selected { TEXT } else { TEXT_DIM })
+                .fg(if selected {
+                    theme().text
+                } else {
+                    theme().text_dim
+                })
                 .bg(background);
             let available = inner_width.saturating_sub(2);
             let wide = available >= usage_width + 2 + 18;
@@ -1900,7 +1945,7 @@ fn render_completion(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .style(Style::default().bg(BACKGROUND))
+            .style(Style::default().bg(theme().background))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -1991,12 +2036,12 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                     // and below so the band floats instead of hugging the text.
                     for line in &mut lines[start_line..] {
                         if line.style.bg.is_none() {
-                            line.style = line.style.patch(Style::default().bg(SURFACE));
+                            line.style = line.style.patch(Style::default().bg(theme().surface));
                         }
                         pad_line_band(line, content_width);
                     }
                     let mut padding = Line::default();
-                    padding.style = Style::default().bg(SURFACE);
+                    padding.style = Style::default().bg(theme().surface);
                     pad_line_band(&mut padding, content_width);
                     lines.insert(start_line, padding.clone());
                     lines.push(padding);
@@ -2005,7 +2050,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                     start_line,
                     end_line: lines.len(),
                     width,
-                    background: BACKGROUND,
+                    background: theme().background,
                     accent: Some(role_accent(*role)),
                 });
                 if final_answer {
@@ -2038,8 +2083,8 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                         start_line,
                         end_line: lines.len(),
                         width,
-                        background: BACKGROUND,
-                        accent: Some(ACCENT_THINKING),
+                        background: theme().background,
+                        accent: Some(theme().accent_thinking),
                     });
                 }
             }
@@ -2057,8 +2102,8 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                     start_line,
                     end_line: lines.len(),
                     width,
-                    background: BACKGROUND,
-                    accent: Some(ACCENT_TOOL),
+                    background: theme().background,
+                    accent: Some(theme().accent_tool),
                 });
                 if tool.expanded && tool_output_body(tool).len() > TOOL_OUTPUT_PREVIEW_LINES {
                     output_lines.push((index, lines.len().saturating_sub(2)));
@@ -2071,14 +2116,14 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
             } => {
                 let start_line = lines.len();
                 lines.push(Line::from(vec![
-                    Span::styled("× ", Style::default().fg(BAD)),
+                    Span::styled("× ", Style::default().fg(theme().bad)),
                     Span::styled(
                         summary.clone(),
                         Style::default()
-                            .fg(TEXT_STRONG)
+                            .fg(theme().text_strong)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("  ctrl+e", Style::default().fg(GRAY_DIM)),
+                    Span::styled("  ctrl+e", Style::default().fg(theme().gray_dim)),
                 ]));
                 if *expanded {
                     for source_line in detail.lines() {
@@ -2087,7 +2132,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                         {
                             lines.push(Line::from(vec![
                                 Span::raw("    "),
-                                Span::styled(segment, Style::default().fg(TEXT_DIM)),
+                                Span::styled(segment, Style::default().fg(theme().text_dim)),
                             ]));
                         }
                     }
@@ -2096,7 +2141,7 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                     start_line,
                     end_line: lines.len(),
                     width,
-                    background: BACKGROUND,
+                    background: theme().background,
                     accent: None,
                 });
                 lines.push(Line::default());
@@ -2139,7 +2184,7 @@ fn stream_cursor() -> Option<Span<'static>> {
         return None;
     }
     let phase = crate::tui::anim::clock_millis() % 1060;
-    (phase < 620).then(|| Span::styled("▍", Style::default().fg(ACCENT_PRIMARY)))
+    (phase < 620).then(|| Span::styled("▍", Style::default().fg(theme().accent_primary)))
 }
 
 fn append_transcript_gap(
@@ -2225,11 +2270,11 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             let hovered = app.hovered(&target);
             let armed = app.armed(&target);
             let background = if selected || armed {
-                SURFACE_RAISED
+                theme().surface_raised
             } else if hovered {
-                SURFACE_HOVER
+                theme().surface_hover
             } else {
-                BACKGROUND
+                theme().background
             };
             let marker: String = if selected {
                 crate::tui::glyphs::prompt_arrow().to_owned()
@@ -2238,27 +2283,27 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             };
             let mut row = if wide {
                 Line::from(vec![
-                    Span::styled(marker, Style::default().fg(ACCENT_PRIMARY)),
+                    Span::styled(marker, Style::default().fg(theme().accent_primary)),
                     Span::styled(
                         format!("{:<usage_width$}", command.usage),
                         Style::default().fg(if selected {
-                            TEXT_STRONG
+                            theme().text_strong
                         } else {
-                            ACCENT_PRIMARY
+                            theme().accent_primary
                         }),
                     ),
                     Span::raw("  "),
-                    Span::styled(command.description, Style::default().fg(TEXT_DIM)),
+                    Span::styled(command.description, Style::default().fg(theme().text_dim)),
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled(marker, Style::default().fg(ACCENT_PRIMARY)),
+                    Span::styled(marker, Style::default().fg(theme().accent_primary)),
                     Span::styled(
                         command.usage,
                         Style::default().fg(if selected {
-                            TEXT_STRONG
+                            theme().text_strong
                         } else {
-                            ACCENT_PRIMARY
+                            theme().accent_primary
                         }),
                     ),
                 ])
@@ -2288,9 +2333,9 @@ fn append_markdown_lines(
     width: usize,
 ) {
     let base_color = match role {
-        MessageRole::User => TEXT_STRONG,
-        MessageRole::Assistant if final_answer => TEXT,
-        MessageRole::Assistant => TEXT_DIM,
+        MessageRole::User => theme().text_strong,
+        MessageRole::Assistant if final_answer => theme().text,
+        MessageRole::Assistant => theme().text_dim,
     };
     let mut in_code_block = false;
     let mut first_visual_line = true;
@@ -2307,17 +2352,17 @@ fn append_markdown_lines(
                         rail,
                         Style::default().fg(message_rail_color(role, final_answer)),
                     ),
-                    Span::styled("▌ ", Style::default().fg(TEXT_FAINT)),
+                    Span::styled("▌ ", Style::default().fg(theme().text_faint)),
                     Span::styled(
                         if language.is_empty() {
                             "code".to_owned()
                         } else {
                             language.to_owned()
                         },
-                        Style::default().fg(TEXT_DIM),
+                        Style::default().fg(theme().text_dim),
                     ),
                 ])
-                .style(Style::default().bg(CODE_BG));
+                .style(Style::default().bg(theme().code_bg));
                 pad_line_band(&mut band, width);
                 lines.push(band);
             } else {
@@ -2327,9 +2372,9 @@ fn append_markdown_lines(
                         rail,
                         Style::default().fg(message_rail_color(role, final_answer)),
                     ),
-                    Span::styled("▌", Style::default().fg(TEXT_FAINT)),
+                    Span::styled("▌", Style::default().fg(theme().text_faint)),
                 ])
-                .style(Style::default().bg(CODE_BG));
+                .style(Style::default().bg(theme().code_bg));
                 pad_line_band(&mut band, width);
                 lines.push(band);
             }
@@ -2344,10 +2389,10 @@ fn append_markdown_lines(
                         rail,
                         Style::default().fg(message_rail_color(role, final_answer)),
                     ),
-                    Span::styled("▌ ", Style::default().fg(TEXT_FAINT)),
-                    Span::styled(segment, Style::default().fg(TEXT_STRONG)),
+                    Span::styled("▌ ", Style::default().fg(theme().text_faint)),
+                    Span::styled(segment, Style::default().fg(theme().text_strong)),
                 ])
-                .style(Style::default().bg(CODE_BG));
+                .style(Style::default().bg(theme().code_bg));
                 pad_line_band(&mut band, width);
                 lines.push(band);
             }
@@ -2361,7 +2406,9 @@ fn append_markdown_lines(
                 final_answer,
                 &mut first_visual_line,
                 width,
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme().text)
+                    .add_modifier(Modifier::BOLD),
             );
         } else if let Some(heading) = trimmed.strip_prefix("## ") {
             append_wrapped_message_lines(
@@ -2372,7 +2419,7 @@ fn append_markdown_lines(
                 &mut first_visual_line,
                 width,
                 Style::default()
-                    .fg(TEXT_STRONG)
+                    .fg(theme().text_strong)
                     .add_modifier(Modifier::BOLD),
             );
         } else if let Some(heading) = trimmed.strip_prefix("# ") {
@@ -2384,7 +2431,7 @@ fn append_markdown_lines(
                 &mut first_visual_line,
                 width,
                 Style::default()
-                    .fg(ACCENT_PRIMARY)
+                    .fg(theme().accent_primary)
                     .add_modifier(Modifier::BOLD),
             );
         } else if let Some(item) = trimmed
@@ -2418,7 +2465,7 @@ fn append_markdown_lines(
                 role,
                 &mut first_visual_line,
                 width,
-                TEXT_DIM,
+                theme().text_dim,
             );
         } else if source_line.is_empty() {
             let rail = message_rail(role, final_answer, &mut first_visual_line);
@@ -2442,10 +2489,10 @@ fn append_markdown_lines(
 
 fn role_accent(role: MessageRole) -> Color {
     match role {
-        MessageRole::User => ACCENT_USER,
+        MessageRole::User => theme().accent_user,
         // Assistant turns rely on indentation for grouping; the rail stays a
         // quiet gray so long transcripts don't accumulate purple noise.
-        MessageRole::Assistant => TEXT_FAINT,
+        MessageRole::Assistant => theme().text_faint,
     }
 }
 
@@ -2650,7 +2697,7 @@ fn inline_markdown_spans(value: &str, base: Style) -> Vec<Span<'static>> {
             let bold: String = chars[index + 2..index + 2 + end].iter().collect();
             spans.push(Span::styled(
                 bold,
-                base.fg(TEXT_STRONG).add_modifier(Modifier::BOLD),
+                base.fg(theme().text_strong).add_modifier(Modifier::BOLD),
             ));
             index += end + 4;
             continue;
@@ -2664,7 +2711,7 @@ fn inline_markdown_spans(value: &str, base: Style) -> Vec<Span<'static>> {
             let code: String = chars[index + 1..index + 1 + end].iter().collect();
             spans.push(Span::styled(
                 code,
-                base.fg(MD_CODE).add_modifier(Modifier::BOLD),
+                base.fg(theme().md_code).add_modifier(Modifier::BOLD),
             ));
             index += end + 2;
             continue;
@@ -2713,7 +2760,7 @@ fn append_output_block_lines(
                 } else {
                     " ".repeat(marker_width)
                 },
-                Style::default().fg(TEXT_DIM),
+                Style::default().fg(theme().text_dim),
             ),
             Span::styled(segment, Style::default().fg(content_color)),
         ]));
@@ -2731,10 +2778,10 @@ fn append_thinking_lines(
 ) {
     let label_style = if selected {
         Style::default()
-            .fg(TEXT_STRONG)
+            .fg(theme().text_strong)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(TEXT_DIM)
+        Style::default().fg(theme().text_dim)
     };
     let header = match status {
         ThinkingStatus::Active => "Thinking…".to_owned(),
@@ -2750,22 +2797,25 @@ fn append_thinking_lines(
     // so it stays quiet unless selected.
     let mut header_spans = vec![Span::styled(
         format!("{} ", crate::tui::glyphs::thinking_mark()),
-        Style::default().fg(ACCENT_THINKING),
+        Style::default().fg(theme().accent_thinking),
     )];
     if status == ThinkingStatus::Active {
-        header_spans.extend(shimmer_word(&header, ACCENT_THINKING));
+        header_spans.extend(shimmer_word(&header, theme().accent_thinking));
     } else {
         header_spans.push(Span::styled(header, label_style));
     }
     if status == ThinkingStatus::Done && !thinking.expanded && selected {
-        header_spans.push(Span::styled("  ctrl+e", Style::default().fg(GRAY_DIM)));
+        header_spans.push(Span::styled(
+            "  ctrl+e",
+            Style::default().fg(theme().gray_dim),
+        ));
     }
     lines.push(card_header_line(header_spans, selected, width));
 
     if thinking.expanded {
         // Grok-style de-emphasis: thinking bodies render dim + italic.
         let body_style = Style::default()
-            .fg(TEXT_FAINT)
+            .fg(theme().text_faint)
             .add_modifier(Modifier::ITALIC);
         for line in thinking.content.split('\n') {
             for segment in wrap_display_hard(line, width.saturating_sub(4).max(1)) {
@@ -2790,15 +2840,15 @@ fn render_input_frame(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
 fn composer_border_color(app: &App) -> Color {
     // Focused chrome picks up a whisper of the primary accent.
-    let focused = crate::tui::anim::blend_color(BORDER_ACTIVE, ACCENT_PRIMARY, 0.5);
+    let focused = crate::tui::anim::blend_color(theme().border_active, theme().accent_primary, 0.5);
     if crate::tui::anim::frozen() {
         return if app.busy || app.input_focused {
             focused
         } else {
-            BORDER
+            theme().border
         };
     }
-    crate::tui::anim::blend_color(BORDER, focused, app.focus_blend)
+    crate::tui::anim::blend_color(theme().border, focused, app.focus_blend)
 }
 
 #[cfg(test)]
@@ -2890,7 +2940,7 @@ fn paint_box_edge(
         };
         if let Some(cell) = buf.cell_mut((x + offset, y)) {
             cell.set_char(ch);
-            cell.set_style(Style::default().fg(fg).bg(BACKGROUND));
+            cell.set_style(Style::default().fg(fg).bg(theme().background));
         }
     }
 }
@@ -2900,7 +2950,7 @@ fn paint_box_sides(frame: &mut Frame<'_>, area: Rect, fg: Color) {
         return;
     }
     let buf = frame.buffer_mut();
-    let style = Style::default().fg(fg).bg(BACKGROUND);
+    let style = Style::default().fg(fg).bg(theme().background);
     for y in area.y..area.bottom() {
         if let Some(cell) = buf.cell_mut((area.x, y)) {
             cell.set_char('│');
@@ -2913,7 +2963,7 @@ fn paint_box_sides(frame: &mut Frame<'_>, area: Rect, fg: Color) {
         for x in area.x + 1..area.right().saturating_sub(1) {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 cell.set_char(' ');
-                cell.set_style(Style::default().fg(TEXT).bg(BACKGROUND));
+                cell.set_style(Style::default().fg(theme().text).bg(theme().background));
             }
         }
     }
@@ -2935,9 +2985,9 @@ fn paint_page_composer_label(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             truncate_display(label, area.width as usize),
-            Style::default().fg(TEXT_DIM),
+            Style::default().fg(theme().text_dim),
         ))
-        .style(Style::default().bg(BACKGROUND)),
+        .style(Style::default().bg(theme().background)),
         area,
     );
 }
@@ -2958,7 +3008,7 @@ fn paint_input_editor(
             app,
             crate::tui::glyphs::prompt_arrow(),
             None,
-            BACKGROUND,
+            theme().background,
         );
         return;
     }
@@ -2968,7 +3018,7 @@ fn paint_input_editor(
         app,
         crate::tui::glyphs::prompt_arrow(),
         placeholder,
-        BACKGROUND,
+        theme().background,
     );
 }
 
@@ -2983,7 +3033,7 @@ fn paint_composer_info(frame: &mut Frame<'_>, x: u16, y: u16, width: u16, app: &
     spans.extend(meta.spans);
     spans.push(Span::raw(" "));
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(BACKGROUND)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme().background)),
         Rect::new(inner_x, y, inner_width, 1),
     );
     register_input_metadata_hits(
@@ -3008,14 +3058,17 @@ fn input_metadata_line(app: &App, width: usize) -> Line<'static> {
     // Grok-style chrome: the model name glows teal, the rest stays muted.
     let mode_spans = if mode == format!("{model} · think {thinking}") {
         vec![
-            Span::styled(model, Style::default().fg(MODEL_ACCENT)),
+            Span::styled(model, Style::default().fg(theme().model_accent)),
             Span::styled(
                 format!(" · think {thinking}"),
-                Style::default().fg(TEXT_DIM),
+                Style::default().fg(theme().text_dim),
             ),
         ]
     } else {
-        vec![Span::styled(mode, Style::default().fg(MODEL_ACCENT))]
+        vec![Span::styled(
+            mode,
+            Style::default().fg(theme().model_accent),
+        )]
     };
     let context = format!(
         "{:.0}%",
@@ -3036,7 +3089,10 @@ fn input_metadata_line(app: &App, width: usize) -> Line<'static> {
     let spacer = remaining.saturating_sub(UnicodeWidthStr::width(detail.as_str()));
     let mut spans = mode_spans;
     spans.push(Span::raw(" ".repeat(spacer)));
-    spans.push(Span::styled(detail, Style::default().fg(TEXT_FAINT)));
+    spans.push(Span::styled(
+        detail,
+        Style::default().fg(theme().text_faint),
+    ));
     Line::from(spans)
 }
 
@@ -3065,9 +3121,9 @@ fn register_input_metadata_hits(app: &mut App, area: Rect) {
 /// Grok-style prompt arrow: bright user gray when focused, dim when not.
 fn prompt_color(app: &App) -> Color {
     if app.input_focused || app.busy {
-        ACCENT_USER
+        theme().accent_user
     } else {
-        GRAY_DIM
+        theme().gray_dim
     }
 }
 
@@ -3122,7 +3178,7 @@ fn render_input_buffer(
     } else {
         Text::from(Line::from(Span::styled(
             app.input.content.clone(),
-            Style::default().fg(TEXT_STRONG),
+            Style::default().fg(theme().text_strong),
         )))
     };
     frame.render_widget(
@@ -3168,7 +3224,10 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("● ", Style::default().fg(ink(toast.color()))),
-                Span::styled(toast.message.clone(), Style::default().fg(ink(TEXT))),
+                Span::styled(
+                    toast.message.clone(),
+                    Style::default().fg(ink(theme().text)),
+                ),
             ])),
             area,
         );
@@ -3234,8 +3293,10 @@ fn render_keymap(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn shortcut_bar(items: &[(&str, &str)], width: usize) -> Line<'static> {
-    let key_style = Style::default().fg(TEXT_FAINT).add_modifier(Modifier::BOLD);
-    let label_style = Style::default().fg(TEXT_FAINT);
+    let key_style = Style::default()
+        .fg(theme().text_faint)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(theme().text_faint);
     let mut spans = Vec::new();
     let mut used = 0;
     for (index, (key, label)) in items.iter().enumerate() {
@@ -3273,11 +3334,11 @@ fn render_turn_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let spinner = crate::tui::glyphs::spinner_frame(millis);
     // Grok-style activity coloring: tools green, thinking purple.
     let (activity, accent) = match app.status {
-        Status::Cancelling => ("stopping", BAD),
-        Status::Error => ("error", BAD),
-        Status::RunningTool => ("working", OK),
-        Status::Thinking => ("thinking", ACCENT_SECONDARY),
-        Status::Idle => ("working", TEXT_FAINT),
+        Status::Cancelling => ("stopping", theme().bad),
+        Status::Error => ("error", theme().bad),
+        Status::RunningTool => ("working", theme().ok),
+        Status::Thinking => ("thinking", theme().accent_secondary),
+        Status::Idle => ("working", theme().text_faint),
     };
     let elapsed = app
         .turn_started
@@ -3298,7 +3359,7 @@ fn render_turn_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     spans.extend(shimmer_word(activity, accent));
     spans.push(Span::styled(
         format!("  {detail}"),
-        Style::default().fg(TEXT_FAINT),
+        Style::default().fg(theme().text_faint),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -3312,7 +3373,7 @@ fn shimmer_word(word: &str, accent: Color) -> Vec<Span<'static>> {
         .enumerate()
         .map(|(index, character)| {
             let glow = crate::tui::anim::sheen(index as f64, span, 2400, 3.0);
-            let color = crate::tui::anim::blend_color(accent, TEXT_STRONG, glow * 0.85);
+            let color = crate::tui::anim::blend_color(accent, theme().text_strong, glow * 0.85);
             Span::styled(character.to_string(), Style::default().fg(color))
         })
         .collect()

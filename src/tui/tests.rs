@@ -5,12 +5,11 @@ use ratatui::{Terminal, backend::TestBackend, style::Color};
 
 use super::glyphs::{HERO_BOX_MIN_WIDTH, LogoTier, logo_tier};
 use super::{
-    ACCENT_PRIMARY, App, AppContext, BACKGROUND, BAD, CODE_BG, CommandOutput, HitTarget,
-    InputAction, InputBuffer, KeyBurst, PRODUCT_NAME, ProviderPane, SCROLL_STEP, SURFACE,
-    SURFACE_RAISED, Status, ThinkingEntry, ToolStatus, TranscriptEntry, command_specs,
+    App, AppContext, CommandOutput, HitTarget, InputAction, InputBuffer, KeyBurst, PRODUCT_NAME,
+    ProviderPane, SCROLL_STEP, Status, ThinkingEntry, ToolStatus, TranscriptEntry, command_specs,
     composer_editor_origin, handle_key_event, handle_mouse_event, handle_terminal_event,
     input_metrics, landing_regions, regions_inside_frame, regions_non_overlapping, render,
-    sanitize_terminal_text, truncate_chars, ui_regions,
+    sanitize_terminal_text, theme::theme, truncate_chars, ui_regions,
 };
 use crate::agent::{AgentEvent, Message, MessageRole};
 use crate::config::{ModelConfig, ModelRef, ProviderCatalog, ProviderConfig, SecretValue};
@@ -698,8 +697,8 @@ fn empty_state_centers_a_large_zex_wordmark_and_focused_prompt_surface() {
     assert!(!screen.contains("Type a message..."));
     assert!(screen.contains("D:/workspaces/zex") || screen.contains("workspaces/zex"));
     assert!(!screen.contains("● idle"));
-    assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
-    assert_eq!(BACKGROUND, Color::Reset);
+    assert_eq!(style_at(&terminal, 0, 0).bg, Some(theme().background));
+    assert_eq!(theme().background, Color::Reset);
     assert!(
         !regions.hero.is_empty(),
         "width 104 should use the hero box"
@@ -801,7 +800,7 @@ fn empty_layout_remains_composed_across_terminal_sizes() {
         assert!(regions.menu.bottom() <= area.bottom());
         assert!(regions.status.bottom() <= area.bottom());
         assert!(regions.completion.bottom() <= area.bottom());
-        assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
+        assert_eq!(style_at(&terminal, 0, 0).bg, Some(theme().background));
     }
 }
 
@@ -851,7 +850,7 @@ fn work_content_uses_contiguous_panel_backgrounds() {
         let background = style_at(&terminal, super::HORIZONTAL_GUTTER + 4, row).bg;
         assert!(matches!(
             background,
-            Some(BACKGROUND | SURFACE | SURFACE_RAISED)
+            Some(color) if [theme().background, theme().surface, theme().surface_raised].contains(&color)
         ));
         let _ = background;
         for x in super::HORIZONTAL_GUTTER..96 - super::HORIZONTAL_GUTTER {
@@ -976,7 +975,7 @@ fn every_draw_paints_the_full_terminal_background() {
             assert!(
                 matches!(
                     cell.style().bg,
-                    Some(BACKGROUND | SURFACE | SURFACE_RAISED | CODE_BG)
+                    Some(color) if [theme().background, theme().surface, theme().surface_raised, theme().code_bg].contains(&color)
                 ),
                 "unpainted cell at {width}x{height}: {:?}",
                 cell.style()
@@ -990,22 +989,23 @@ fn every_draw_paints_the_full_terminal_background() {
         ] {
             assert!(matches!(
                 style_at(&terminal, x, y).bg,
-                Some(BACKGROUND | SURFACE | SURFACE_RAISED | CODE_BG)
+                Some(color) if [theme().background, theme().surface, theme().surface_raised, theme().code_bg].contains(&color)
             ));
         }
     }
 }
 
 #[test]
-fn night_palette_uses_shipped_default_rgb_values() {
-    assert_eq!(BACKGROUND, Color::Reset);
-    assert_eq!(super::TEXT, Color::Rgb(192, 202, 245));
-    assert_eq!(SURFACE, Color::Rgb(31, 35, 53));
-    assert_eq!(SURFACE_RAISED, Color::Rgb(55, 62, 92));
-    assert_eq!(ACCENT_PRIMARY, Color::Rgb(56, 189, 248));
-    assert_eq!(super::ACCENT_SECONDARY, Color::Rgb(167, 139, 250));
-    assert_eq!(BAD, Color::Rgb(247, 118, 142));
-    assert_ne!(ACCENT_PRIMARY, Color::Rgb(120, 158, 166));
+fn default_palette_uses_shipped_rgb_values() {
+    assert_eq!(theme().background, Color::Reset);
+    assert_eq!(theme().text, Color::Rgb(212, 215, 221));
+    assert_eq!(theme().surface, Color::Rgb(29, 33, 41));
+    assert_eq!(theme().surface_raised, Color::Rgb(49, 54, 63));
+    assert_eq!(theme().accent_primary, Color::Rgb(103, 232, 249));
+    assert_eq!(theme().accent_secondary, Color::Rgb(178, 129, 214));
+    assert_eq!(theme().command, Color::Rgb(254, 188, 56));
+    assert_eq!(theme().bad, Color::Rgb(252, 58, 75));
+    assert_ne!(theme().accent_primary, Color::Rgb(56, 189, 248));
 }
 
 #[test]
@@ -1091,7 +1091,7 @@ fn code_blocks_use_a_raised_band_and_tools_stay_on_the_base_background() {
         assert!(
             matches!(
                 cell.style().bg,
-                Some(BACKGROUND | SURFACE | SURFACE_RAISED | CODE_BG)
+                Some(color) if [theme().background, theme().surface, theme().surface_raised, theme().code_bg].contains(&color)
             ),
             "unexpected background {:?}",
             cell.style().bg
@@ -1104,7 +1104,7 @@ fn code_blocks_use_a_raised_band_and_tools_stay_on_the_base_background() {
         .lines()
         .position(|row| row.contains("fn main() {}"))
         .expect("code block should be visible") as u16;
-    assert_eq!(style_at(&terminal, 40, code_row).bg, Some(CODE_BG));
+    assert_eq!(style_at(&terminal, 40, code_row).bg, Some(theme().code_bg));
     assert!(
         format!("{}", terminal.backend())
             .lines()
@@ -1262,7 +1262,7 @@ fn work_input_background_and_text_share_the_block_inner_rect() {
     assert_eq!(terminal.backend().buffer()[(text_x, text_y)].symbol(), "a");
     assert_eq!(
         style_at(&terminal, text_x, text_y).bg,
-        Some(BACKGROUND),
+        Some(theme().background),
         "text cell must sit inside the prompt box, not a slab"
     );
 }
@@ -1331,7 +1331,7 @@ fn completion_panel_aligns_with_footer_and_highlights_selection() {
     let selected_row = regions.completion.y;
     assert!((regions.completion.x..regions.completion.right()).any(|x| {
         let style = style_at(&terminal, x, selected_row);
-        style.fg == Some(ACCENT_PRIMARY) || style.bg == Some(SURFACE_RAISED)
+        style.fg == Some(theme().accent_primary) || style.bg == Some(theme().surface_raised)
     }));
     let screen = format!("{}", terminal.backend());
     assert!(screen.contains("/help") || screen.contains("/"));
@@ -1452,7 +1452,7 @@ fn thinking_is_a_folded_card_in_the_single_timeline() {
         .expect("thinking row should be visible") as u16;
     assert!((0..100).any(|x| {
         let bg = style_at(&terminal, x, thinking_row).bg;
-        matches!(bg, Some(BACKGROUND | SURFACE | SURFACE_RAISED))
+        matches!(bg, Some(color) if [theme().background, theme().surface, theme().surface_raised].contains(&color))
     }));
 
     app.select_timeline_entry(false);
@@ -1670,7 +1670,7 @@ fn tool_cards_use_zex_subject_result_and_duration_summaries() {
         .expect("tool row should be visible") as u16;
     assert!((0..110).any(|x| {
         let bg = style_at(&terminal, x, tool_row).bg;
-        matches!(bg, Some(BACKGROUND | SURFACE | SURFACE_RAISED))
+        matches!(bg, Some(color) if [theme().background, theme().surface, theme().surface_raised].contains(&color))
     }));
 }
 
@@ -1751,8 +1751,8 @@ fn failed_tool_colors_only_the_status_field_as_error() {
     let status_x = unicode_width::UnicodeWidthStr::width(&row_text[..status_byte]) as u16;
     let name_x = unicode_width::UnicodeWidthStr::width(&row_text[..name_byte]) as u16;
 
-    assert_eq!(style_at(&terminal, status_x, row).fg, Some(BAD));
-    assert_ne!(style_at(&terminal, name_x, row).fg, Some(BAD));
+    assert_eq!(style_at(&terminal, status_x, row).fg, Some(theme().bad));
+    assert_ne!(style_at(&terminal, name_x, row).fg, Some(theme().bad));
 }
 
 #[test]
@@ -3088,8 +3088,8 @@ fn resume_picker_paints_complete_two_line_rows_with_a_selected_accent() {
     assert_eq!(selected.height, 1);
     assert!(
         (selected.x..selected.right()).any(|x| style_at(&terminal, x, selected.y).bg
-            == Some(SURFACE_RAISED)
-            || style_at(&terminal, x, selected.y).bg == Some(SURFACE))
+            == Some(theme().surface_raised)
+            || style_at(&terminal, x, selected.y).bg == Some(theme().surface))
     );
 
     let unselected = app
@@ -4769,7 +4769,7 @@ fn welcome_wide_uses_hero_box_and_night_palette() {
     assert!(
         screen_has_glyph(&terminal, "\u{276F}") || screen.contains('❯') || screen.contains('>')
     );
-    assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
+    assert_eq!(style_at(&terminal, 0, 0).bg, Some(theme().background));
     assert!(!screen_has_rgb(&terminal, Color::Rgb(120, 158, 166)));
     assert_no_banned_branding(&screen);
 }
@@ -4837,7 +4837,7 @@ fn conversation_paints_rail_thought_tool_info_and_shortcuts() {
             || screen_has_glyph(&terminal, "\u{2502}")
             || screen_has_glyph(&terminal, "│")
     );
-    assert_eq!(style_at(&terminal, 0, 0).bg, Some(BACKGROUND));
+    assert_eq!(style_at(&terminal, 0, 0).bg, Some(theme().background));
     assert!(!screen.contains("Ask anything"));
     assert!(!screen.contains('›'));
     assert_no_banned_branding(&screen);
@@ -4869,8 +4869,8 @@ fn slash_completion_is_a_highlighted_label_description_dropdown() {
             .buffer()
             .content()
             .iter()
-            .any(|cell| cell.style().bg == Some(SURFACE_RAISED)
-                || cell.style().fg == Some(ACCENT_PRIMARY))
+            .any(|cell| cell.style().bg == Some(theme().surface_raised)
+                || cell.style().fg == Some(theme().accent_primary))
     );
     assert_no_banned_branding(&screen);
 }
@@ -4923,7 +4923,7 @@ fn expanded_tool_and_answer_keep_base_background_and_ascii_glyphs() {
         .expect("tool body row") as u16;
     assert_eq!(
         style_at(&terminal, super::HORIZONTAL_GUTTER + 4, output_row).bg,
-        Some(BACKGROUND),
+        Some(theme().background),
         "expanded tool body must not sit on a raised slab"
     );
 
@@ -4933,7 +4933,7 @@ fn expanded_tool_and_answer_keep_base_background_and_ascii_glyphs() {
         .expect("answer row") as u16;
     assert_eq!(
         style_at(&terminal, super::HORIZONTAL_GUTTER + 4, answer_row).bg,
-        Some(BACKGROUND),
+        Some(theme().background),
         "assistant body must not sit on a raised slab"
     );
 }
@@ -5033,7 +5033,7 @@ fn grok_style_visual_regression() {
     let band_right = regions.transcript.right().saturating_sub(3);
     assert_eq!(
         style_at(&terminal, band_right, user_row).bg,
-        Some(SURFACE),
+        Some(theme().surface),
         "user band must span the full transcript width"
     );
 
@@ -5048,11 +5048,11 @@ fn grok_style_visual_regression() {
         .expect("insert row visible") as u16;
     assert_eq!(
         style_at(&terminal, band_right, del_row).bg,
-        Some(super::DIFF_DEL_BG)
+        Some(super::theme().diff_del_bg)
     );
     assert_eq!(
         style_at(&terminal, band_right, add_row).bg,
-        Some(super::DIFF_ADD_BG)
+        Some(super::theme().diff_add_bg)
     );
 
     // Code block rows sit on the raised code surface.
@@ -5060,7 +5060,10 @@ fn grok_style_visual_regression() {
         .lines()
         .position(|row| row.contains("fn main() {}"))
         .expect("code row visible") as u16;
-    assert_eq!(style_at(&terminal, band_right, code_row).bg, Some(CODE_BG));
+    assert_eq!(
+        style_at(&terminal, band_right, code_row).bg,
+        Some(theme().code_bg)
+    );
 
     // Tool header: path subject stays on the quiet gray ramp.
     let tool_row = screen
@@ -5075,7 +5078,7 @@ fn grok_style_visual_regression() {
         .unwrap() as u16;
     assert_eq!(
         style_at(&terminal, path_col, tool_row).fg,
-        Some(super::TEXT_DIM)
+        Some(super::theme().text_dim)
     );
 
     // Composer chrome: teal model name.
@@ -5092,7 +5095,7 @@ fn grok_style_visual_regression() {
         .unwrap() as u16;
     assert_eq!(
         style_at(&terminal, model_col, model_row).fg,
-        Some(super::MODEL_ACCENT)
+        Some(super::theme().model_accent)
     );
 
     // Thinking status label replaces the generic "working".
@@ -5123,6 +5126,6 @@ fn wrapped_message_rows_keep_inline_markdown_styling() {
         .find("marker")
         .unwrap() as u16;
     let style = style_at(&terminal, column, row);
-    assert_eq!(style.fg, Some(super::TEXT_STRONG));
+    assert_eq!(style.fg, Some(super::theme().text_strong));
     assert!(style.add_modifier.contains(ratatui::style::Modifier::BOLD));
 }

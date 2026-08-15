@@ -336,6 +336,128 @@ pub struct Config {
     pub compact_keep_turns: usize,
     pub default_thinking_level: ThinkingLevel,
     pub hide_thinking_block: bool,
+    pub theme: ThemeConfig,
+}
+
+/// A `[theme]` color value: `"#rgb"`, `"#rrggbb"`, or `"default"`/`"reset"`
+/// to follow the terminal's own color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeColor {
+    Terminal,
+    Rgb(u8, u8, u8),
+}
+
+impl ThemeColor {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("default") || value.eq_ignore_ascii_case("reset") {
+            return Ok(Self::Terminal);
+        }
+        let Some(hex) = value.strip_prefix('#') else {
+            return Err(format!("{value:?} is not a hex color like #7dcfff"));
+        };
+        let expanded;
+        let hex = match hex.len() {
+            3 => {
+                expanded = hex
+                    .chars()
+                    .flat_map(|digit| [digit, digit])
+                    .collect::<String>();
+                &expanded
+            }
+            6 => hex,
+            _ => {
+                return Err(format!(
+                    "#{hex} must have 3 or 6 hex digits, like #7df or #7dcfff"
+                ));
+            }
+        };
+        let channel = |pair: &str| {
+            u8::from_str_radix(pair, 16).map_err(|_| format!("#{hex} contains a non-hex digit"))
+        };
+        Ok(Self::Rgb(
+            channel(&hex[0..2])?,
+            channel(&hex[2..4])?,
+            channel(&hex[4..6])?,
+        ))
+    }
+}
+
+impl<'de> Deserialize<'de> for ThemeColor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        ThemeColor::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// `[theme]` palette overrides for the TUI. Every key is optional; unset keys
+/// keep the built-in defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemeConfig {
+    pub background: Option<ThemeColor>,
+    pub surface: Option<ThemeColor>,
+    pub surface_hover: Option<ThemeColor>,
+    pub surface_raised: Option<ThemeColor>,
+    pub text: Option<ThemeColor>,
+    pub text_strong: Option<ThemeColor>,
+    pub text_dim: Option<ThemeColor>,
+    pub text_faint: Option<ThemeColor>,
+    pub gray_dim: Option<ThemeColor>,
+    pub accent_primary: Option<ThemeColor>,
+    pub accent_secondary: Option<ThemeColor>,
+    pub accent_user: Option<ThemeColor>,
+    pub accent_thinking: Option<ThemeColor>,
+    pub accent_tool: Option<ThemeColor>,
+    pub border: Option<ThemeColor>,
+    pub border_active: Option<ThemeColor>,
+    pub ok: Option<ThemeColor>,
+    pub bad: Option<ThemeColor>,
+    pub command: Option<ThemeColor>,
+    pub running: Option<ThemeColor>,
+    pub model_accent: Option<ThemeColor>,
+    pub md_code: Option<ThemeColor>,
+    pub code_bg: Option<ThemeColor>,
+    pub diff_add_bg: Option<ThemeColor>,
+    pub diff_del_bg: Option<ThemeColor>,
+    pub wordmark_ink: Option<ThemeColor>,
+}
+
+impl ThemeConfig {
+    /// Project config wins key by key over the global config.
+    fn merge(self, project: Self) -> Self {
+        Self {
+            background: project.background.or(self.background),
+            surface: project.surface.or(self.surface),
+            surface_hover: project.surface_hover.or(self.surface_hover),
+            surface_raised: project.surface_raised.or(self.surface_raised),
+            text: project.text.or(self.text),
+            text_strong: project.text_strong.or(self.text_strong),
+            text_dim: project.text_dim.or(self.text_dim),
+            text_faint: project.text_faint.or(self.text_faint),
+            gray_dim: project.gray_dim.or(self.gray_dim),
+            accent_primary: project.accent_primary.or(self.accent_primary),
+            accent_secondary: project.accent_secondary.or(self.accent_secondary),
+            accent_user: project.accent_user.or(self.accent_user),
+            accent_thinking: project.accent_thinking.or(self.accent_thinking),
+            accent_tool: project.accent_tool.or(self.accent_tool),
+            border: project.border.or(self.border),
+            border_active: project.border_active.or(self.border_active),
+            ok: project.ok.or(self.ok),
+            bad: project.bad.or(self.bad),
+            command: project.command.or(self.command),
+            running: project.running.or(self.running),
+            model_accent: project.model_accent.or(self.model_accent),
+            md_code: project.md_code.or(self.md_code),
+            code_bg: project.code_bg.or(self.code_bg),
+            diff_add_bg: project.diff_add_bg.or(self.diff_add_bg),
+            diff_del_bg: project.diff_del_bg.or(self.diff_del_bg),
+            wordmark_ink: project.wordmark_ink.or(self.wordmark_ink),
+        }
+    }
 }
 
 impl Config {
@@ -477,6 +599,7 @@ impl Config {
                 file.hide_thinking_block,
                 false,
             )?,
+            theme: file.theme,
         })
     }
 
@@ -510,6 +633,8 @@ struct FileConfig {
     default_thinking_level: Option<ThinkingLevel>,
     hide_thinking_block: Option<bool>,
     session_dir: Option<String>,
+    #[serde(default)]
+    theme: ThemeConfig,
 }
 
 impl FileConfig {
@@ -536,6 +661,7 @@ impl FileConfig {
                 .or(self.default_thinking_level),
             hide_thinking_block: project.hide_thinking_block.or(self.hide_thinking_block),
             session_dir: project.session_dir.or(self.session_dir),
+            theme: self.theme.merge(project.theme),
         }
     }
 }

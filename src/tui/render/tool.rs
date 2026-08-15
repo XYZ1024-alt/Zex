@@ -33,10 +33,10 @@ pub(super) fn append_tool_lines(
     ));
 
     if tool.expanded {
-        let label_style = Style::default().fg(TEXT_FAINT);
-        let body_style = Style::default().fg(TEXT_DIM);
-        let added_style = Style::default().fg(OK);
-        let removed_style = Style::default().fg(BAD);
+        let label_style = Style::default().fg(theme().text_faint);
+        let body_style = Style::default().fg(theme().text_dim);
+        let added_style = Style::default().fg(theme().ok);
+        let removed_style = Style::default().fg(theme().bad);
         let arguments = serde_json::from_str::<Value>(&tool.arguments).ok();
         let param_key = match tool.name.as_str() {
             "bash" => "command",
@@ -87,11 +87,11 @@ pub(super) fn append_tool_lines(
         if let Some(diff_lines) = &edit_diff {
             for line in diff_lines.iter().take(visible_lines) {
                 let (style, band) = if line.starts_with("+ ") {
-                    (added_style, Some(DIFF_ADD_BG))
+                    (added_style, Some(theme().diff_add_bg))
                 } else if line.starts_with("- ") {
-                    (removed_style, Some(DIFF_DEL_BG))
+                    (removed_style, Some(theme().diff_del_bg))
                 } else {
-                    (Style::default().fg(TEXT), None)
+                    (Style::default().fg(theme().text), None)
                 };
                 for segment in wrap_display_hard(line, width.saturating_sub(2).max(1)) {
                     let mut rendered =
@@ -160,13 +160,13 @@ fn tool_verb(name: &str) -> String {
 fn tool_subject_spans(tool: &ToolEntry, subject: &str) -> Vec<Span<'static>> {
     if tool.name == "bash" {
         return vec![
-            Span::styled("$ ", Style::default().fg(GRAY_DIM)),
-            Span::styled(subject.to_owned(), Style::default().fg(COMMAND)),
+            Span::styled("$ ", Style::default().fg(theme().gray_dim)),
+            Span::styled(subject.to_owned(), Style::default().fg(theme().command)),
         ];
     }
     vec![Span::styled(
         subject.to_owned(),
-        Style::default().fg(TEXT_DIM),
+        Style::default().fg(theme().text_dim),
     )]
 }
 
@@ -187,14 +187,18 @@ fn tool_header_line(
     let selected = state.selected;
     let result_color = state.result_color;
     let verb_style = Style::default()
-        .fg(if selected { TEXT_STRONG } else { TEXT })
+        .fg(if selected {
+            theme().text_strong
+        } else {
+            theme().text
+        })
         .add_modifier(Modifier::BOLD);
     // Status glyph: a live braille spinner while running, otherwise a quiet
     // dot colored by outcome (green ok, red failed, gray stopped).
     let glyph = match state.running_millis {
         Some(millis) => Span::styled(
             crate::tui::glyphs::spinner_frame(millis).to_owned(),
-            Style::default().fg(RUNNING),
+            Style::default().fg(theme().running),
         ),
         None => Span::styled(
             crate::tui::glyphs::status_dot().to_owned(),
@@ -218,7 +222,11 @@ fn tool_header_line(
         meta.push(duration.to_owned());
     }
     if !meta.is_empty() {
-        let meta_color = if result_color == BAD { BAD } else { TEXT_FAINT };
+        let meta_color = if result_color == theme().bad {
+            theme().bad
+        } else {
+            theme().text_faint
+        };
         spans.push(Span::styled(
             format!(" · {}", meta.join(" · ")),
             Style::default().fg(meta_color),
@@ -312,7 +320,7 @@ fn tool_result(tool: &ToolEntry) -> String {
 
 fn tool_result_color(tool: &ToolEntry) -> Color {
     if tool.name == "bash" && bash_exit_code(&tool.output).is_some_and(|code| code != "0") {
-        return BAD;
+        return theme().bad;
     }
     tool.status.color()
 }

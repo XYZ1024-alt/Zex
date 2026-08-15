@@ -48,7 +48,9 @@ async fn main() -> Result<()> {
         compact_keep_turns,
         default_thinking_level,
         hide_thinking_block,
+        theme,
     } = config;
+    tui::install_theme(&theme);
     let thinking_level = loaded_session
         .as_ref()
         .and_then(|session| session.thinking_level)

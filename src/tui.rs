@@ -58,43 +58,12 @@ const SCROLL_STEP: usize = 3;
 const PASTE_BURST_WINDOW: Duration = Duration::from_millis(12);
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-// Tokyo Night palette on a transparent base: the terminal's own background
-// shows through, foregrounds use the cool blue/violet ramp. Surface bands
-// stay low-contrast so highlights read as a whisper, not slabs.
-const BACKGROUND: Color = Color::Reset;
 // Fixed dark ink used only as the blend target for fades/shimmers; never
 // painted as a background.
-const BASE_INK: Color = Color::Rgb(26, 27, 38);
-const SURFACE: Color = Color::Rgb(31, 35, 53);
-const SURFACE_HOVER: Color = Color::Rgb(41, 46, 66);
-const SURFACE_RAISED: Color = Color::Rgb(55, 62, 92);
-const TEXT: Color = Color::Rgb(192, 202, 245);
-const TEXT_STRONG: Color = Color::Rgb(224, 230, 251);
-const TEXT_DIM: Color = Color::Rgb(115, 122, 162);
-const TEXT_FAINT: Color = Color::Rgb(86, 95, 137);
-const GRAY_DIM: Color = Color::Rgb(65, 72, 104);
-const ACCENT_PRIMARY: Color = Color::Rgb(56, 189, 248);
-const ACCENT_SECONDARY: Color = Color::Rgb(167, 139, 250);
-const ACCENT_USER: Color = Color::Rgb(200, 206, 230);
-const ACCENT_THINKING: Color = ACCENT_SECONDARY;
-// Tool chrome deliberately blends into the gray ramp; only status colors pop.
-const ACCENT_TOOL: Color = TEXT_FAINT;
-const BORDER: Color = Color::Rgb(41, 46, 66);
-const BORDER_ACTIVE: Color = Color::Rgb(84, 92, 126);
-const OK: Color = Color::Rgb(158, 206, 106);
-const BAD: Color = Color::Rgb(247, 118, 142);
-// Semantic accents: sky blue leads, violet thinks, orange runs commands.
-const COMMAND: Color = Color::Rgb(255, 166, 87);
-const RUNNING: Color = Color::Rgb(125, 207, 255);
-const MODEL_ACCENT: Color = Color::Rgb(255, 171, 112);
-const MD_CODE: Color = Color::Rgb(130, 170, 255);
-const CODE_BG: Color = Color::Rgb(24, 26, 38);
-const DIFF_ADD_BG: Color = Color::Rgb(26, 48, 38);
-const DIFF_DEL_BG: Color = Color::Rgb(61, 35, 42);
+use theme::BASE_INK;
+use theme::theme;
+
 const PRODUCT_NAME: &str = "ZEX";
-// Wordmark palette: a single sky tone for the block letters,
-// animated by the shimmer sweep.
-const WORDMARK_INK: Color = Color::Rgb(125, 207, 255);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WelcomeActionKind {
@@ -1286,10 +1255,10 @@ impl ToolStatus {
 
     fn color(self) -> Color {
         match self {
-            Self::Running => RUNNING,
-            Self::Cancelled => TEXT_FAINT,
-            Self::Done => OK,
-            Self::Failed => BAD,
+            Self::Running => theme().running,
+            Self::Cancelled => theme().text_faint,
+            Self::Done => theme().ok,
+            Self::Failed => theme().bad,
         }
     }
 }
@@ -1444,8 +1413,8 @@ impl Toast {
 
     fn color(&self) -> Color {
         match self.tone {
-            ToastTone::Neutral => ACCENT_PRIMARY,
-            ToastTone::Success => OK,
+            ToastTone::Neutral => theme().accent_primary,
+            ToastTone::Success => theme().ok,
         }
     }
 }
@@ -3669,6 +3638,9 @@ fn git_output(working_dir: &Path, arguments: &[&str]) -> Option<String> {
 mod anim;
 mod glyphs;
 mod render;
+mod theme;
+
+pub use theme::install_theme;
 
 use render::{
     error_summary, format_json, render, sanitize_terminal_text, single_line,
