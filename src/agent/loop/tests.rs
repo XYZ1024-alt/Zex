@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     agent::{AgentEvent, AssistantMessage, MessageRole, ToolCall},
+    memory::{MemoryConfig, MemoryRuntime, extract_memory_ids},
     provider::{Provider, ToolDefinition},
     tools::{Tool, ToolFuture, ToolRegistry},
 };
@@ -265,6 +266,188 @@ async fn emits_message_tool_and_turn_events_in_order() {
 }
 
 #[tokio::test]
+async fn large_tool_result_compacts_to_a_recallable_citation() {
+    let directory = std::env::temp_dir().join(format!(
+        "zex-agent-memory-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let memory = Arc::new(MemoryRuntime::new(MemoryConfig {
+        max_recall_tokens: 8_192,
+        ..MemoryConfig::default()
+    }));
+    memory
+        .activate("20260815-120000-cafebabe", directory.clone())
+        .await
+        .unwrap();
+    let original = "precise-large-observation\n".repeat(600);
+    let old_prompt = "old task context ".repeat(2_000);
+    let provider = SequenceProvider {
+        messages: Mutex::new(VecDeque::from([
+            AssistantMessage {
+                content: String::new(),
+                thinking: Some("Need the large observation.".to_owned()),
+                tool_calls: vec![ToolCall {
+                    id: "call-big".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: serde_json::to_string(&json!({"value": original.clone()})).unwrap(),
+                }],
+                provider_state: None,
+                usage: None,
+            },
+            AssistantMessage {
+                content: "old turn complete".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+                usage: None,
+            },
+            AssistantMessage {
+                content: "recent turn complete".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+                usage: None,
+            },
+        ])),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut tools = ToolRegistry::new(Duration::from_secs(1), 32_000);
+    tools.set_memory(Arc::clone(&memory));
+    tools.register(EchoTool);
+    let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        provider,
+        tools,
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(5),
+            max_turns: 3,
+            max_context_tokens: 120_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+    agent.initialize_memory().await.unwrap();
+
+    agent.prompt(old_prompt.clone()).await.unwrap();
+    agent.prompt("recent task").await.unwrap();
+
+    let tool_content = agent
+        .messages()
+        .iter()
+        .find_map(|message| match message {
+            crate::agent::Message::Tool { content, .. } => Some(content),
+            _ => None,
+        })
+        .unwrap();
+    let id = extract_memory_ids(tool_content).pop().unwrap();
+    assert!(tool_content.contains("recall available"));
+    assert!(!tool_content.contains("precise-large-observation"));
+    assert!(matches!(
+        agent.messages().first(),
+        Some(crate::agent::Message::System { content })
+            if content.contains("[Current valid addressable pointers]")
+                && content.contains(&id)
+                && content.contains("Never invent")
+                && content.contains("A recall failure means the content is unavailable")
+    ));
+    let stored_history = memory.list_pointers(Some("old task")).unwrap();
+    let turn_id = extract_memory_ids(&stored_history).pop().unwrap();
+    assert!(turn_id.starts_with("§turn_"));
+
+    let before = agent.context_tokens();
+    let stats = agent.compact().await.unwrap();
+    assert!(stats.freed_tokens > 0);
+    assert!(agent.context_tokens() * 2 < before);
+    assert!(matches!(
+        agent.messages().get(1),
+        Some(crate::agent::Message::System { content })
+            if content.contains("[Available addressable pointers]")
+                && content.contains(&id)
+    ));
+    let recalled_turn = memory
+        .recall(&turn_id, Some("recover compacted request".to_owned()))
+        .await
+        .unwrap();
+    assert!(recalled_turn.ends_with(&old_prompt));
+    let recalled = memory
+        .recall(&id, Some("continue from exact evidence".to_owned()))
+        .await
+        .unwrap();
+    assert!(recalled.ends_with(&original));
+    tokio::fs::remove_dir_all(directory).await.unwrap();
+}
+
+#[tokio::test]
+async fn disabled_memory_preserves_the_original_tool_and_prompt_contract() {
+    let original = "legacy-full-output".repeat(200);
+    let provider = SequenceProvider {
+        messages: Mutex::new(VecDeque::from([
+            AssistantMessage {
+                content: String::new(),
+                thinking: None,
+                tool_calls: vec![ToolCall {
+                    id: "legacy-call".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: serde_json::to_string(&json!({"value": original.clone()})).unwrap(),
+                }],
+                provider_state: None,
+                usage: None,
+            },
+            AssistantMessage {
+                content: "done".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+                usage: None,
+            },
+        ])),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut tools = ToolRegistry::new(Duration::from_secs(1), 32_000);
+    tools.register(EchoTool);
+    let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        provider,
+        tools,
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(5),
+            max_turns: 2,
+            max_context_tokens: 120_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+
+    agent.prompt("legacy behavior").await.unwrap();
+
+    assert!(matches!(
+        agent.messages().first(),
+        Some(crate::agent::Message::System { content })
+            if !content.contains("[Addressable memory policy]")
+    ));
+    assert!(agent.messages().iter().any(|message| matches!(
+        message,
+        crate::agent::Message::Tool { content, .. } if content == &original
+    )));
+    assert!(
+        !agent
+            .messages()
+            .iter()
+            .any(|message| !extract_memory_ids(super::message_content(message)).is_empty())
+    );
+}
+
+#[tokio::test]
 async fn emits_provider_errors() {
     let (events, mut receiver) = mpsc::unbounded_channel();
     let mut agent = Agent::new(
@@ -346,8 +529,8 @@ async fn cancellation_keeps_user_prompt_and_discards_partial_turn_state() {
     assert_eq!(receiver.try_recv().unwrap(), AgentEvent::TurnCancelled);
 }
 
-#[test]
-fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
+#[tokio::test]
+async fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
     let provider = SequenceProvider {
         messages: Mutex::new(VecDeque::new()),
         requests: Arc::new(Mutex::new(Vec::new())),
@@ -405,7 +588,7 @@ fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
     );
 
     let before = agent.context_tokens();
-    let stats = agent.compact();
+    let stats = agent.compact().await.unwrap();
 
     assert_eq!(stats.kept_turns, 2);
     assert_eq!(stats.summarized_turns, 1);
@@ -438,8 +621,8 @@ fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
         ));
 }
 
-#[test]
-fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
+#[tokio::test]
+async fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
     let provider = SequenceProvider {
         messages: Mutex::new(VecDeque::new()),
         requests: Arc::new(Mutex::new(Vec::new())),
@@ -473,7 +656,11 @@ fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
         ]),
     );
 
-    let stats = agent.compact_if_needed().expect("context should compact");
+    let stats = agent
+        .compact_if_needed()
+        .await
+        .unwrap()
+        .expect("context should compact");
 
     assert!(stats.freed_tokens > 0);
     assert!(matches!(
@@ -664,8 +851,8 @@ fn context_budget_falls_back_when_no_model_limit_is_known() {
     assert_eq!(agent.context_budget(), 42_000);
 }
 
-#[test]
-fn prune_clears_old_tool_outputs_before_full_compaction() {
+#[tokio::test]
+async fn prune_clears_old_tool_outputs_before_full_compaction() {
     let (events, _) = mpsc::unbounded_channel();
     let mut messages = vec![crate::agent::Message::User {
         content: "task".to_owned(),
@@ -708,6 +895,8 @@ fn prune_clears_old_tool_outputs_before_full_compaction() {
 
     let stats = agent
         .compact_if_needed()
+        .await
+        .unwrap()
         .expect("context should cross the threshold");
 
     assert_eq!(stats.pruned_tool_outputs, 2);
@@ -799,6 +988,6 @@ async fn server_usage_calibrates_context_and_compaction_resets_it() {
 
     // Compaction rewrites the history, so the server baseline is dropped and
     // the estimate becomes fully local again.
-    agent.compact();
+    agent.compact().await.unwrap();
     assert_eq!(agent.context_tokens(), local_sum(&agent));
 }

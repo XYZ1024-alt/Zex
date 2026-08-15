@@ -8,9 +8,12 @@ use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{
-    ModelLimit, ModelsDevCatalog, ModelsDevLoad, ModelsDevProviderAlias, OpenAiApi,
-    ThinkingCapabilities, ThinkingCompat, ThinkingConfig, ThinkingLevel,
+use crate::{
+    memory::{MemoryConfig, MemoryMode},
+    provider::{
+        ModelLimit, ModelsDevCatalog, ModelsDevLoad, ModelsDevProviderAlias, OpenAiApi,
+        ThinkingCapabilities, ThinkingCompat, ThinkingConfig, ThinkingLevel,
+    },
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -350,6 +353,7 @@ pub struct Config {
     pub max_tool_output_chars: usize,
     pub max_context_tokens: usize,
     pub compact_keep_turns: usize,
+    pub memory: MemoryConfig,
     pub default_thinking_level: ThinkingLevel,
     pub hide_thinking_block: bool,
     pub theme: ThemeConfig,
@@ -607,6 +611,46 @@ impl Config {
                     DEFAULT_COMPACT_KEEP_TURNS,
                 )?,
             )?,
+            memory: {
+                let defaults = MemoryConfig::default();
+                MemoryConfig {
+                    enabled: env_or_file(
+                        "ZEX_MEMORY_ENABLED",
+                        file.memory.enabled,
+                        defaults.enabled,
+                    )?,
+                    mode: env_or_file("ZEX_MEMORY_MODE", file.memory.mode, MemoryMode::default())?,
+                    recall_rate_limit: positive(
+                        "memory.recall_rate_limit",
+                        env_or_file(
+                            "ZEX_MEMORY_RECALL_RATE_LIMIT",
+                            file.memory.recall_rate_limit,
+                            defaults.recall_rate_limit,
+                        )?,
+                    )?,
+                    max_recall_tokens: positive(
+                        "memory.max_recall_tokens",
+                        env_or_file(
+                            "ZEX_MEMORY_MAX_RECALL_TOKENS",
+                            file.memory.max_recall_tokens,
+                            defaults.max_recall_tokens,
+                        )?,
+                    )?,
+                    hot_cache_size: positive(
+                        "memory.hot_cache_size",
+                        env_or_file(
+                            "ZEX_MEMORY_HOT_CACHE_SIZE",
+                            file.memory.hot_cache_size,
+                            defaults.hot_cache_size,
+                        )?,
+                    )?,
+                    auto_pin_important: env_or_file(
+                        "ZEX_MEMORY_AUTO_PIN_IMPORTANT",
+                        file.memory.auto_pin_important,
+                        defaults.auto_pin_important,
+                    )?,
+                }
+            },
             default_thinking_level: env_or_file(
                 "ZEX_DEFAULT_THINKING_LEVEL",
                 file.default_thinking_level,
@@ -653,7 +697,33 @@ struct FileConfig {
     hide_thinking_block: Option<bool>,
     session_dir: Option<String>,
     #[serde(default)]
+    memory: FileMemoryConfig,
+    #[serde(default)]
     theme: ThemeConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileMemoryConfig {
+    enabled: Option<bool>,
+    mode: Option<MemoryMode>,
+    recall_rate_limit: Option<usize>,
+    max_recall_tokens: Option<usize>,
+    hot_cache_size: Option<usize>,
+    auto_pin_important: Option<bool>,
+}
+
+impl FileMemoryConfig {
+    fn merge(self, project: Self) -> Self {
+        Self {
+            enabled: project.enabled.or(self.enabled),
+            mode: project.mode.or(self.mode),
+            recall_rate_limit: project.recall_rate_limit.or(self.recall_rate_limit),
+            max_recall_tokens: project.max_recall_tokens.or(self.max_recall_tokens),
+            hot_cache_size: project.hot_cache_size.or(self.hot_cache_size),
+            auto_pin_important: project.auto_pin_important.or(self.auto_pin_important),
+        }
+    }
 }
 
 impl FileConfig {
@@ -680,6 +750,7 @@ impl FileConfig {
                 .or(self.default_thinking_level),
             hide_thinking_block: project.hide_thinking_block.or(self.hide_thinking_block),
             session_dir: project.session_dir.or(self.session_dir),
+            memory: self.memory.merge(project.memory),
             theme: self.theme.merge(project.theme),
         }
     }

@@ -25,6 +25,12 @@ const TEST_ENV: &[&str] = &[
     "ZEX_MAX_CONTEXT_CHARS",
     "ZEX_MAX_CONTEXT_TOKENS",
     "ZEX_COMPACT_KEEP_TURNS",
+    "ZEX_MEMORY_ENABLED",
+    "ZEX_MEMORY_MODE",
+    "ZEX_MEMORY_RECALL_RATE_LIMIT",
+    "ZEX_MEMORY_MAX_RECALL_TOKENS",
+    "ZEX_MEMORY_HOT_CACHE_SIZE",
+    "ZEX_MEMORY_AUTO_PIN_IMPORTANT",
     "ZEX_DEFAULT_THINKING_LEVEL",
     "ZEX_HIDE_THINKING_BLOCK",
     "ZEX_SESSION_DIR",
@@ -553,6 +559,72 @@ async fn legacy_max_context_chars_key_and_environment_variable_still_work() {
     let config = Config::load_from(&project, &global).await.unwrap();
     assert_eq!(config.max_context_tokens, 96_000);
 
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_config_merges_and_environment_overrides_runtime_limits() {
+    let _environment = EnvGuard::clear();
+    let root = temp_directory("memory-config");
+    let project = root.join("project");
+    let global = root.join("global");
+    write_config(
+        &global.join("config.toml"),
+        r#"
+[memory]
+enabled = true
+mode = "summary"
+recall_rate_limit = 4
+max_recall_tokens = 1024
+hot_cache_size = 8
+auto_pin_important = false
+"#,
+    )
+    .await;
+    write_config(
+        &project.join(".zex/config.toml"),
+        r#"
+[memory]
+enabled = false
+mode = "pointer_priority"
+max_recall_tokens = 2048
+"#,
+    )
+    .await;
+    unsafe {
+        std::env::set_var("ZEX_MEMORY_ENABLED", "true");
+        std::env::set_var("ZEX_MEMORY_RECALL_RATE_LIMIT", "7");
+    }
+
+    let config = Config::load_from(&project, &global).await.unwrap();
+
+    assert!(config.memory.enabled);
+    assert_eq!(
+        config.memory.mode,
+        crate::memory::MemoryMode::PointerPriority
+    );
+    assert_eq!(config.memory.recall_rate_limit, 7);
+    assert_eq!(config.memory.max_recall_tokens, 2_048);
+    assert_eq!(config.memory.hot_cache_size, 8);
+    assert!(!config.memory.auto_pin_important);
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_can_be_disabled_for_traditional_behavior() {
+    let _environment = EnvGuard::clear();
+    let root = temp_directory("memory-disabled");
+    let project = root.join("project");
+    let global = root.join("global");
+    write_config(
+        &project.join(".zex/config.toml"),
+        "[memory]\nenabled = false\n",
+    )
+    .await;
+
+    let config = Config::load_from(&project, &global).await.unwrap();
+
+    assert!(!config.memory.enabled);
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 

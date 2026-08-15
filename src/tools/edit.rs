@@ -80,6 +80,7 @@ impl Tool for EditTool {
                 Ok(ToolOutcome {
                     output: format!("edited {}", path.display()),
                     change: FileChange::capture(path.clone(), Some(content), edited),
+                    memory: None,
                 })
             })
             .await

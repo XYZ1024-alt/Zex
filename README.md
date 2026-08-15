@@ -2,7 +2,7 @@
 
 Zex 是一个极简、可单二进制运行的通用 coding harness。它提供最小 Agent 循环与可观测终端界面，而不是大而全的 IDE 或实验管理平台。
 
-Zex 当前只包含 OpenAI 兼容模型接入、ReAct 循环、六个开箱可用的本地工具、核心事件流、ratatui TUI、headless 模式、斜杠命令、规则式上下文 compact、TOML 配置和 JSONL 会话管理。它不包含 MCP、子 Agent、Plan Mode、权限审批流、插件市场、IDE、科研指标、实验记录、向量库、RAG 或长期记忆。
+Zex 当前包含 OpenAI 兼容模型接入、ReAct 循环、六个本地工具、四个地址化回忆工具、核心事件流、ratatui TUI、headless 模式、斜杠命令、Addressable Recall Compaction（ARC）、TOML 配置和 JSONL 会话管理。它不包含 MCP、子 Agent、Plan Mode、权限审批流、插件市场、IDE、科研指标、向量检索或跨会话共享记忆。
 
 ## 构建
 
@@ -30,7 +30,7 @@ Zex 按以下顺序合并配置，后者覆盖前者：
 
 可用 `ZEX_CONFIG_DIR` 覆盖整个全局目录，便于便携安装和隔离测试。
 
-会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建/更新时间、保存时的 model 和当前 `thinking_level`；后续每行是一条 Agent 消息。会话不保存 API Key、base URL 或其他敏感运行配置。恢复会话会恢复消息与思考级别，但不改变当前通过 `/model` 选择的模型。
+会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建/更新时间、保存时的 model 和当前 `thinking_level`；后续每行是一条 Agent 消息。启用 ARC 时，原始观察和被 compact 的历史另存于 `sessions/<id>/memory/records.jsonl`；该文件 append-only，session resume 时重建 ID 索引。会话不保存 API Key、base URL 或其他敏感运行配置。恢复会话会恢复消息、地址化 Store 和思考级别，但不改变当前通过 `/model` 选择的模型。
 
 项目配置示例：
 
@@ -45,6 +45,14 @@ max_context_tokens = 128000
 compact_keep_turns = 6
 default_thinking_level = "medium"
 hide_thinking_block = false
+
+[memory]
+enabled = true
+mode = "hybrid"
+recall_rate_limit = 5
+max_recall_tokens = 2048
+hot_cache_size = 32
+auto_pin_important = true
 
 [[providers]]
 id = "openai"
@@ -87,6 +95,12 @@ max = "max"
 | `max_tool_output_chars` | `32000` | 所有内置工具返回内容的统一字符上限；超限时保留头尾 |
 | `max_context_tokens` | `128000` | 上下文 token 预算兜底值；模型窗口已知（models.dev 或模型的 `context_window` 覆盖）时优先使用模型窗口并预留输出空间，达到 85% 时自动 compact。旧键 `max_context_chars` 仍被接受 |
 | `compact_keep_turns` | `6` | compact 时完整保留的最近用户轮次数 |
+| `memory.enabled` | `true` | ARC 总开关；关闭后不注册 memory 工具，并回退到原有工具输出与 summary compact 路径 |
+| `memory.mode` | `"hybrid"` | `pointer_priority` 优先 citation、`summary` 使用传统摘要、`hybrid` 保留轻量流程摘要并用 citation 保存精确恢复路径 |
+| `memory.recall_rate_limit` | `5` | 每分钟 recall 上限；同时每个模型工具轮最多 3 次 |
+| `memory.max_recall_tokens` | `2048` | 单次 recall 返回 token 上限；超限返回受控前缀片段，全文继续保留在原 ID |
+| `memory.hot_cache_size` | `32` | 进程内最近访问内容的 LRU 条目数；重启后由 Store 按需重建 |
+| `memory.auto_pin_important` | `true` | 自动 pin 高价值修改类工具结果；可用 `unpin` 解除 |
 | `default_thinking_level` | `medium` | 新会话默认思考强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
 | `hide_thinking_block` | `false` | 是否隐藏 TUI 中默认折叠的思考卡片；隐藏不删除会话数据，也不影响模型实际思考 |
 | `session_dir` | 全局 `sessions` 目录 | 自定义会话目录；相对路径基于项目工作目录 |
@@ -128,6 +142,12 @@ Zex 启动时从 `https://models.dev/api.json` 刷新模型思考能力，并把
 | `ZEX_MAX_TOOL_OUTPUT_CHARS` | 无 | `max_tool_output_chars` |
 | `ZEX_MAX_CONTEXT_TOKENS` | 无 | `max_context_tokens`（旧变量 `ZEX_MAX_CONTEXT_CHARS` 仍被接受） |
 | `ZEX_COMPACT_KEEP_TURNS` | 无 | `compact_keep_turns` |
+| `ZEX_MEMORY_ENABLED` | 无 | `memory.enabled` |
+| `ZEX_MEMORY_MODE` | 无 | `memory.mode` |
+| `ZEX_MEMORY_RECALL_RATE_LIMIT` | 无 | `memory.recall_rate_limit` |
+| `ZEX_MEMORY_MAX_RECALL_TOKENS` | 无 | `memory.max_recall_tokens` |
+| `ZEX_MEMORY_HOT_CACHE_SIZE` | 无 | `memory.hot_cache_size` |
+| `ZEX_MEMORY_AUTO_PIN_IMPORTANT` | 无 | `memory.auto_pin_important` |
 | `ZEX_DEFAULT_THINKING_LEVEL` | 无 | `default_thinking_level` |
 | `ZEX_HIDE_THINKING_BLOCK` | 无 | `hide_thinking_block` |
 | `ZEX_SESSION_DIR` | 无 | `session_dir` |
@@ -237,7 +257,7 @@ TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册�
 | `/clear` | 清空当前 TUI/REPL 上下文；TUI 同时清空对话视图。不删除磁盘会话，下一条普通消息创建新会话 |
 | `/sessions` | 查看保存的会话；复用 `SessionStore::list` 列出 ID、更新时间、消息数和预览 |
 | `/resume [id]` | 无参数时打开历史会话选择列表；有参数时直接恢复指定会话。只恢复消息，不改变当前模型 |
-| `/compact` | 立即压缩旧上下文，显示压缩前后字符数、约释放字符数、保留轮次和摘要数量 |
+| `/compact` | 立即压缩旧上下文；ARC 模式先持久化原文并用 citation 替换大观察，再显示压缩前后 token、保留轮次和摘要数量 |
 | `/think [off\|minimal\|low\|medium\|high\|xhigh\|max]` | 无参数时显示当前请求值、有效值与模型可用级别；有参数时设置并自动 clamp/map。写入项目默认值及活跃会话 |
 | `/thinking [show\|hide]` | 无参数时显示当前思考卡片可见性；有参数时独立设置并写入项目 `.zex/config.toml` |
 
@@ -281,11 +301,32 @@ zex resume 20260812-143012-1a2b3c4d -p "继续上一轮工作并给出结论"
 zex resume -p "继续上一轮工作并给出结论"
 ```
 
-新运行在退出时创建一个 JSONL 文件；恢复已有会话时原位更新同一文件，不复制分叉会话。若 Provider 或工具报错，Zex 仍会保存当前消息历史，再返回错误；无效斜杠命令只在当前界面显示错误，不写入模型上下文。
+新运行在退出时创建一个 JSONL 文件；恢复已有会话时原位更新同一文件，不复制分叉会话。`/clear` 或 `/new` 保存旧会话及其 Store，并切换到新的独立 session 地址空间，不删除旧 Store。若 Provider 或工具报错，Zex 仍会保存当前消息历史，再返回错误；无效斜杠命令只在当前界面显示错误，不写入模型上下文。
+
+### Addressable Recall Compaction
+
+默认 `memory.mode = "hybrid"`。每个普通工具结果先以稳定 ID 写入 session Store，再决定进入模型 Active View 的形式：
+
+```text
+[file snapshot] read → §obs_8f2c… (~6.2k tokens, path=src/main.rs; recall available)
+```
+
+- 大结果只进入 citation；小结果保留当前可见文本并附带 addressable copy。
+- `/compact` 和 auto-compact 在删除旧轮次前，把用户/assistant 原消息写为 `§turn_...`，把工具观察保留为 `§obs_...`，再生成有界 structured summary 和 pointer manifest。
+- `recall({"id":"§obs_...","reason":"该诊断直接决定修复"})` 精确取回未超上限的原文；大内容返回受控片段，全文仍保留在同一 ID。
+- `pin` / `unpin` 调整 compact 和 pointer manifest 的优先级；`list_pointers` 无 filter 时列出 active/pinned ID，有 filter 时按路径、工具、角色和预览搜索当前 session Store。
+- 不存在或格式错误的 ID 会返回明确错误；recall 默认每个模型工具轮最多 3 次、每分钟最多 5 次。创建、recall、失败、限流和 pin 操作都记录在 Store JSONL。
+
+需要完全回退时设置：
+
+```toml
+[memory]
+enabled = false
+```
 
 ## 内置工具
 
-工具通过统一的 `Tool` trait 注册，Agent loop 不包含工具名称分支。六个工具全部编译进 Zex，不调用 `rg`、`fd` 或其他可选外部二进制。每个 schema 都接受可选正整数 `timeout_seconds`；未指定时使用 `tool_timeout_seconds`。Registry 对所有成功输出统一执行 `max_tool_output_chars` 截断，并给参数、超时、I/O 和执行错误补充工具名上下文。
+工具通过统一的 `Tool` trait 注册，Agent loop 不包含普通本地工具名称分支。六个文件/系统工具与启用 ARC 时的四个 memory 工具全部编译进 Zex，不调用 `rg`、`fd` 或其他可选外部二进制。每个 schema 都接受可选正整数 `timeout_seconds`；未指定时使用 `tool_timeout_seconds`。普通工具成功输出先写 Store，再统一执行 `max_tool_output_chars` 截断；Registry 同时给参数、超时、I/O 和执行错误补充工具名上下文。
 
 - `read`：读取 UTF-8 文件；相对路径基于启动 Zex 时的工作目录。长内容会截断。
 - `write`：创建或完整覆盖 UTF-8 文件，并自动创建父目录。写入前捕获旧内容，供 TUI/headless 展示真实 diff（覆盖可见被删行）；变更记录不进入模型上下文。
@@ -293,6 +334,9 @@ zex resume -p "继续上一轮工作并给出结论"
 - `grep`：使用 Rust `regex` + `ignore` 递归搜索 UTF-8 文件内容，返回 `path:line:content`。主要 schema：`pattern`、`path`、`case_sensitive`、`file_glob`、`hidden`、`max_results`。默认尊重 `.gitignore`、全局 gitignore 和 `.git/info/exclude`；二进制或非 UTF-8 文件跳过。
 - `glob`：使用 Rust `globset` + `ignore` 按路径 glob 查找文件或目录。主要 schema：`pattern`、`path`、`hidden`、`max_results`。无 `/` 的模式在任意深度匹配，目录结果带 `/`；默认尊重 Git ignore。
 - `bash`：仅用于其他系统命令。在启动工作目录中通过系统 shell 执行；Windows 使用 `cmd /D /S /C`，其他平台使用 `sh -c`。stdout/stderr 合并为结构化文本后执行统一截断。
+- `recall`：按精确 ID 取回原始内容；超大内容返回受 token 上限控制的片段，不存在或格式错误的 ID 明确报错。
+- `pin` / `unpin`：设置或移除已有 ID 的高优先级状态，不删除记录。
+- `list_pointers`：列出 active/pinned citation；指定 `filter` 时搜索当前 session 的 Store 元数据。
 
 工具描述明确约定：搜文件内容用 `grep`；找文件或目录用 `glob`；其他系统命令才用 `bash`。
 
@@ -306,8 +350,8 @@ Compact 是 core 的确定性规则，不调用外部总结模型。已用 token
 
 1. system prompt 始终完整保留。
 2. 最近 `compact_keep_turns` 个用户轮次及其 assistant/tool 消息完整保留。
-3. 更早轮次压成一条 system 摘要：首条用户消息作为 Original request 原文锚点保留；其余用户和 assistant 文本保留首尾关键片段；旧 tool 输出优先压成工具名、首尾各 180 字符、原省略长度。
-4. 上下文达到预算的 85% 时，先把较旧的超长 tool 输出替换为占位符（保留最近 4 条原文）；仍超阈值再走全量 compact。`/compact` 可随时手动触发；若保留配置轮数后仍超过预算，会逐步减少完整保留轮次，但至少保留最近 1 轮。
+3. `pointer_priority` / `hybrid` 下，更早轮次在移除前写入 Store；摘要保留 Original request、关键流程和 `§turn_...` / `§obs_...` citation，工具结果不再退化成不可恢复的首尾片段。`summary` 模式保持传统规则摘要。
+4. 上下文达到预算的 85% 时，ARC 模式先把较旧的超长 tool 输出替换为已存在 ID 的 citation（保留最近 4 条）；关闭 ARC 或使用传统 summary 时才使用原占位清理。仍超阈值再走全量 compact。`/compact` 可随时手动触发；若保留配置轮数后仍超过预算，会逐步减少完整保留轮次，但至少保留最近 1 轮。
 5. TUI/REPL 反馈约释放 token 数、compact 前后占用、保留完整轮次、摘要旧轮次和清理的 tool 输出数量。Compact 后的消息直接用于后续 Provider 请求和会话持久化。
 
 OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两种协议都优先请求流式响应，并兼容网关忽略 `stream` 后返回普通 JSON。Responses 模式使用扁平 function tool 定义、`function_call`/`function_call_output` 输入项，并保留 Provider 输出项以支持推理模型的连续工具调用。

@@ -55,6 +55,14 @@ impl SessionStore {
         Self { directory }
     }
 
+    pub fn allocate_id(&self) -> Result<String> {
+        new_session_id(OffsetDateTime::now_utc())
+    }
+
+    pub fn memory_directory(&self, id: &str) -> Result<PathBuf> {
+        Ok(self.directory.join(validate_session_id(id)?).join("memory"))
+    }
+
     pub async fn save(
         &self,
         session_id: Option<&str>,

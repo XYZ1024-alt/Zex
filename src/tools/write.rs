@@ -68,6 +68,7 @@ impl Tool for WriteTool {
                         path.display()
                     ),
                     change: FileChange::capture(path.clone(), before, arguments.content),
+                    memory: None,
                 })
             })
             .await

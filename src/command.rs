@@ -195,7 +195,15 @@ where
                 None
             };
             agent.clear();
-            *session_id = None;
+            if agent.memory_enabled() {
+                let next_id = session_store.allocate_id()?;
+                agent
+                    .activate_memory(&next_id, session_store.memory_directory(&next_id)?)
+                    .await?;
+                *session_id = Some(next_id);
+            } else {
+                *session_id = None;
+            }
             Ok(CommandResult {
                 output: CommandOutput::Status(match saved_id {
                     Some(id) => format!("New session started. Saved previous session {id}."),
@@ -228,7 +236,10 @@ where
             if let Some(thinking_level) = loaded.thinking_level {
                 agent.set_thinking_level(thinking_level);
             }
-            agent.replace_messages(loaded.messages);
+            agent
+                .activate_memory(&resumed_id, session_store.memory_directory(&resumed_id)?)
+                .await?;
+            agent.replace_messages(loaded.messages).await?;
             *session_id = Some(resumed_id.clone());
             Ok(CommandResult {
                 output: CommandOutput::Status(format!(
@@ -244,7 +255,7 @@ where
             })
         }
         SlashCommand::Compact => {
-            let stats = agent.compact();
+            let stats = agent.compact().await?;
             Ok(CommandResult {
                 output: CommandOutput::Status(compact_feedback(&stats)),
                 effect: CommandEffect::ReplaceView,
@@ -301,8 +312,8 @@ where
 mod execution_tests {
     use std::{
         collections::VecDeque,
-        sync::Mutex,
         sync::atomic::{AtomicU64, Ordering},
+        sync::{Arc, Mutex},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -310,7 +321,8 @@ mod execution_tests {
 
     use super::{CommandEffect, CommandOutput, SlashCommand, execute};
     use crate::{
-        agent::{Agent, AgentOptions, AssistantMessage, Message},
+        agent::{Agent, AgentOptions, AssistantMessage, Message, ToolCall},
+        memory::{MemoryConfig, MemoryRuntime},
         provider::{Provider, ThinkingLevel, ToolDefinition},
         session::SessionStore,
         tools::ToolRegistry,
@@ -447,6 +459,100 @@ mod execution_tests {
         assert_eq!(agent.thinking_preference(), ThinkingLevel::Medium);
         assert!(agent.messages().iter().any(
             |message| matches!(message, Message::User { content } if content == "saved context")
+        ));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_reopens_addressable_store_and_restores_active_pointers() {
+        let directory = temporary_directory();
+        let store = SessionStore::new(directory.clone());
+        let resumed_id = store.allocate_id().unwrap();
+        let first_runtime = MemoryRuntime::new(MemoryConfig::default());
+        first_runtime
+            .activate(&resumed_id, store.memory_directory(&resumed_id).unwrap())
+            .await
+            .unwrap();
+        let pointer = first_runtime
+            .store_tool_result(
+                "read",
+                &serde_json::json!({"path": "resume.txt"}),
+                "exact resumed observation".to_owned(),
+            )
+            .await
+            .unwrap();
+        let tool_content =
+            first_runtime.render_tool_result(&pointer, "exact resumed observation".to_owned());
+        store
+            .save(
+                Some(&resumed_id),
+                "saved-model",
+                ThinkingLevel::Medium,
+                &[
+                    Message::User {
+                        content: "saved context".to_owned(),
+                    },
+                    Message::Assistant {
+                        content: String::new(),
+                        thinking: None,
+                        tool_calls: vec![ToolCall {
+                            id: "saved-call".to_owned(),
+                            name: "read".to_owned(),
+                            arguments: r#"{"path":"resume.txt"}"#.to_owned(),
+                        }],
+                        provider_state: None,
+                    },
+                    Message::Tool {
+                        tool_call_id: "saved-call".to_owned(),
+                        content: tool_content,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let runtime = Arc::new(MemoryRuntime::new(MemoryConfig::default()));
+        let mut tools = ToolRegistry::new(Duration::from_secs(1), 32_000);
+        tools.set_memory(Arc::clone(&runtime));
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            IdleProvider {
+                responses: Mutex::new(VecDeque::new()),
+            },
+            tools,
+            events,
+            AgentOptions {
+                model: "model-a".to_owned(),
+                turn_timeout: Duration::from_secs(1),
+                max_turns: 1,
+                max_context_tokens: 120_000,
+                compact_keep_turns: 1,
+                thinking_level: ThinkingLevel::Medium,
+            },
+            None,
+        );
+        let mut session_id = None;
+
+        execute(
+            SlashCommand::Resume(Some(resumed_id.clone())),
+            &mut agent,
+            &store,
+            &mut session_id,
+            &directory,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime.active_session_id().as_deref(),
+            Some(resumed_id.as_str())
+        );
+        assert!(runtime.list_pointers(None).unwrap().contains(&pointer.id));
+        let recalled = runtime.recall(&pointer.id, None).await.unwrap();
+        assert!(recalled.ends_with("exact resumed observation"));
+        assert!(matches!(
+            agent.messages().first(),
+            Some(Message::System { content }) if content.contains(&pointer.id)
         ));
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }

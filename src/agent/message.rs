@@ -94,13 +94,46 @@ impl Message {
     }
 }
 
-fn estimate_tokens(content: &str) -> usize {
+pub(crate) fn estimate_tokens(content: &str) -> usize {
     if let Some(bpe) = tokenizer() {
         // `encode_ordinary` treats special-token-looking text as plain text,
         // so untrusted file contents can never panic the counter.
         return bpe.encode_ordinary(content).len();
     }
     heuristic_estimate(content)
+}
+
+pub(crate) fn truncate_to_token_budget(content: &str, max_tokens: usize) -> (String, bool, usize) {
+    let original_tokens = estimate_tokens(content);
+    if original_tokens <= max_tokens {
+        return (content.to_owned(), false, original_tokens);
+    }
+    if max_tokens == 0 {
+        return (String::new(), true, 0);
+    }
+    if let Some(bpe) = tokenizer() {
+        let tokens = bpe.encode_ordinary(content);
+        let mut end = max_tokens.min(tokens.len());
+        while end > 0 {
+            if let Ok(excerpt) = bpe.decode(&tokens[..end]) {
+                let returned_tokens = estimate_tokens(&excerpt);
+                return (excerpt, true, returned_tokens);
+            }
+            end -= 1;
+        }
+        return (String::new(), true, 0);
+    }
+
+    let mut excerpt = String::new();
+    for character in content.chars() {
+        excerpt.push(character);
+        if heuristic_estimate(&excerpt) > max_tokens {
+            excerpt.pop();
+            break;
+        }
+    }
+    let returned_tokens = heuristic_estimate(&excerpt);
+    (excerpt, true, returned_tokens)
 }
 
 /// Last-resort estimate when the tokenizer is unavailable: ASCII text
