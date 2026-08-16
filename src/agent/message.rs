@@ -66,10 +66,10 @@ pub enum PromptOutcome {
 }
 
 impl Message {
-    /// Token count used for context budgeting, measured with the shared
-    /// o200k_base tokenizer. Historical `thinking` and `provider_state` are
-    /// excluded because they are stripped from the wire before requests
-    /// (see `sanitize_messages`).
+    /// Lightweight per-message estimate used for memory metadata and as a
+    /// last-resort fallback when a provider cannot prepare its exact request.
+    /// Runtime budgeting uses `PreparedRequest`, which measures the sanitized
+    /// protocol payload including tools and retained reasoning state.
     pub fn token_estimate(&self) -> usize {
         match self {
             Self::System { content } | Self::User { content } | Self::Tool { content, .. } => {

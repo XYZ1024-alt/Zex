@@ -323,7 +323,7 @@ mod execution_tests {
     use crate::{
         agent::{Agent, AgentOptions, AssistantMessage, Message, ToolCall},
         memory::{MemoryConfig, MemoryRuntime},
-        provider::{Provider, ThinkingLevel, ToolDefinition},
+        provider::{PreparedRequest, Provider, ThinkingLevel, ToolDefinition},
         session::SessionStore,
         tools::ToolRegistry,
     };
@@ -333,12 +333,27 @@ mod execution_tests {
     }
 
     impl Provider for IdleProvider {
-        async fn complete(
+        type Request = Vec<Message>;
+
+        fn prepare_request(
             &self,
             _model: &str,
             _thinking_level: crate::provider::ThinkingLevel,
-            _messages: &[Message],
-            _tools: &[ToolDefinition],
+            messages: &[Message],
+            tools: &[ToolDefinition],
+            max_output_tokens: usize,
+        ) -> Result<PreparedRequest<Self::Request>> {
+            let serialized = serde_json::to_string(&(messages, tools))?;
+            Ok(PreparedRequest::new(
+                crate::agent::estimate_tokens(&serialized),
+                max_output_tokens,
+                messages.to_vec(),
+            ))
+        }
+
+        async fn complete(
+            &self,
+            _request: Self::Request,
             _events: &crate::agent::EventSender,
         ) -> Result<AssistantMessage> {
             Ok(self

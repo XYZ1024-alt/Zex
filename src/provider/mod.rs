@@ -16,7 +16,7 @@ use crate::agent::{AssistantMessage, EventSender, Message};
 use crate::config::{ModelConfig, ModelRef, ProviderCatalog};
 
 pub use models_dev::{ModelLimit, ModelsDevCatalog, ModelsDevLoad, ModelsDevProviderAlias};
-pub use openai::OpenAiProvider;
+pub use openai::{OpenAiPreparedRequest, OpenAiProvider};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -691,7 +691,46 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
+#[derive(Debug)]
+pub struct PreparedRequest<T> {
+    input_tokens: usize,
+    max_output_tokens: usize,
+    payload: T,
+}
+
+impl<T> PreparedRequest<T> {
+    pub fn new(input_tokens: usize, max_output_tokens: usize, payload: T) -> Self {
+        Self {
+            input_tokens,
+            max_output_tokens,
+            payload,
+        }
+    }
+
+    pub fn input_tokens(&self) -> usize {
+        self.input_tokens
+    }
+
+    pub fn max_output_tokens(&self) -> usize {
+        self.max_output_tokens
+    }
+
+    pub fn into_payload(self) -> T {
+        self.payload
+    }
+
+    fn map<U>(self, map: impl FnOnce(T) -> U) -> PreparedRequest<U> {
+        PreparedRequest {
+            input_tokens: self.input_tokens,
+            max_output_tokens: self.max_output_tokens,
+            payload: map(self.payload),
+        }
+    }
+}
+
 pub trait Provider: Send + Sync {
+    type Request: Send;
+
     fn thinking_capabilities(&self, _model: &str) -> ThinkingCapabilities {
         ThinkingCapabilities::default()
     }
@@ -700,12 +739,18 @@ pub trait Provider: Send + Sync {
         None
     }
 
-    async fn complete(
+    fn prepare_request(
         &self,
         model: &str,
         thinking_level: ThinkingLevel,
         messages: &[Message],
         tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>>;
+
+    async fn complete(
+        &self,
+        request: Self::Request,
         events: &EventSender,
     ) -> Result<AssistantMessage>;
 }
@@ -717,8 +762,15 @@ pub struct ProviderRegistry {
 }
 
 struct ProviderRegistryState {
-    providers: BTreeMap<String, OpenAiProvider>,
+    providers: BTreeMap<String, Arc<OpenAiProvider>>,
     models: BTreeMap<String, (ModelConfig, ThinkingCapabilities, Option<ModelLimit>)>,
+}
+
+#[derive(Debug)]
+pub struct RegistryPreparedRequest {
+    provider: Arc<OpenAiProvider>,
+    request: OpenAiPreparedRequest,
+    thinking: NormalizedThinking,
 }
 
 pub struct ProviderRegistryUpdate(ProviderRegistryState);
@@ -755,12 +807,12 @@ impl ProviderRegistry {
         for provider in &catalog.providers {
             providers.insert(
                 provider.id.clone(),
-                OpenAiProvider::new(
+                Arc::new(OpenAiProvider::new(
                     &provider.base_url,
                     provider.api_key.expose().to_owned(),
                     provider.openai_api,
                     request_timeout,
-                )?,
+                )?),
             );
             for model in &provider.models {
                 let model_ref = ModelRef {
@@ -777,6 +829,8 @@ impl ProviderRegistry {
 }
 
 impl Provider for ProviderRegistry {
+    type Request = RegistryPreparedRequest;
+
     fn thinking_capabilities(&self, model: &str) -> ThinkingCapabilities {
         self.inner
             .read()
@@ -797,14 +851,14 @@ impl Provider for ProviderRegistry {
             .and_then(|state| state.models.get(model).and_then(|(_, _, limit)| *limit))
     }
 
-    async fn complete(
+    fn prepare_request(
         &self,
         model: &str,
         thinking_level: ThinkingLevel,
         messages: &[Message],
         tools: &[ToolDefinition],
-        events: &EventSender,
-    ) -> Result<AssistantMessage> {
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
         if model.is_empty() {
             anyhow::bail!("no active model configured; use /provider, then /model");
         }
@@ -828,16 +882,39 @@ impl Provider for ProviderRegistry {
             };
         let (_, capabilities, _) = configured;
         let normalized = normalize_thinking_level(&capabilities, thinking_level);
-        let _ = events.send(crate::agent::AgentEvent::ThinkingNormalized {
-            requested: normalized.requested,
-            clamped: normalized.clamped,
-            effective: normalized.effective,
-            provider_value: normalized.provider_value.clone(),
-        });
         let request_messages =
             sanitize_messages(messages, capabilities.supports_interleaved_thinking);
         provider
-            .complete_normalized(model_id, &normalized, &request_messages, tools, events)
+            .prepare_normalized(
+                model_id,
+                &normalized,
+                &request_messages,
+                tools,
+                max_output_tokens,
+            )
+            .map(|prepared| {
+                prepared.map(|request| RegistryPreparedRequest {
+                    provider,
+                    request,
+                    thinking: normalized,
+                })
+            })
+    }
+
+    async fn complete(
+        &self,
+        request: Self::Request,
+        events: &EventSender,
+    ) -> Result<AssistantMessage> {
+        let _ = events.send(crate::agent::AgentEvent::ThinkingNormalized {
+            requested: request.thinking.requested,
+            clamped: request.thinking.clamped,
+            effective: request.thinking.effective,
+            provider_value: request.thinking.provider_value.clone(),
+        });
+        request
+            .provider
+            .complete_prepared(request.request, events)
             .await
     }
 }

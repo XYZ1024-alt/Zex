@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use tokio::sync::mpsc;
 
@@ -358,14 +358,83 @@ fn serializes_reasoning_state_for_chat_tool_continuation() {
         &thinking,
         &messages,
         &[],
+        4_096,
     ))
     .unwrap();
     let assistant = &request["messages"][0];
 
+    assert_eq!(request["max_completion_tokens"], 4_096);
     assert_eq!(assistant["reasoning_content"], "Call the reader.");
     assert_eq!(assistant["reasoning_details"][0]["summary"], "Call reader");
     assert_eq!(assistant["thinking_blocks"][0]["signature"], "signed");
     assert_eq!(assistant["tool_calls"][0]["id"], "call_read");
+}
+
+#[test]
+fn prepared_request_counts_the_serialized_wire_payload() {
+    let provider = super::OpenAiProvider::new(
+        "https://example.com/v1",
+        "secret".to_owned(),
+        OpenAiApi::Responses,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let messages = vec![Message::Assistant {
+        content: String::new(),
+        thinking: Some("Inspect the repository.".to_owned()),
+        tool_calls: vec![ToolCall {
+            id: "call_read".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+        }],
+        provider_state: Some(serde_json::json!([
+            {
+                "type": "reasoning",
+                "id": "reasoning_1",
+                "encrypted_content": "opaque-reasoning-state",
+                "summary": [{"type": "summary_text", "text": "Inspect the repository."}]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_read",
+                "name": "read",
+                "arguments": "{\"path\":\"Cargo.toml\"}"
+            }
+        ])),
+    }];
+    let tools = vec![ToolDefinition {
+        name: "read".to_owned(),
+        description: "Read a UTF-8 file".to_owned(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }),
+    }];
+    let thinking = crate::provider::NormalizedThinking {
+        requested: ThinkingLevel::High,
+        clamped: ThinkingLevel::High,
+        effective: ThinkingLevel::High,
+        provider_value: Some("high".to_owned()),
+    };
+
+    let prepared = provider
+        .prepare_normalized("gpt-5", &thinking, &messages, &tools, 4_096)
+        .unwrap();
+    assert_eq!(prepared.max_output_tokens(), 4_096);
+    let input_tokens = prepared.input_tokens();
+    let request = prepared.into_payload();
+    let serialized = std::str::from_utf8(&request.body).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+
+    assert_eq!(input_tokens, crate::agent::estimate_tokens(serialized));
+    assert_eq!(body["max_output_tokens"], 4_096);
+    assert_eq!(body["input"][0]["type"], "reasoning");
+    assert_eq!(
+        body["input"][0]["encrypted_content"],
+        "opaque-reasoning-state"
+    );
+    assert_eq!(body["tools"][0]["name"], "read");
 }
 
 #[test]
@@ -431,10 +500,12 @@ fn serializes_responses_input_and_flat_tools() {
         &thinking,
         &messages,
         &tools,
+        2_048,
     ))
     .unwrap();
     assert_eq!(request["stream"], true);
     assert_eq!(request["store"], false);
+    assert_eq!(request["max_output_tokens"], 2_048);
     assert_eq!(request["tools"][0]["type"], "function");
     assert_eq!(request["tools"][0]["name"], "read");
     assert!(request["tools"][0].get("function").is_none());
@@ -456,8 +527,9 @@ fn serializes_supported_thinking_levels() {
         provider_value: Some("high".to_owned()),
     };
     let responses =
-        serde_json::to_value(ResponsesRequest::new("gpt-5", &high, &messages, &[])).unwrap();
+        serde_json::to_value(ResponsesRequest::new("gpt-5", &high, &messages, &[], 4_096)).unwrap();
     assert_eq!(responses["reasoning"]["effort"], "high");
+    assert_eq!(responses["max_output_tokens"], 4_096);
 
     let low = crate::provider::NormalizedThinking {
         requested: ThinkingLevel::Low,
@@ -465,10 +537,17 @@ fn serializes_supported_thinking_levels() {
         effective: ThinkingLevel::Low,
         provider_value: Some("low".to_owned()),
     };
-    let chat =
-        serde_json::to_value(super::ChatRequest::new("gpt-5", &low, &messages, &[])).unwrap();
+    let chat = serde_json::to_value(super::ChatRequest::new(
+        "gpt-5",
+        &low,
+        &messages,
+        &[],
+        4_096,
+    ))
+    .unwrap();
     assert_eq!(chat["reasoning_effort"], "low");
     assert_eq!(chat["stream_options"]["include_usage"], true);
+    assert_eq!(chat["max_completion_tokens"], 4_096);
 }
 
 #[test]

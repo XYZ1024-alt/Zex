@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -11,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::{
     agent::{AgentEvent, AssistantMessage, MessageRole, ToolCall},
     memory::{MemoryConfig, MemoryRuntime, extract_memory_ids},
-    provider::{Provider, ToolDefinition},
+    provider::{PreparedRequest, Provider, ToolDefinition},
     tools::{Tool, ToolFuture, ToolRegistry},
 };
 
@@ -22,19 +25,42 @@ struct SequenceProvider {
     requests: Arc<Mutex<Vec<Vec<crate::agent::Message>>>>,
 }
 
+fn prepare_messages(
+    messages: &[crate::agent::Message],
+    tools: &[ToolDefinition],
+    max_output_tokens: usize,
+) -> Result<PreparedRequest<Vec<crate::agent::Message>>> {
+    let serialized = serde_json::to_string(&(messages, tools))?;
+    Ok(PreparedRequest::new(
+        crate::agent::estimate_tokens(&serialized),
+        max_output_tokens,
+        messages.to_vec(),
+    ))
+}
+
 impl Provider for SequenceProvider {
-    async fn complete(
+    type Request = Vec<crate::agent::Message>;
+
+    fn prepare_request(
         &self,
         _model: &str,
         _thinking_level: crate::provider::ThinkingLevel,
         messages: &[crate::agent::Message],
-        _tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        prepare_messages(messages, tools, max_output_tokens)
+    }
+
+    async fn complete(
+        &self,
+        messages: Self::Request,
         events: &crate::agent::EventSender,
     ) -> Result<AssistantMessage> {
         self.requests
             .lock()
             .expect("sequence provider requests mutex poisoned")
-            .push(messages.to_vec());
+            .push(messages);
         let message = self
             .messages
             .lock()
@@ -59,12 +85,22 @@ impl Provider for SequenceProvider {
 struct FailingProvider;
 
 impl Provider for FailingProvider {
-    async fn complete(
+    type Request = Vec<crate::agent::Message>;
+
+    fn prepare_request(
         &self,
         _model: &str,
         _thinking_level: crate::provider::ThinkingLevel,
-        _messages: &[crate::agent::Message],
-        _tools: &[ToolDefinition],
+        messages: &[crate::agent::Message],
+        tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        prepare_messages(messages, tools, max_output_tokens)
+    }
+
+    async fn complete(
+        &self,
+        _request: Self::Request,
         _events: &crate::agent::EventSender,
     ) -> Result<AssistantMessage> {
         bail!("provider unavailable")
@@ -74,12 +110,22 @@ impl Provider for FailingProvider {
 struct PendingProvider;
 
 impl Provider for PendingProvider {
-    async fn complete(
+    type Request = Vec<crate::agent::Message>;
+
+    fn prepare_request(
         &self,
         _model: &str,
         _thinking_level: crate::provider::ThinkingLevel,
-        _messages: &[crate::agent::Message],
-        _tools: &[ToolDefinition],
+        messages: &[crate::agent::Message],
+        tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        prepare_messages(messages, tools, max_output_tokens)
+    }
+
+    async fn complete(
+        &self,
+        _request: Self::Request,
         _events: &crate::agent::EventSender,
     ) -> Result<AssistantMessage> {
         std::future::pending().await
@@ -636,7 +682,7 @@ async fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
             model: "test-model".to_owned(),
             turn_timeout: Duration::from_secs(1),
             max_turns: 1,
-            max_context_tokens: 1_000,
+            max_context_tokens: 2_000,
             compact_keep_turns: 1,
             thinking_level: crate::provider::ThinkingLevel::Medium,
         },
@@ -656,17 +702,14 @@ async fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
         ]),
     );
 
-    let stats = agent
-        .compact_if_needed()
-        .await
-        .unwrap()
-        .expect("context should compact");
+    let definitions = agent.tools.definitions();
+    let _request = agent.prepare_with_compaction(&definitions).await.unwrap();
+    let stats = match receiver.try_recv().unwrap() {
+        AgentEvent::ContextCompacted { stats } => stats,
+        event => panic!("expected context compaction event, got {event:?}"),
+    };
 
     assert!(stats.freed_tokens > 0);
-    assert!(matches!(
-        receiver.try_recv().unwrap(),
-        AgentEvent::ContextCompacted { stats: emitted } if emitted == stats
-    ));
 }
 
 #[tokio::test]
@@ -760,6 +803,8 @@ async fn tool_end_event_carries_the_file_change_for_mutations() {
 struct LimitedProvider;
 
 impl Provider for LimitedProvider {
+    type Request = Vec<crate::agent::Message>;
+
     fn context_limit(&self, _model: &str) -> Option<crate::provider::ModelLimit> {
         Some(crate::provider::ModelLimit {
             context: 100_000,
@@ -767,20 +812,89 @@ impl Provider for LimitedProvider {
         })
     }
 
-    async fn complete(
+    fn prepare_request(
         &self,
         _model: &str,
         _thinking_level: crate::provider::ThinkingLevel,
-        _messages: &[crate::agent::Message],
-        _tools: &[ToolDefinition],
+        messages: &[crate::agent::Message],
+        tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        prepare_messages(messages, tools, max_output_tokens)
+    }
+
+    async fn complete(
+        &self,
+        _request: Self::Request,
         _events: &crate::agent::EventSender,
     ) -> Result<AssistantMessage> {
         bail!("not used")
     }
 }
 
+struct ModelSizedProvider;
+
+impl Provider for ModelSizedProvider {
+    type Request = ();
+
+    fn prepare_request(
+        &self,
+        model: &str,
+        _thinking_level: crate::provider::ThinkingLevel,
+        _messages: &[crate::agent::Message],
+        _tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        let input_tokens = if model == "small" { 100 } else { 200 };
+        Ok(PreparedRequest::new(input_tokens, max_output_tokens, ()))
+    }
+
+    async fn complete(
+        &self,
+        _request: Self::Request,
+        _events: &crate::agent::EventSender,
+    ) -> Result<AssistantMessage> {
+        bail!("not used")
+    }
+}
+
+struct OversizedProvider {
+    completed: Arc<AtomicBool>,
+}
+
+impl Provider for OversizedProvider {
+    type Request = ();
+
+    fn context_limit(&self, _model: &str) -> Option<crate::provider::ModelLimit> {
+        Some(crate::provider::ModelLimit {
+            context: 100,
+            output: Some(20),
+        })
+    }
+
+    fn prepare_request(
+        &self,
+        _model: &str,
+        _thinking_level: crate::provider::ThinkingLevel,
+        _messages: &[crate::agent::Message],
+        _tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        Ok(PreparedRequest::new(90, max_output_tokens, ()))
+    }
+
+    async fn complete(
+        &self,
+        _request: Self::Request,
+        _events: &crate::agent::EventSender,
+    ) -> Result<AssistantMessage> {
+        self.completed.store(true, Ordering::Relaxed);
+        bail!("oversized request reached provider")
+    }
+}
+
 #[test]
-fn token_estimate_uses_bpe_and_skips_thinking() {
+fn fallback_message_estimate_uses_bpe_and_skips_reasoning_state() {
     // o200k_base merges common ASCII runs into single tokens.
     let ascii = crate::agent::Message::User {
         content: "abcdefgh".repeat(8),
@@ -828,6 +942,9 @@ fn context_budget_uses_model_limit_minus_output_reserve() {
     );
 
     assert_eq!(agent.context_budget(), 96_000);
+    let definitions = agent.tools.definitions();
+    let request = agent.prepare_request(&definitions).unwrap();
+    assert_eq!(request.max_output_tokens(), 4_000);
 }
 
 #[test]
@@ -851,9 +968,65 @@ fn context_budget_falls_back_when_no_model_limit_is_known() {
     assert_eq!(agent.context_budget(), 42_000);
 }
 
+#[test]
+fn context_tokens_follow_the_active_model_preparation() {
+    let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        ModelSizedProvider,
+        ToolRegistry::new(Duration::from_secs(1), 32_000),
+        events,
+        AgentOptions {
+            model: "small".to_owned(),
+            turn_timeout: Duration::from_secs(1),
+            max_turns: 1,
+            max_context_tokens: 42_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+
+    assert_eq!(agent.context_tokens(), 100);
+    agent.set_model("large".to_owned());
+    assert_eq!(agent.context_tokens(), 200);
+}
+
+#[tokio::test]
+async fn oversized_prepared_request_is_rejected_before_provider_execution() {
+    let completed = Arc::new(AtomicBool::new(false));
+    let provider = OversizedProvider {
+        completed: Arc::clone(&completed),
+    };
+    let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(Duration::from_secs(1), 32_000),
+        events,
+        AgentOptions {
+            model: "limited".to_owned(),
+            turn_timeout: Duration::from_secs(1),
+            max_turns: 1,
+            max_context_tokens: 42_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+
+    let error = agent.prompt("too large").await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("exceeding the 80 token input budget")
+    );
+    assert!(error.to_string().contains("20 output tokens reserved"));
+    assert!(!completed.load(Ordering::Relaxed));
+}
+
 #[tokio::test]
 async fn prune_clears_old_tool_outputs_before_full_compaction() {
-    let (events, _) = mpsc::unbounded_channel();
+    let (events, mut receiver) = mpsc::unbounded_channel();
     let mut messages = vec![crate::agent::Message::User {
         content: "task".to_owned(),
     }];
@@ -893,11 +1066,12 @@ async fn prune_clears_old_tool_outputs_before_full_compaction() {
         Some(messages),
     );
 
-    let stats = agent
-        .compact_if_needed()
-        .await
-        .unwrap()
-        .expect("context should cross the threshold");
+    let definitions = agent.tools.definitions();
+    let _request = agent.prepare_with_compaction(&definitions).await.unwrap();
+    let stats = match receiver.try_recv().unwrap() {
+        AgentEvent::ContextCompacted { stats } => stats,
+        event => panic!("expected context compaction event, got {event:?}"),
+    };
 
     assert_eq!(stats.pruned_tool_outputs, 2);
     assert_eq!(stats.summarized_turns, 0, "pruning alone was enough");
@@ -921,7 +1095,7 @@ async fn prune_clears_old_tool_outputs_before_full_compaction() {
 }
 
 #[tokio::test]
-async fn server_usage_calibrates_context_and_compaction_resets_it() {
+async fn prepared_request_measurement_recomputes_after_each_history_change() {
     let provider = SequenceProvider {
         messages: Mutex::new(VecDeque::from([AssistantMessage {
             content: "ok".to_owned(),
@@ -964,30 +1138,19 @@ async fn server_usage_calibrates_context_and_compaction_resets_it() {
         ]),
     );
 
-    let local_sum = |agent: &Agent<SequenceProvider>| {
-        agent
-            .messages()
-            .iter()
-            .map(crate::agent::Message::token_estimate)
-            .sum::<usize>()
+    let prepared_tokens = |agent: &Agent<SequenceProvider>| {
+        let definitions = agent.tools.definitions();
+        prepare_messages(agent.messages(), &definitions, 8_192)
+            .unwrap()
+            .input_tokens()
     };
-    assert_eq!(agent.context_tokens(), local_sum(&agent));
+    assert_eq!(agent.context_tokens(), prepared_tokens(&agent));
 
     agent.prompt("hello").await.unwrap();
 
-    // After a completion, context = server-reported input tokens + local
-    // estimate of the messages appended since (the assistant reply).
-    let assistant_tail = crate::agent::Message::Assistant {
-        content: "ok".to_owned(),
-        thinking: None,
-        tool_calls: Vec::new(),
-        provider_state: None,
-    }
-    .token_estimate();
-    assert_eq!(agent.context_tokens(), 5_000 + assistant_tail);
+    assert_eq!(agent.context_tokens(), prepared_tokens(&agent));
+    assert_ne!(agent.context_tokens(), 5_000);
 
-    // Compaction rewrites the history, so the server baseline is dropped and
-    // the estimate becomes fully local again.
     agent.compact().await.unwrap();
-    assert_eq!(agent.context_tokens(), local_sum(&agent));
+    assert_eq!(agent.context_tokens(), prepared_tokens(&agent));
 }

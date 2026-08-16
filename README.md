@@ -353,15 +353,15 @@ enabled = false
 
 ### 上下文 compact
 
-Compact 是 core 的确定性规则，不调用外部总结模型。已用 tokens ≈ 最近一次 API 返回的 usage（chat 的 `prompt_tokens` / responses 的 `input_tokens`，含 system prompt 与工具定义等开销）+ 之后新增消息用内置 tiktoken o200k_base 的本地估算；会话开始或 compact 后没有基线时退化为全量本地估算，tokenizer 不可用时再回退字符启发式。历史 thinking 不计入本地估算；预算取模型 context window（models.dev `limit.context` 或模型配置的 `context_window` 覆盖）扣除输出预留，未知时用 `max_context_tokens` 兜底：
+Compact 是 core 的确定性规则，不调用外部总结模型。每次 Provider 调用前先生成一次 `PreparedRequest`：按当前模型能力移除不会回传的历史 reasoning，构造 Chat Completions 或 Responses 的实际 JSON 请求，加入完整工具定义和需要连续传递的 interleaved reasoning/provider state，再使用内置 tiktoken o200k_base 估算整个 wire payload。计量后的同一份序列化请求直接发送，不再依赖可能属于旧模型或旧 system manifest 的 usage baseline。预算取模型 context window（models.dev `limit.context` 或模型配置的 `context_window` 覆盖）扣除输出预留，未知时用 `max_context_tokens` 作为输入预算兜底：
 
 1. system prompt 始终完整保留。
 2. 最近 `compact_keep_turns` 个用户轮次及其 assistant/tool 消息完整保留。
 3. `pointer_priority` / `hybrid` 下，更早轮次在移除前写入 Store；摘要保留 Original request、关键流程和 `§turn_...` / `§obs_...` citation，工具结果不再退化成不可恢复的首尾片段。`summary` 模式保持传统规则摘要。
-4. 上下文达到预算的 85% 时，ARC 模式先把较旧的超长 tool 输出替换为已存在 ID 的 citation（保留最近 4 条）；关闭 ARC 或使用传统 summary 时才使用原占位清理。仍超阈值再走全量 compact。`/compact` 可随时手动触发；若保留配置轮数后仍超过预算，会逐步减少完整保留轮次，但至少保留最近 1 轮。
+4. 上下文达到预算的 85% 时，ARC 模式先把较旧的超长 tool 输出替换为已存在 ID 的 citation（保留最近 4 条）；关闭 ARC 或使用传统 summary 时才使用原占位清理。仍超阈值再走全量 compact。`/compact` 可随时手动触发；若保留配置轮数后仍超过预算，会逐步减少完整保留轮次，但至少保留最近 1 轮。Compact 后请求仍超过输入预算时，会在调用 Provider 前返回明确错误。
 5. TUI/REPL 反馈约释放 token 数、compact 前后占用、保留完整轮次、摘要旧轮次和清理的 tool 输出数量。Compact 后的消息直接用于后续 Provider 请求和会话持久化。
 
-OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两种协议都优先请求流式响应，并兼容网关忽略 `stream` 后返回普通 JSON。Responses 模式使用扁平 function tool 定义、`function_call`/`function_call_output` 输入项，并保留 Provider 输出项以支持推理模型的连续工具调用。
+OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两种协议都优先请求流式响应，并兼容网关忽略 `stream` 后返回普通 JSON。Chat Completions 的 `max_completion_tokens` 和 Responses 的 `max_output_tokens` 与上下文预算预留使用同一数值，保证预算和实际输出上限一致。Responses 模式使用扁平 function tool 定义、`function_call`/`function_call_output` 输入项，并保留 Provider 输出项以支持推理模型的连续工具调用。
 
 ## 事件设计与模块划分
 

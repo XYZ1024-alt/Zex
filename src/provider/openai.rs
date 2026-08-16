@@ -11,8 +11,11 @@ use serde_json::Value;
 use crate::{
     agent::{
         AgentEvent, AssistantMessage, CompletionUsage, EventSender, Message, MessageRole, ToolCall,
+        estimate_tokens,
     },
-    provider::{NormalizedThinking, OpenAiApi, Provider, ThinkingLevel, ToolDefinition},
+    provider::{
+        NormalizedThinking, OpenAiApi, PreparedRequest, Provider, ThinkingLevel, ToolDefinition,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -21,6 +24,11 @@ pub struct OpenAiProvider {
     api_key: String,
     endpoint: String,
     api: OpenAiApi,
+}
+
+#[derive(Debug)]
+pub struct OpenAiPreparedRequest {
+    body: Vec<u8>,
 }
 
 impl OpenAiProvider {
@@ -44,25 +52,50 @@ impl OpenAiProvider {
         })
     }
 
-    async fn send_request(
+    pub(crate) fn prepare_normalized(
         &self,
         model: &str,
         thinking: &NormalizedThinking,
         messages: &[Message],
         tools: &[ToolDefinition],
-    ) -> Result<reqwest::Response> {
-        let request = self.client.post(&self.endpoint).bearer_auth(&self.api_key);
-        let response = match self.api {
-            OpenAiApi::ChatCompletions => {
-                request.json(&ChatRequest::new(model, thinking, messages, tools))
-            }
-            OpenAiApi::Responses => {
-                request.json(&ResponsesRequest::new(model, thinking, messages, tools))
-            }
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<OpenAiPreparedRequest>> {
+        let body = match self.api {
+            OpenAiApi::ChatCompletions => serde_json::to_vec(&ChatRequest::new(
+                model,
+                thinking,
+                messages,
+                tools,
+                max_output_tokens,
+            )),
+            OpenAiApi::Responses => serde_json::to_vec(&ResponsesRequest::new(
+                model,
+                thinking,
+                messages,
+                tools,
+                max_output_tokens,
+            )),
         }
-        .send()
-        .await
-        .with_context(|| format!("failed to call {}", self.endpoint))?;
+        .context("failed to serialize the prepared provider request")?;
+        let serialized = std::str::from_utf8(&body)
+            .context("prepared provider request was not valid UTF-8 JSON")?;
+        Ok(PreparedRequest::new(
+            estimate_tokens(serialized),
+            max_output_tokens,
+            OpenAiPreparedRequest { body },
+        ))
+    }
+
+    async fn send_request(&self, request: OpenAiPreparedRequest) -> Result<reqwest::Response> {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .bearer_auth(&self.api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(request.body)
+            .send()
+            .await
+            .with_context(|| format!("failed to call {}", self.endpoint))?;
 
         if response.status().is_success() {
             return Ok(response);
@@ -76,16 +109,13 @@ impl OpenAiProvider {
         bail!("OpenAI-compatible provider returned {status}: {body}");
     }
 
-    pub(crate) async fn complete_normalized(
+    pub(crate) async fn complete_prepared(
         &self,
-        model: &str,
-        thinking: &NormalizedThinking,
-        messages: &[Message],
-        tools: &[ToolDefinition],
+        request: OpenAiPreparedRequest,
         events: &EventSender,
     ) -> Result<AssistantMessage> {
         let started = Instant::now();
-        let response = self.send_request(model, thinking, messages, tools).await?;
+        let response = self.send_request(request).await?;
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -170,18 +200,31 @@ fn parse_models_response(body: &[u8]) -> Result<Vec<String>> {
 }
 
 impl Provider for OpenAiProvider {
-    async fn complete(
+    type Request = OpenAiPreparedRequest;
+
+    fn prepare_request(
         &self,
         model: &str,
         thinking_level: ThinkingLevel,
         messages: &[Message],
         tools: &[ToolDefinition],
-        events: &EventSender,
-    ) -> Result<AssistantMessage> {
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
         let capabilities = self.thinking_capabilities(model);
         let thinking = crate::provider::normalize_thinking_level(&capabilities, thinking_level);
-        self.complete_normalized(model, &thinking, messages, tools, events)
-            .await
+        let messages = crate::provider::sanitize_messages(
+            messages,
+            capabilities.supports_interleaved_thinking,
+        );
+        self.prepare_normalized(model, &thinking, &messages, tools, max_output_tokens)
+    }
+
+    async fn complete(
+        &self,
+        request: Self::Request,
+        events: &EventSender,
+    ) -> Result<AssistantMessage> {
+        self.complete_prepared(request, events).await
     }
 }
 
@@ -191,6 +234,7 @@ struct ChatRequest<'a> {
     messages: Vec<WireMessage<'a>>,
     stream: bool,
     stream_options: ChatStreamOptions,
+    max_completion_tokens: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -205,6 +249,7 @@ impl<'a> ChatRequest<'a> {
         thinking: &'a NormalizedThinking,
         messages: &'a [Message],
         tools: &'a [ToolDefinition],
+        max_output_tokens: usize,
     ) -> Self {
         Self {
             model,
@@ -213,6 +258,7 @@ impl<'a> ChatRequest<'a> {
             stream_options: ChatStreamOptions {
                 include_usage: true,
             },
+            max_completion_tokens: max_output_tokens,
             reasoning_effort: thinking.provider_value.as_deref(),
             tools: tools.iter().map(WireTool::from).collect(),
             tool_choice: (!tools.is_empty()).then_some("auto"),
@@ -344,6 +390,7 @@ struct ResponsesRequest<'a> {
     input: Vec<ResponsesInputItem<'a>>,
     stream: bool,
     store: bool,
+    max_output_tokens: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ResponsesReasoning<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -358,6 +405,7 @@ impl<'a> ResponsesRequest<'a> {
         thinking: &'a NormalizedThinking,
         messages: &'a [Message],
         tools: &'a [ToolDefinition],
+        max_output_tokens: usize,
     ) -> Self {
         Self {
             model,
@@ -367,6 +415,7 @@ impl<'a> ResponsesRequest<'a> {
                 .collect(),
             stream: true,
             store: false,
+            max_output_tokens,
             reasoning: thinking
                 .provider_value
                 .as_deref()

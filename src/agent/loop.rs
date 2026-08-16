@@ -10,9 +10,12 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::{
-    agent::{AgentEvent, AssistantMessage, EventSender, Message, MessageRole, PromptOutcome},
+    agent::{
+        AgentEvent, AssistantMessage, EventSender, Message, MessageRole, PromptOutcome,
+        estimate_tokens,
+    },
     memory::{MemoryKind, MemoryMode, MemoryPointer, MemoryRuntime, extract_memory_ids},
-    provider::{Provider, ThinkingLevel},
+    provider::{PreparedRequest, Provider, ThinkingLevel, ToolDefinition},
     tools::ToolRegistry,
 };
 
@@ -48,15 +51,6 @@ pub struct Agent<P> {
     compact_keep_turns: usize,
     thinking_level: ThinkingLevel,
     memory: Option<Arc<MemoryRuntime>>,
-    /// Server-reported input tokens for the message prefix sent with the last
-    /// completion; messages appended afterwards are estimated locally.
-    usage_baseline: Option<UsageBaseline>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct UsageBaseline {
-    message_len: usize,
-    input_tokens: usize,
 }
 
 pub struct AgentOptions {
@@ -77,6 +71,13 @@ pub struct CompactStats {
     pub summarized_turns: usize,
     pub summarized_tool_outputs: usize,
     pub pruned_tool_outputs: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompactionResult {
+    kept_turns: usize,
+    summarized_turns: usize,
+    summarized_tool_outputs: usize,
 }
 
 impl<P> Agent<P>
@@ -103,7 +104,6 @@ where
             compact_keep_turns: options.compact_keep_turns,
             thinking_level: options.thinking_level,
             memory,
-            usage_baseline: None,
         };
         agent.sync_memory_context();
         agent
@@ -145,18 +145,43 @@ where
     /// window minus an output reserve, falling back to the configured
     /// `max_context_tokens` when no limit is known.
     pub fn context_budget(&self) -> usize {
+        self.request_budgets().0
+    }
+
+    fn request_budgets(&self) -> (usize, usize) {
         self.provider
             .context_limit(&self.model)
             .and_then(|limit| {
-                let reserve = limit
+                let output_tokens = limit
                     .output
                     .unwrap_or(OUTPUT_RESERVE_TOKENS)
                     .min(OUTPUT_RESERVE_TOKENS)
                     .min(limit.context / 4);
-                usize::try_from(limit.context.saturating_sub(reserve)).ok()
+                Some((
+                    usize::try_from(limit.context.saturating_sub(output_tokens)).ok()?,
+                    usize::try_from(output_tokens).ok()?,
+                ))
             })
-            .filter(|budget| *budget > 0)
-            .unwrap_or(self.fallback_context_tokens)
+            .filter(|(input_tokens, output_tokens)| *input_tokens > 0 && *output_tokens > 0)
+            .unwrap_or((
+                self.fallback_context_tokens,
+                usize::try_from(OUTPUT_RESERVE_TOKENS)
+                    .expect("the fixed output reserve must fit usize"),
+            ))
+    }
+
+    fn prepare_request(
+        &self,
+        definitions: &[ToolDefinition],
+    ) -> Result<PreparedRequest<P::Request>> {
+        let (_, max_output_tokens) = self.request_budgets();
+        self.provider.prepare_request(
+            &self.model,
+            self.thinking_level,
+            &self.messages,
+            definitions,
+            max_output_tokens,
+        )
     }
 
     pub fn default_tool_timeout(&self) -> Duration {
@@ -165,15 +190,14 @@ where
 
     pub fn clear(&mut self) {
         self.messages = fresh_messages();
-        self.usage_baseline = None;
         self.sync_memory_context();
     }
 
     pub async fn replace_messages(&mut self, messages: Vec<Message>) -> Result<()> {
         self.messages = normalize_messages(messages);
-        self.usage_baseline = None;
         self.initialize_memory().await?;
-        self.compact_if_needed().await?;
+        let definitions = self.tools.definitions();
+        let _ = self.prepare_with_compaction(&definitions).await?;
         Ok(())
     }
 
@@ -255,23 +279,33 @@ where
         Ok(())
     }
 
-    /// Used context tokens: the server-reported input tokens of the last
-    /// completion (which also covers the system prompt, tool definitions, and
-    /// provider-side overhead) plus a local estimate for messages appended
-    /// since. Falls back to a purely local estimate before the first
-    /// completion and after compaction rewrote the history.
+    /// Estimated input tokens for the exact request shape that the active
+    /// provider would send, including sanitized reasoning state and tool
+    /// definitions.
     pub fn context_tokens(&self) -> usize {
-        match self.usage_baseline {
-            Some(baseline) if baseline.message_len <= self.messages.len() => {
-                baseline.input_tokens + context_tokens(&self.messages[baseline.message_len..])
-            }
-            _ => context_tokens(&self.messages),
-        }
+        let definitions = self.tools.definitions();
+        self.prepare_request(&definitions)
+            .map(|request| request.input_tokens())
+            .unwrap_or_else(|_| fallback_request_tokens(&self.messages, &definitions))
     }
 
     pub async fn compact(&mut self) -> Result<CompactStats> {
+        let definitions = self.tools.definitions();
+        self.sync_memory_context();
+        let request = self.prepare_request(&definitions)?;
+        let (stats, request) = self.compact_prepared(&definitions, request).await?;
+        self.ensure_request_fits(&request)?;
+        Ok(stats)
+    }
+
+    async fn compact_prepared(
+        &mut self,
+        definitions: &[ToolDefinition],
+        mut request: PreparedRequest<P::Request>,
+    ) -> Result<(CompactStats, PreparedRequest<P::Request>)> {
         let budget = self.context_budget();
-        let before_tokens = self.context_tokens();
+        let before_tokens = request.input_tokens();
+        let mut current_tokens = before_tokens;
         let mut keep_turns = self.compact_keep_turns;
         let mut stats = CompactStats {
             before_tokens,
@@ -290,21 +324,22 @@ where
                 self.memory.as_deref(),
                 &archived,
             );
-            stats.after_tokens = next.after_tokens;
+            self.sync_memory_context();
+            let next_request = self.prepare_request(definitions)?;
+            stats.after_tokens = next_request.input_tokens();
             stats.kept_turns = next.kept_turns;
             stats.summarized_turns += next.summarized_turns;
             stats.summarized_tool_outputs += next.summarized_tool_outputs;
-            if next.freed_tokens == 0 || stats.after_tokens <= budget || next.kept_turns <= 1 {
+            let made_progress = stats.after_tokens < current_tokens;
+            request = next_request;
+            if !made_progress || stats.after_tokens <= budget || next.kept_turns <= 1 {
                 break;
             }
+            current_tokens = stats.after_tokens;
             keep_turns = next.kept_turns - 1;
         }
         stats.freed_tokens = before_tokens.saturating_sub(stats.after_tokens);
-        if stats.freed_tokens > 0 {
-            self.usage_baseline = None;
-        }
-        self.sync_memory_context();
-        Ok(stats)
+        Ok((stats, request))
     }
 
     async fn archive_compacted_messages(
@@ -457,7 +492,6 @@ where
     where
         F: Future<Output = ()>,
     {
-        self.compact_if_needed().await?;
         let checkpoint = self.messages.len();
         let prompt = prompt.into();
         if let Some(memory) = &self.memory {
@@ -517,21 +551,13 @@ where
         let definitions = self.tools.definitions();
 
         for _ in 0..self.max_turns {
-            self.compact_if_needed().await?;
+            let request = self.prepare_with_compaction(&definitions).await?;
             if let Some(memory) = &self.memory {
                 memory.begin_model_turn();
             }
-            self.sync_memory_context();
-            let sent_len = self.messages.len();
             let assistant = match self
                 .provider
-                .complete(
-                    &self.model,
-                    self.thinking_level,
-                    &self.messages,
-                    &definitions,
-                    &self.events,
-                )
+                .complete(request.into_payload(), &self.events)
                 .await
             {
                 Ok(assistant) => assistant,
@@ -542,17 +568,6 @@ where
                     return Err(error);
                 }
             };
-
-            if let Some(input_tokens) = assistant
-                .usage
-                .and_then(|usage| usage.input_tokens)
-                .and_then(|tokens| usize::try_from(tokens).ok())
-            {
-                self.usage_baseline = Some(UsageBaseline {
-                    message_len: sent_len,
-                    input_tokens,
-                });
-            }
 
             let assistant_message = Message::Assistant {
                 content: assistant.content.clone(),
@@ -644,7 +659,6 @@ where
                     content,
                 });
                 self.sync_memory_context();
-                self.compact_if_needed().await?;
             }
         }
 
@@ -658,31 +672,39 @@ where
         bail!(message)
     }
 
-    async fn compact_if_needed(&mut self) -> Result<Option<CompactStats>> {
+    async fn prepare_with_compaction(
+        &mut self,
+        definitions: &[ToolDefinition],
+    ) -> Result<PreparedRequest<P::Request>> {
+        self.sync_memory_context();
+        let mut request = self.prepare_request(definitions)?;
         let threshold = self.context_budget().saturating_mul(AUTO_COMPACT_PERCENT) / 100;
-        if self.context_tokens() < threshold {
-            return Ok(None);
+        if request.input_tokens() < threshold {
+            self.ensure_request_fits(&request)?;
+            return Ok(request);
         }
-        let before_tokens = self.context_tokens();
+        let before_tokens = request.input_tokens();
         let pruned_tool_outputs = prune_tool_outputs(&mut self.messages, self.memory.as_deref());
         if pruned_tool_outputs > 0 {
-            // Pruning rewrote prefix messages, so the server baseline no
-            // longer describes the current history.
-            self.usage_baseline = None;
+            self.sync_memory_context();
+            request = self.prepare_request(definitions)?;
         }
-        let mut stats = if self.context_tokens() >= threshold {
-            self.compact().await?
+        let (mut stats, request) = if request.input_tokens() >= threshold {
+            self.compact_prepared(definitions, request).await?
         } else {
-            let after_tokens = self.context_tokens();
-            CompactStats {
-                before_tokens,
-                after_tokens,
-                freed_tokens: before_tokens.saturating_sub(after_tokens),
-                kept_turns: 0,
-                summarized_turns: 0,
-                summarized_tool_outputs: 0,
-                pruned_tool_outputs: 0,
-            }
+            let after_tokens = request.input_tokens();
+            (
+                CompactStats {
+                    before_tokens,
+                    after_tokens,
+                    freed_tokens: before_tokens.saturating_sub(after_tokens),
+                    kept_turns: 0,
+                    summarized_turns: 0,
+                    summarized_tool_outputs: 0,
+                    pruned_tool_outputs: 0,
+                },
+                request,
+            )
         };
         stats.before_tokens = before_tokens;
         stats.freed_tokens = before_tokens.saturating_sub(stats.after_tokens);
@@ -693,7 +715,21 @@ where
                 stats: stats.clone(),
             });
         }
-        Ok(Some(stats))
+        self.ensure_request_fits(&request)?;
+        Ok(request)
+    }
+
+    fn ensure_request_fits(&self, request: &PreparedRequest<P::Request>) -> Result<()> {
+        let budget = self.context_budget();
+        if request.input_tokens() <= budget {
+            return Ok(());
+        }
+        bail!(
+            "prepared request requires approximately {} input tokens, exceeding the {} token input budget with {} output tokens reserved; shorten the current prompt or use a model with a larger context window",
+            request.input_tokens(),
+            budget,
+            request.max_output_tokens()
+        )
     }
 }
 
@@ -724,8 +760,10 @@ fn normalize_messages(messages: Vec<Message>) -> Vec<Message> {
     }
 }
 
-fn context_tokens(messages: &[Message]) -> usize {
-    messages.iter().map(Message::token_estimate).sum()
+fn fallback_request_tokens(messages: &[Message], tools: &[ToolDefinition]) -> usize {
+    serde_json::to_string(&(messages, tools))
+        .map(|request| estimate_tokens(&request))
+        .unwrap_or_else(|_| messages.iter().map(Message::token_estimate).sum())
 }
 
 fn message_content(message: &Message) -> &str {
@@ -806,8 +844,7 @@ fn compact_messages(
     keep_turns: usize,
     memory: Option<&MemoryRuntime>,
     archived: &HashMap<usize, MemoryPointer>,
-) -> CompactStats {
-    let before_tokens = context_tokens(messages);
+) -> CompactionResult {
     let user_indices = user_indices(messages);
     let existing_summary = matches!(
         messages.get(1),
@@ -817,14 +854,10 @@ fn compact_messages(
     let kept_turns = user_indices.len().min(keep_turns);
     let summarized_turns = user_indices.len().saturating_sub(kept_turns);
     if summarized_turns == 0 {
-        return CompactStats {
-            before_tokens,
-            after_tokens: before_tokens,
-            freed_tokens: 0,
+        return CompactionResult {
             kept_turns,
             summarized_turns: 0,
             summarized_tool_outputs: 0,
-            pruned_tool_outputs: 0,
         };
     }
 
@@ -997,15 +1030,10 @@ fn compact_messages(
     compacted.extend(messages[keep_start..].iter().cloned());
     *messages = compacted;
 
-    let after_tokens = context_tokens(messages);
-    CompactStats {
-        before_tokens,
-        after_tokens,
-        freed_tokens: before_tokens.saturating_sub(after_tokens),
+    CompactionResult {
         kept_turns,
         summarized_turns,
         summarized_tool_outputs,
-        pruned_tool_outputs: 0,
     }
 }
 
