@@ -27,6 +27,13 @@ async fn main() -> Result<()> {
         print_sessions(&session_store).await?;
         return Ok(());
     }
+    if let Some(Command::Delete { id }) = &cli.command {
+        if !session_store.delete(id).await? {
+            anyhow::bail!("session {id:?} was not found");
+        }
+        println!("Deleted session {id}.");
+        return Ok(());
+    }
     let loaded_session = match &cli.command {
         Some(Command::Resume { id, .. }) => Some(
             session_store

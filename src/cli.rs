@@ -15,6 +15,11 @@ pub struct Cli {
 pub enum Command {
     /// List saved sessions for the current project.
     Sessions,
+    /// Delete a saved session and its addressable memory.
+    Delete {
+        /// Session ID shown by `zex sessions`.
+        id: String,
+    },
     /// Continue a saved session, or the latest session when ID is omitted.
     Resume {
         /// Session ID shown by `zex sessions`.
@@ -48,6 +53,12 @@ mod tests {
 
         let sessions = Cli::try_parse_from(["zex", "sessions"]).unwrap();
         assert!(matches!(sessions.command, Some(Command::Sessions)));
+
+        let delete = Cli::try_parse_from(["zex", "delete", "session-id"]).unwrap();
+        assert!(matches!(
+            delete.command,
+            Some(Command::Delete { ref id }) if id == "session-id"
+        ));
 
         let resume =
             Cli::try_parse_from(["zex", "resume", "session-id", "-p", "continue"]).unwrap();

@@ -63,6 +63,35 @@ impl SessionStore {
         Ok(self.directory.join(validate_session_id(id)?).join("memory"))
     }
 
+    pub async fn delete(&self, id: &str) -> Result<bool> {
+        let id = validate_session_id(id)?;
+        let mut deleted = false;
+        for path in [
+            self.path_for(id),
+            self.directory.join(format!("{id}.jsonl.tmp")),
+        ] {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => deleted = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to delete session {}", path.display()));
+                }
+            }
+        }
+        let memory_root = self.directory.join(id);
+        match tokio::fs::remove_dir_all(&memory_root).await {
+            Ok(()) => deleted = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to delete session memory {}", memory_root.display())
+                });
+            }
+        }
+        Ok(deleted)
+    }
+
     pub async fn save(
         &self,
         session_id: Option<&str>,
@@ -535,6 +564,35 @@ mod tests {
             vec![newer.as_str(), older.as_str()]
         );
         assert!(sessions[0].updated_at >= sessions[1].updated_at);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_removes_session_and_addressable_memory() {
+        let directory = temp_directory("delete");
+        let store = SessionStore::new(directory.clone());
+        let id = store
+            .save(
+                None,
+                "model",
+                crate::provider::ThinkingLevel::Medium,
+                &[Message::User {
+                    content: "delete me".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+        let memory_directory = store.memory_directory(&id).unwrap();
+        tokio::fs::create_dir_all(&memory_directory).await.unwrap();
+        tokio::fs::write(memory_directory.join("records.jsonl"), b"memory")
+            .await
+            .unwrap();
+
+        assert!(store.delete(&id).await.unwrap());
+        assert!(store.load(Some(&id)).await.unwrap().is_none());
+        assert!(!tokio::fs::try_exists(&memory_directory).await.unwrap());
+        assert!(!store.delete(&id).await.unwrap());
+
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

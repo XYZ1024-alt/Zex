@@ -22,6 +22,14 @@ use tokio::{
 use crate::agent::{estimate_tokens, truncate_to_token_budget};
 
 const RECORDS_FILE: &str = "records.jsonl";
+const AUDIT_FILE: &str = "audit.jsonl";
+const PIN_STATE_FILE: &str = "pin-state.json";
+const PIN_STATE_FORMAT: u8 = 1;
+const AUDIT_ARCHIVE_LIMIT: usize = 4;
+#[cfg(not(test))]
+const AUDIT_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(test)]
+const AUDIT_ROTATE_BYTES: u64 = 4 * 1024;
 const MEMORY_ID_HEX_LEN: usize = 24;
 const ACTIVE_POINTER_LIMIT: usize = 64;
 const SYSTEM_POINTER_LIMIT: usize = 24;
@@ -103,6 +111,16 @@ impl MemoryKind {
             Self::Summary => "summary",
         }
     }
+
+    fn filter_name(self) -> &'static str {
+        match self {
+            Self::ToolResult => "tool_result",
+            Self::Message => "message",
+            Self::FileSnapshot => "file_snapshot",
+            Self::Decision => "decision",
+            Self::Summary => "summary",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,10 +181,25 @@ struct AuditEvent {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PinState {
+    format: u8,
+    overrides: BTreeMap<String, bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PointerFilter {
+    Text(String),
+    Field { key: String, value: String },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
 enum StoreRecord {
     Item { item: MemoryItem },
+    // Existing stores may contain inline audit records. New audit events are
+    // written to audit.jsonl so rebuilding the content index does not scan
+    // operational history.
     Audit { audit: AuditEvent },
 }
 
@@ -182,6 +215,7 @@ struct StoreIndex {
     entries: HashMap<String, RecordLocation>,
     order: Vec<String>,
     message_fingerprints: HashMap<String, String>,
+    tool_fingerprints: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -270,16 +304,24 @@ struct SessionMemory {
     session_id: String,
     directory: PathBuf,
     records_path: PathBuf,
+    audit_path: PathBuf,
+    pin_state_path: PathBuf,
     session_hash: u64,
     next_sequence: AtomicU64,
     append_lock: AsyncMutex<()>,
+    audit_append_lock: AsyncMutex<()>,
+    dedupe_lock: AsyncMutex<()>,
+    pin_lock: AsyncMutex<()>,
     index: Mutex<StoreIndex>,
+    pin_overrides: Mutex<BTreeMap<String, bool>>,
     cache: Mutex<HotCache>,
 }
 
 impl SessionMemory {
     async fn open(session_id: String, directory: PathBuf, cache_size: usize) -> Result<Self> {
         let records_path = directory.join(RECORDS_FILE);
+        let audit_path = directory.join(AUDIT_FILE);
+        let pin_state_path = directory.join(PIN_STATE_FILE);
         let mut index = StoreIndex::default();
         let mut item_count = 0u64;
 
@@ -351,10 +393,22 @@ impl SessionMemory {
                             item_count += 1;
                             index.order.push(item.pointer.id.clone());
                             if let Some(fingerprint) = item.pointer.metadata.get("fingerprint") {
-                                index
-                                    .message_fingerprints
-                                    .entry(fingerprint.clone())
-                                    .or_insert_with(|| item.pointer.id.clone());
+                                match item.pointer.kind {
+                                    MemoryKind::ToolResult | MemoryKind::FileSnapshot => {
+                                        index
+                                            .tool_fingerprints
+                                            .entry(fingerprint.clone())
+                                            .or_insert_with(|| item.pointer.id.clone());
+                                    }
+                                    MemoryKind::Message
+                                    | MemoryKind::Decision
+                                    | MemoryKind::Summary => {
+                                        index
+                                            .message_fingerprints
+                                            .entry(fingerprint.clone())
+                                            .or_insert_with(|| item.pointer.id.clone());
+                                    }
+                                }
                             }
                             index.entries.insert(
                                 item.pointer.id.clone(),
@@ -391,14 +445,51 @@ impl SessionMemory {
             }
         }
 
+        let pin_overrides = match tokio::fs::read(&pin_state_path).await {
+            Ok(content) => {
+                let state: PinState = serde_json::from_slice(&content).with_context(|| {
+                    format!("failed to parse pin state {}", pin_state_path.display())
+                })?;
+                if state.format != PIN_STATE_FORMAT {
+                    bail!(
+                        "unsupported pin state format {} in {}",
+                        state.format,
+                        pin_state_path.display()
+                    );
+                }
+                for (id, pinned) in &state.overrides {
+                    validate_memory_id(id)?;
+                    let entry = index.entries.get_mut(id).with_context(|| {
+                        format!(
+                            "pin state {} references missing memory ID {id}",
+                            pin_state_path.display()
+                        )
+                    })?;
+                    entry.pointer.pinned = *pinned;
+                }
+                state.overrides
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read {}", pin_state_path.display()));
+            }
+        };
+
         Ok(Self {
             session_hash: fnv1a64(session_id.as_bytes()),
             session_id,
             directory,
             records_path,
+            audit_path,
+            pin_state_path,
             next_sequence: AtomicU64::new(item_count),
             append_lock: AsyncMutex::new(()),
+            audit_append_lock: AsyncMutex::new(()),
+            dedupe_lock: AsyncMutex::new(()),
+            pin_lock: AsyncMutex::new(()),
             index: Mutex::new(index),
+            pin_overrides: Mutex::new(pin_overrides),
             cache: Mutex::new(HotCache::new(cache_size)),
         })
     }
@@ -443,10 +534,20 @@ impl SessionMemory {
         }
         index.order.push(id.clone());
         if let Some(fingerprint) = pointer.metadata.get("fingerprint") {
-            index
-                .message_fingerprints
-                .entry(fingerprint.clone())
-                .or_insert_with(|| id.clone());
+            match pointer.kind {
+                MemoryKind::ToolResult | MemoryKind::FileSnapshot => {
+                    index
+                        .tool_fingerprints
+                        .entry(fingerprint.clone())
+                        .or_insert_with(|| id.clone());
+                }
+                MemoryKind::Message | MemoryKind::Decision | MemoryKind::Summary => {
+                    index
+                        .message_fingerprints
+                        .entry(fingerprint.clone())
+                        .or_insert_with(|| id.clone());
+                }
+            }
         }
         index.entries.insert(
             id.clone(),
@@ -498,7 +599,93 @@ impl SessionMemory {
     }
 
     async fn append_audit(&self, audit: AuditEvent) -> Result<()> {
-        self.append(&StoreRecord::Audit { audit }).await?;
+        let mut line = serde_json::to_vec(&audit).context("failed to serialize memory audit")?;
+        line.push(b'\n');
+        let _append = self.audit_append_lock.lock().await;
+        tokio::fs::create_dir_all(&self.directory)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create memory directory {}",
+                    self.directory.display()
+                )
+            })?;
+        self.rotate_audit_if_needed(line.len()).await?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.audit_path)
+            .await
+            .with_context(|| format!("failed to open {}", self.audit_path.display()))?;
+        file.write_all(&line)
+            .await
+            .with_context(|| format!("failed to append {}", self.audit_path.display()))?;
+        file.flush()
+            .await
+            .with_context(|| format!("failed to flush {}", self.audit_path.display()))?;
+        Ok(())
+    }
+
+    async fn rotate_audit_if_needed(&self, next_record_bytes: usize) -> Result<()> {
+        let current_bytes = match tokio::fs::metadata(&self.audit_path).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", self.audit_path.display()));
+            }
+        };
+        if current_bytes == 0
+            || current_bytes.saturating_add(next_record_bytes as u64) <= AUDIT_ROTATE_BYTES
+        {
+            return Ok(());
+        }
+
+        let archive = self.directory.join(format!(
+            "audit-{}-{:08x}.jsonl",
+            OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            self.next_sequence.load(Ordering::Relaxed)
+        ));
+        tokio::fs::rename(&self.audit_path, &archive)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to rotate {} to {}",
+                    self.audit_path.display(),
+                    archive.display()
+                )
+            })?;
+        self.prune_audit_archives().await
+    }
+
+    async fn prune_audit_archives(&self) -> Result<()> {
+        let mut entries = tokio::fs::read_dir(&self.directory)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to inspect memory directory {}",
+                    self.directory.display()
+                )
+            })?;
+        let mut archives = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .context("failed to inspect memory audit archives")?
+        {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("audit-") && name.ends_with(".jsonl") {
+                archives.push(entry.path());
+            }
+        }
+        archives.sort();
+        let remove_count = archives.len().saturating_sub(AUDIT_ARCHIVE_LIMIT);
+        for archive in archives.into_iter().take(remove_count) {
+            tokio::fs::remove_file(&archive)
+                .await
+                .with_context(|| format!("failed to remove {}", archive.display()))?;
+        }
         Ok(())
     }
 
@@ -568,6 +755,12 @@ impl SessionMemory {
         index.entries.get(id).map(|entry| entry.pointer.clone())
     }
 
+    fn pointer_by_tool_fingerprint(&self, fingerprint: &str) -> Option<MemoryPointer> {
+        let index = self.index.lock().unwrap_or_else(|error| error.into_inner());
+        let id = index.tool_fingerprints.get(fingerprint)?;
+        index.entries.get(id).map(|entry| entry.pointer.clone())
+    }
+
     fn pointers(&self) -> Vec<MemoryPointer> {
         let index = self.index.lock().unwrap_or_else(|error| error.into_inner());
         index
@@ -579,6 +772,7 @@ impl SessionMemory {
     }
 
     async fn set_pinned(&self, id: &str, pinned: bool) -> Result<MemoryPointer> {
+        let _pin = self.pin_lock.lock().await;
         let action = if pinned {
             AuditAction::Pin
         } else {
@@ -598,25 +792,124 @@ impl SessionMemory {
             .await?;
             bail!(message);
         };
-        self.append_audit(AuditEvent {
-            action,
-            id: id.to_owned(),
-            created_at: timestamp()?,
-            reason: None,
-            returned_tokens: None,
-            truncated: false,
-            error: None,
-        })
-        .await?;
-        let mut index = self.index.lock().unwrap_or_else(|error| error.into_inner());
-        let entry = index
-            .entries
-            .get_mut(id)
-            .context("memory record disappeared while updating pin state")?;
-        entry.pointer.pinned = pinned;
+
+        let previous = pointer.pinned;
+        let previous_override = {
+            let mut overrides = self
+                .pin_overrides
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            overrides.insert(id.to_owned(), pinned)
+        };
+        {
+            let mut index = self.index.lock().unwrap_or_else(|error| error.into_inner());
+            let entry = index
+                .entries
+                .get_mut(id)
+                .context("memory record disappeared while updating pin state")?;
+            entry.pointer.pinned = pinned;
+        }
+        let overrides = self
+            .pin_overrides
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Err(error) = self.persist_pin_state(&overrides).await {
+            self.restore_pin_state(id, previous, previous_override)
+                .await?;
+            return Err(error);
+        }
+
+        if let Err(error) = self
+            .append_audit(AuditEvent {
+                action,
+                id: id.to_owned(),
+                created_at: timestamp()?,
+                reason: None,
+                returned_tokens: None,
+                truncated: false,
+                error: None,
+            })
+            .await
+        {
+            self.restore_pin_state(id, previous, previous_override)
+                .await?;
+            return Err(error);
+        }
+
         let mut updated = pointer;
         updated.pinned = pinned;
         Ok(updated)
+    }
+
+    async fn restore_pin_state(
+        &self,
+        id: &str,
+        pinned: bool,
+        previous_override: Option<bool>,
+    ) -> Result<()> {
+        {
+            let mut index = self.index.lock().unwrap_or_else(|error| error.into_inner());
+            let entry = index
+                .entries
+                .get_mut(id)
+                .context("memory record disappeared while restoring pin state")?;
+            entry.pointer.pinned = pinned;
+        }
+        let overrides = {
+            let mut overrides = self
+                .pin_overrides
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match previous_override {
+                Some(previous) => {
+                    overrides.insert(id.to_owned(), previous);
+                }
+                None => {
+                    overrides.remove(id);
+                }
+            }
+            overrides.clone()
+        };
+        self.persist_pin_state(&overrides)
+            .await
+            .context("failed to restore pin state after persistence error")
+    }
+
+    async fn persist_pin_state(&self, overrides: &BTreeMap<String, bool>) -> Result<()> {
+        tokio::fs::create_dir_all(&self.directory)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create memory directory {}",
+                    self.directory.display()
+                )
+            })?;
+        let content = serde_json::to_vec(&PinState {
+            format: PIN_STATE_FORMAT,
+            overrides: overrides.clone(),
+        })
+        .context("failed to serialize memory pin state")?;
+        let temporary_path = self.directory.join(format!("{PIN_STATE_FILE}.tmp"));
+        tokio::fs::write(&temporary_path, content)
+            .await
+            .with_context(|| format!("failed to write {}", temporary_path.display()))?;
+        if let Err(error) = tokio::fs::rename(&temporary_path, &self.pin_state_path).await {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                tokio::fs::remove_file(&self.pin_state_path)
+                    .await
+                    .with_context(|| {
+                        format!("failed to replace {}", self.pin_state_path.display())
+                    })?;
+                tokio::fs::rename(&temporary_path, &self.pin_state_path)
+                    .await
+                    .with_context(|| format!("failed to save {}", self.pin_state_path.display()))?;
+            } else {
+                return Err(error)
+                    .with_context(|| format!("failed to save {}", self.pin_state_path.display()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -686,7 +979,14 @@ impl MemoryRuntime {
         content: String,
     ) -> Result<MemoryPointer> {
         let session = self.active_session()?;
+        let fingerprint = tool_result_fingerprint(tool, arguments, &content)?;
+        let _dedupe = session.dedupe_lock.lock().await;
+        if let Some(pointer) = session.pointer_by_tool_fingerprint(&fingerprint) {
+            return Ok(pointer);
+        }
         let importance = tool_importance(tool, &content);
+        let mut metadata = tool_metadata(arguments);
+        metadata.insert("fingerprint".to_owned(), fingerprint);
         session
             .store(NewMemoryItem {
                 kind: if tool == "read" {
@@ -699,7 +999,7 @@ impl MemoryRuntime {
                 importance,
                 pinned: self.config.auto_pin_important && importance >= 85,
                 parent_id: None,
-                metadata: tool_metadata(arguments),
+                metadata,
             })
             .await
             .with_context(|| format!("failed to persist {tool} result in addressable memory"))
@@ -713,6 +1013,7 @@ impl MemoryRuntime {
     ) -> Result<MemoryPointer> {
         let session = self.active_session()?;
         let fingerprint = message_fingerprint(role, &content);
+        let _dedupe = session.dedupe_lock.lock().await;
         if let Some(pointer) = session.pointer_by_message_fingerprint(&fingerprint) {
             return Ok(pointer);
         }
@@ -895,6 +1196,7 @@ impl MemoryRuntime {
     pub fn list_pointers(&self, filter: Option<&str>) -> Result<String> {
         let session = self.active_session()?;
         let filter = filter.map(str::trim).filter(|filter| !filter.is_empty());
+        let parsed_filter = filter.map(parse_pointer_filters).transpose()?;
         let active = self
             .active_pointers
             .lock()
@@ -915,15 +1217,10 @@ impl MemoryRuntime {
         let mut matches = candidates
             .into_iter()
             .filter(|pointer| {
-                filter.is_none_or(|filter| {
-                    let filter = filter.to_ascii_lowercase();
-                    self.citation(pointer)
-                        .to_ascii_lowercase()
-                        .contains(&filter)
-                        || pointer
-                            .metadata
-                            .values()
-                            .any(|value| value.to_ascii_lowercase().contains(&filter))
+                parsed_filter.as_ref().is_none_or(|filters| {
+                    filters
+                        .iter()
+                        .all(|filter| self.pointer_matches_filter(pointer, filter))
                 })
             })
             .collect::<Vec<_>>();
@@ -953,6 +1250,36 @@ impl MemoryRuntime {
             ));
         }
         Ok(output)
+    }
+
+    fn pointer_matches_filter(&self, pointer: &MemoryPointer, filter: &PointerFilter) -> bool {
+        match filter {
+            PointerFilter::Text(value) => {
+                contains_case_insensitive(&self.citation(pointer), value)
+                    || pointer
+                        .source_tool
+                        .as_deref()
+                        .is_some_and(|tool| contains_case_insensitive(tool, value))
+                    || pointer
+                        .metadata
+                        .values()
+                        .any(|candidate| contains_case_insensitive(candidate, value))
+            }
+            PointerFilter::Field { key, value } => match key.as_str() {
+                "id" => contains_case_insensitive(&pointer.id, value),
+                "kind" => pointer.kind.filter_name().eq_ignore_ascii_case(value),
+                "tool" => pointer
+                    .source_tool
+                    .as_deref()
+                    .is_some_and(|tool| tool.eq_ignore_ascii_case(value)),
+                "role" | "path" | "pattern" | "file_glob" | "command" => pointer
+                    .metadata
+                    .get(key)
+                    .is_some_and(|candidate| contains_case_insensitive(candidate, value)),
+                "pinned" => pointer.pinned == (value == "true"),
+                _ => unreachable!("pointer filter keys are validated during parsing"),
+            },
+        }
     }
 
     pub fn records_path(&self) -> Option<PathBuf> {
@@ -1121,6 +1448,46 @@ pub fn validate_memory_id(id: &str) -> Result<&str> {
     Ok(id)
 }
 
+fn parse_pointer_filters(filter: &str) -> Result<Vec<PointerFilter>> {
+    filter
+        .split_whitespace()
+        .map(|term| {
+            let Some((key, value)) = term.split_once('=') else {
+                return Ok(PointerFilter::Text(term.to_ascii_lowercase()));
+            };
+            let key = key.to_ascii_lowercase();
+            if !matches!(
+                key.as_str(),
+                "id"
+                    | "kind"
+                    | "tool"
+                    | "role"
+                    | "path"
+                    | "pattern"
+                    | "file_glob"
+                    | "command"
+                    | "pinned"
+            ) {
+                bail!(
+                    "unsupported pointer filter field {key:?}; use id, kind, tool, role, path, pattern, file_glob, command, or pinned"
+                );
+            }
+            if value.is_empty() {
+                bail!("pointer filter field {key:?} requires a value");
+            }
+            let value = value.to_ascii_lowercase();
+            if key == "pinned" && !matches!(value.as_str(), "true" | "false") {
+                bail!("pointer filter pinned must be true or false");
+            }
+            Ok(PointerFilter::Field { key, value })
+        })
+        .collect()
+}
+
+fn contains_case_insensitive(candidate: &str, value: &str) -> bool {
+    candidate.to_ascii_lowercase().contains(value)
+}
+
 fn tool_metadata(arguments: &Value) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     for key in ["path", "pattern", "file_glob"] {
@@ -1132,6 +1499,18 @@ fn tool_metadata(arguments: &Value) -> BTreeMap<String, String> {
         metadata.insert("command".to_owned(), one_line_preview(command, 120));
     }
     metadata
+}
+
+fn tool_result_fingerprint(tool: &str, arguments: &Value, content: &str) -> Result<String> {
+    let arguments =
+        serde_json::to_vec(arguments).context("failed to serialize tool arguments for memory")?;
+    let mut bytes = Vec::with_capacity(tool.len() + arguments.len() + content.len() + 2);
+    bytes.extend_from_slice(tool.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&arguments);
+    bytes.push(0);
+    bytes.extend_from_slice(content.as_bytes());
+    Ok(fingerprint_bytes(&bytes))
 }
 
 fn tool_importance(tool: &str, content: &str) -> u8 {
@@ -1199,10 +1578,14 @@ fn message_fingerprint(role: &str, content: &str) -> String {
     bytes.extend_from_slice(role.as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(content.as_bytes());
+    fingerprint_bytes(&bytes)
+}
+
+fn fingerprint_bytes(bytes: &[u8]) -> String {
     format!(
         "{:016x}{:016x}",
-        fnv1a64(&bytes),
-        fnv1a64_seed(&bytes, 0x8422_2325_cbf2_9ce4)
+        fnv1a64(bytes),
+        fnv1a64_seed(bytes, 0x8422_2325_cbf2_9ce4)
     )
 }
 
@@ -1212,7 +1595,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{MemoryConfig, MemoryRuntime, extract_memory_ids};
+    use super::{
+        AUDIT_ARCHIVE_LIMIT, AUDIT_FILE, MemoryConfig, MemoryRuntime, PIN_STATE_FILE,
+        extract_memory_ids,
+    };
 
     fn temporary_directory(label: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -1283,9 +1669,18 @@ mod tests {
         let records_path = runtime.records_path().unwrap();
         let log = tokio::fs::read_to_string(&records_path).await.unwrap();
         assert!(log.contains("\"record_type\":\"item\""));
-        assert!(log.contains("\"action\":\"recall\""));
-        assert!(log.contains("\"action\":\"pin\""));
-        assert!(log.contains("\"error\":\"memory ID"));
+        assert!(!log.contains("\"action\":"));
+        let audit = tokio::fs::read_to_string(directory.join(AUDIT_FILE))
+            .await
+            .unwrap();
+        assert!(audit.contains("\"action\":\"recall\""));
+        assert!(audit.contains("\"action\":\"pin\""));
+        assert!(audit.contains("\"error\":\"memory ID"));
+        let pin_state = tokio::fs::read_to_string(directory.join(PIN_STATE_FILE))
+            .await
+            .unwrap();
+        assert!(pin_state.contains(&pointer.id));
+        assert!(pin_state.contains("false"));
 
         drop(runtime);
         let reopened = MemoryRuntime::new(config);
@@ -1322,6 +1717,177 @@ mod tests {
 
         assert!(recalled.contains("controlled excerpt"));
         assert!(crate::agent::estimate_tokens(&recalled) < 96);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deduplicates_tool_results_and_supports_structured_filters() {
+        let directory = temporary_directory("dedupe-filter");
+        let runtime = MemoryRuntime::new(MemoryConfig::default());
+        runtime
+            .activate("20260815-120000-01020304", directory.clone())
+            .await
+            .unwrap();
+
+        let first = runtime
+            .store_tool_result(
+                "read",
+                &json!({"path": "src/main.rs"}),
+                "same source".to_owned(),
+            )
+            .await
+            .unwrap();
+        let duplicate = runtime
+            .store_tool_result(
+                "read",
+                &json!({"path": "src/main.rs"}),
+                "same source".to_owned(),
+            )
+            .await
+            .unwrap();
+        let search = runtime
+            .store_tool_result(
+                "grep",
+                &json!({"pattern": "needle", "path": "src"}),
+                "src/main.rs:1:needle".to_owned(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(duplicate.id, first.id);
+        assert_ne!(search.id, first.id);
+        let records = tokio::fs::read_to_string(runtime.records_path().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(records.lines().count(), 2);
+
+        let read_matches = runtime
+            .list_pointers(Some("tool=read path=src/main.rs kind=file_snapshot"))
+            .unwrap();
+        assert!(read_matches.contains(&first.id));
+        assert!(!read_matches.contains(&search.id));
+        let grep_matches = runtime
+            .list_pointers(Some("tool=grep pattern=needle"))
+            .unwrap();
+        assert!(grep_matches.contains(&search.id));
+        let invalid = runtime.list_pointers(Some("unknown=value")).unwrap_err();
+        assert!(
+            invalid
+                .to_string()
+                .contains("unsupported pointer filter field")
+        );
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pin_snapshot_survives_reopen_without_masking_new_automatic_pins() {
+        let directory = temporary_directory("pin-state");
+        let config = MemoryConfig::default();
+        let runtime = MemoryRuntime::new(config.clone());
+        runtime
+            .activate("20260815-120000-11121314", directory.clone())
+            .await
+            .unwrap();
+        let manually_unpinned = runtime
+            .store_tool_result(
+                "write",
+                &json!({"path": "first.txt"}),
+                "wrote first".to_owned(),
+            )
+            .await
+            .unwrap();
+        let manually_pinned = runtime
+            .store_tool_result("read", &json!({"path": "source.txt"}), "source".to_owned())
+            .await
+            .unwrap();
+        runtime.unpin(&manually_unpinned.id).await.unwrap();
+        runtime.pin(&manually_pinned.id).await.unwrap();
+        drop(runtime);
+
+        let reopened = MemoryRuntime::new(config.clone());
+        reopened
+            .activate("20260815-120000-11121314", directory.clone())
+            .await
+            .unwrap();
+        assert!(
+            !reopened
+                .pointer_for_id(&manually_unpinned.id)
+                .unwrap()
+                .pinned
+        );
+        assert!(reopened.pointer_for_id(&manually_pinned.id).unwrap().pinned);
+        let automatically_pinned = reopened
+            .store_tool_result(
+                "edit",
+                &json!({"path": "second.txt"}),
+                "edited second".to_owned(),
+            )
+            .await
+            .unwrap();
+        assert!(automatically_pinned.pinned);
+        drop(reopened);
+
+        let reopened_again = MemoryRuntime::new(config);
+        reopened_again
+            .activate("20260815-120000-11121314", directory.clone())
+            .await
+            .unwrap();
+        assert!(
+            reopened_again
+                .pointer_for_id(&automatically_pinned.id)
+                .unwrap()
+                .pinned
+        );
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rotates_audit_logs_and_keeps_records_free_of_operational_events() {
+        let directory = temporary_directory("audit-rotation");
+        let runtime = MemoryRuntime::new(MemoryConfig::default());
+        runtime
+            .activate("20260815-120000-21222324", directory.clone())
+            .await
+            .unwrap();
+        let pointer = runtime
+            .store_tool_result(
+                "read",
+                &json!({"path": "rotate.txt"}),
+                "rotation source".to_owned(),
+            )
+            .await
+            .unwrap();
+
+        for index in 0..240 {
+            if index % 2 == 0 {
+                runtime.pin(&pointer.id).await.unwrap();
+            } else {
+                runtime.unpin(&pointer.id).await.unwrap();
+            }
+        }
+
+        let records = tokio::fs::read_to_string(runtime.records_path().unwrap())
+            .await
+            .unwrap();
+        assert!(!records.contains("\"action\":"));
+        let mut entries = tokio::fs::read_dir(&directory).await.unwrap();
+        let mut archives = 0usize;
+        let mut current = 0usize;
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("audit-") && name.ends_with(".jsonl") {
+                archives += 1;
+            } else if name == AUDIT_FILE {
+                current += 1;
+            }
+        }
+        assert!(archives > 0);
+        assert!(archives <= AUDIT_ARCHIVE_LIMIT);
+        assert_eq!(current, 1);
+
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }

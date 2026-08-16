@@ -30,7 +30,7 @@ Zex 按以下顺序合并配置，后者覆盖前者：
 
 可用 `ZEX_CONFIG_DIR` 覆盖整个全局目录，便于便携安装和隔离测试。
 
-会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建/更新时间、保存时的 model 和当前 `thinking_level`；后续每行是一条 Agent 消息。启用 ARC 时，原始观察和被 compact 的历史另存于 `sessions/<id>/memory/records.jsonl`；该文件 append-only，session resume 时重建 ID 索引。会话不保存 API Key、base URL 或其他敏感运行配置。恢复会话会恢复消息、地址化 Store 和思考级别，但不改变当前通过 `/model` 选择的模型。
+会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建/更新时间、保存时的 model 和当前 `thinking_level`；后续每行是一条 Agent 消息。启用 ARC 时，原始观察和被 compact 的历史另存于 `sessions/<id>/memory/records.jsonl`，pin 覆盖状态保存在紧凑的 `pin-state.json`，recall/pin 审计写入独立的 `audit.jsonl`。审计文件达到 4 MiB 后轮转，最多保留 4 个归档；session resume 只需扫描内容记录并载入 pin 快照。会话不保存 API Key、base URL 或其他敏感运行配置。恢复会话会恢复消息、地址化 Store 和思考级别，但不改变当前通过 `/model` 选择的模型。
 
 项目配置示例：
 
@@ -269,12 +269,18 @@ echo "解释当前目录" | zex
 
 非 TTY REPL 沿用 `zex>` 提示；Unix 上 Ctrl-D，Windows 上 Ctrl-Z 后回车退出。
 
-### 会话列表与恢复
+### 会话列表、恢复与删除
 
 列出会话；输出包含 ID、最后更新时间、消息数和首条用户消息摘要：
 
 ```bash
 zex sessions
+```
+
+删除指定会话及其地址化记忆：
+
+```bash
+zex delete 20260812-143012-1a2b3c4d
 ```
 
 恢复最近更新的会话并进入交互模式：
@@ -314,8 +320,9 @@ zex resume -p "继续上一轮工作并给出结论"
 - 大结果只进入 citation；小结果保留当前可见文本并附带 addressable copy。
 - `/compact` 和 auto-compact 在删除旧轮次前，把用户/assistant 原消息写为 `§turn_...`，把工具观察保留为 `§obs_...`，再生成有界 structured summary 和 pointer manifest。
 - `recall({"id":"§obs_...","reason":"该诊断直接决定修复"})` 精确取回未超上限的原文；大内容返回受控片段，全文仍保留在同一 ID。
-- `pin` / `unpin` 调整 compact 和 pointer manifest 的优先级；`list_pointers` 无 filter 时列出 active/pinned ID，有 filter 时按路径、工具、角色和预览搜索当前 session Store。
-- 不存在或格式错误的 ID 会返回明确错误；recall 默认每个模型工具轮最多 3 次、每分钟最多 5 次。创建、recall、失败、限流和 pin 操作都记录在 Store JSONL。
+- 相同工具、参数和完整输出只保存一次，重复观察复用已有 ID。
+- `pin` / `unpin` 调整 compact 和 pointer manifest 的优先级；`list_pointers` 无 filter 时列出 active/pinned ID，有 filter 时支持普通文本或 `tool=read path=src/main.rs kind=file_snapshot pinned=true` 等可组合结构化条件。
+- 不存在或格式错误的 ID 会返回明确错误；recall 默认每个模型工具轮最多 3 次、每分钟最多 5 次。recall、失败、限流和 pin 操作写入独立轮转审计日志，内容 Store 不混入操作事件。
 
 需要完全回退时设置：
 
@@ -336,7 +343,7 @@ enabled = false
 - `bash`：仅用于其他系统命令。在启动工作目录中通过系统 shell 执行；Windows 使用 `cmd /D /S /C`，其他平台使用 `sh -c`。stdout/stderr 合并为结构化文本后执行统一截断。
 - `recall`：按精确 ID 取回原始内容；超大内容返回受 token 上限控制的片段，不存在或格式错误的 ID 明确报错。
 - `pin` / `unpin`：设置或移除已有 ID 的高优先级状态，不删除记录。
-- `list_pointers`：列出 active/pinned citation；指定 `filter` 时搜索当前 session 的 Store 元数据。
+- `list_pointers`：列出 active/pinned citation；指定 `filter` 时可使用普通文本，或 `id`、`kind`、`tool`、`role`、`path`、`pattern`、`file_glob`、`command`、`pinned` 结构化字段；多个条件按 AND 组合。
 
 工具描述明确约定：搜文件内容用 `grep`；找文件或目录用 `glob`；其他系统命令才用 `bash`。
 

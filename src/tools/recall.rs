@@ -144,13 +144,13 @@ impl Tool for ListPointersTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_pointers".to_owned(),
-            description: "List valid addressable memory IDs. Without a filter it shows active and pinned pointers; with a filter it searches stored pointer metadata. Use this before recall when the exact ID is not visible. Do not use it as semantic search or repeatedly enumerate the whole store.".to_owned(),
+            description: "List valid addressable memory IDs. Without a filter it shows active and pinned pointers. A filter may contain plain text or structured terms such as tool=read, path=src/main.rs, kind=file_snapshot, role=user, pinned=true, or multiple AND-combined terms. Use this before recall when the exact ID is not visible. Do not use it as semantic search or repeatedly enumerate the whole store.".to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "filter": {
                         "type": "string",
-                        "description": "Optional narrow text filter such as a path, tool name, role, or known ID fragment"
+                        "description": "Optional narrow text or structured filter. Supported fields: id, kind, tool, role, path, pattern, file_glob, command, pinned"
                     }
                 },
                 "additionalProperties": false
