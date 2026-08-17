@@ -562,8 +562,14 @@ mod execution_tests {
             runtime.active_session_id().as_deref(),
             Some(resumed_id.as_str())
         );
-        assert!(runtime.list_pointers(None).unwrap().contains(&pointer.id));
-        let recalled = runtime.recall(&pointer.id, None).await.unwrap();
+        assert!(
+            runtime
+                .list_pointers(None)
+                .await
+                .unwrap()
+                .contains(&pointer.id)
+        );
+        let recalled = runtime.recall(&pointer.id, None, None, None).await.unwrap();
         assert!(recalled.ends_with("exact resumed observation"));
         assert!(matches!(
             agent.messages().first(),

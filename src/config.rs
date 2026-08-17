@@ -649,6 +649,39 @@ impl Config {
                         file.memory.auto_pin_important,
                         defaults.auto_pin_important,
                     )?,
+                    max_auto_pins: positive(
+                        "memory.max_auto_pins",
+                        env_or_file(
+                            "ZEX_MEMORY_MAX_AUTO_PINS",
+                            file.memory.max_auto_pins,
+                            defaults.max_auto_pins,
+                        )?,
+                    )?,
+                    max_records: positive(
+                        "memory.max_records",
+                        env_or_file(
+                            "ZEX_MEMORY_MAX_RECORDS",
+                            file.memory.max_records,
+                            defaults.max_records,
+                        )?,
+                    )?,
+                    max_store_bytes: positive_u64(
+                        "memory.max_store_bytes",
+                        env_or_file(
+                            "ZEX_MEMORY_MAX_STORE_BYTES",
+                            file.memory.max_store_bytes,
+                            defaults.max_store_bytes,
+                        )?,
+                    )?,
+                    retention_days: positive_u64(
+                        "memory.retention_days",
+                        env_or_file(
+                            "ZEX_MEMORY_RETENTION_DAYS",
+                            file.memory.retention_days,
+                            defaults.retention_days,
+                        )?,
+                    )?,
+                    encryption_key: crate::memory::MemoryEncryptionKey::from_environment(),
                 }
             },
             default_thinking_level: env_or_file(
@@ -711,6 +744,10 @@ struct FileMemoryConfig {
     max_recall_tokens: Option<usize>,
     hot_cache_size: Option<usize>,
     auto_pin_important: Option<bool>,
+    max_auto_pins: Option<usize>,
+    max_records: Option<usize>,
+    max_store_bytes: Option<u64>,
+    retention_days: Option<u64>,
 }
 
 impl FileMemoryConfig {
@@ -722,6 +759,10 @@ impl FileMemoryConfig {
             max_recall_tokens: project.max_recall_tokens.or(self.max_recall_tokens),
             hot_cache_size: project.hot_cache_size.or(self.hot_cache_size),
             auto_pin_important: project.auto_pin_important.or(self.auto_pin_important),
+            max_auto_pins: project.max_auto_pins.or(self.max_auto_pins),
+            max_records: project.max_records.or(self.max_records),
+            max_store_bytes: project.max_store_bytes.or(self.max_store_bytes),
+            retention_days: project.retention_days.or(self.retention_days),
         }
     }
 }

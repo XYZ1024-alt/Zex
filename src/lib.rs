@@ -5,6 +5,7 @@ pub mod config;
 pub mod headless;
 pub mod memory;
 pub mod provider;
+mod secure;
 pub mod session;
 pub mod tools;
 pub mod tui;

@@ -103,37 +103,67 @@ pub(crate) fn estimate_tokens(content: &str) -> usize {
     heuristic_estimate(content)
 }
 
-pub(crate) fn truncate_to_token_budget(content: &str, max_tokens: usize) -> (String, bool, usize) {
-    let original_tokens = estimate_tokens(content);
-    if original_tokens <= max_tokens {
-        return (content.to_owned(), false, original_tokens);
-    }
-    if max_tokens == 0 {
-        return (String::new(), true, 0);
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TokenWindow {
+    pub content: String,
+    pub start: usize,
+    pub end: usize,
+    pub total: usize,
+}
+
+pub(crate) fn token_window(content: &str, offset: usize, max_tokens: usize) -> TokenWindow {
     if let Some(bpe) = tokenizer() {
         let tokens = bpe.encode_ordinary(content);
-        let mut end = max_tokens.min(tokens.len());
-        while end > 0 {
-            if let Ok(excerpt) = bpe.decode(&tokens[..end]) {
-                let returned_tokens = estimate_tokens(&excerpt);
-                return (excerpt, true, returned_tokens);
-            }
+        let total = tokens.len();
+        let mut start = offset.min(total);
+        while start > 0 && bpe.decode(&tokens[..start]).is_err() {
+            start -= 1;
+        }
+        let mut end = offset.saturating_add(max_tokens).min(total);
+        while end > start && bpe.decode(&tokens[..end]).is_err() {
             end -= 1;
         }
-        return (String::new(), true, 0);
+        let content = bpe.decode(&tokens[start..end]).unwrap_or_default();
+        return TokenWindow {
+            content,
+            start,
+            end,
+            total,
+        };
     }
 
-    let mut excerpt = String::new();
-    for character in content.chars() {
-        excerpt.push(character);
-        if heuristic_estimate(&excerpt) > max_tokens {
-            excerpt.pop();
+    let total = heuristic_estimate(content);
+    let mut ascii = 0usize;
+    let mut non_ascii = 0usize;
+    let mut start_byte = content.len();
+    let mut end_byte = content.len();
+    let requested_end = offset.saturating_add(max_tokens);
+    for (byte, character) in content.char_indices() {
+        let tokens = ascii / 4 + non_ascii;
+        if start_byte == content.len() && tokens >= offset {
+            start_byte = byte;
+        }
+        if tokens >= requested_end {
+            end_byte = byte;
             break;
         }
+        if character.is_ascii() {
+            ascii += 1;
+        } else {
+            non_ascii += 1;
+        }
     }
-    let returned_tokens = heuristic_estimate(&excerpt);
-    (excerpt, true, returned_tokens)
+    if offset == 0 {
+        start_byte = 0;
+    }
+    let start = offset.min(total);
+    let end = requested_end.min(total);
+    TokenWindow {
+        content: content[start_byte..end_byte].to_owned(),
+        start,
+        end,
+        total,
+    }
 }
 
 /// Last-resort estimate when the tokenizer is unavailable: ASCII text

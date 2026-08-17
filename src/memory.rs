@@ -19,7 +19,11 @@ use tokio::{
     sync::Mutex as AsyncMutex,
 };
 
-use crate::agent::{estimate_tokens, truncate_to_token_budget};
+use crate::{
+    agent::{estimate_tokens, token_window},
+    secure::{Cipher as MemoryCipher, EncryptedContent as ContentEncryption},
+    session::atomic_write,
+};
 
 const RECORDS_FILE: &str = "records.jsonl";
 const AUDIT_FILE: &str = "audit.jsonl";
@@ -59,6 +63,8 @@ impl FromStr for MemoryMode {
     }
 }
 
+pub use crate::secure::EncryptionKey as MemoryEncryptionKey;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryConfig {
     pub enabled: bool,
@@ -67,6 +73,11 @@ pub struct MemoryConfig {
     pub max_recall_tokens: usize,
     pub hot_cache_size: usize,
     pub auto_pin_important: bool,
+    pub max_auto_pins: usize,
+    pub max_records: usize,
+    pub max_store_bytes: u64,
+    pub retention_days: u64,
+    pub encryption_key: Option<MemoryEncryptionKey>,
 }
 
 impl Default for MemoryConfig {
@@ -78,6 +89,11 @@ impl Default for MemoryConfig {
             max_recall_tokens: 2_048,
             hot_cache_size: 32,
             auto_pin_important: true,
+            max_auto_pins: 32,
+            max_records: 10_000,
+            max_store_bytes: 64 * 1024 * 1024,
+            retention_days: 30,
+            encryption_key: None,
         }
     }
 }
@@ -143,6 +159,10 @@ pub struct MemoryPointer {
 struct MemoryItem {
     #[serde(flatten)]
     pointer: MemoryPointer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption: Option<ContentEncryption>,
     content: String,
 }
 
@@ -154,6 +174,7 @@ struct NewMemoryItem {
     pinned: bool,
     parent_id: Option<String>,
     metadata: BTreeMap<String, String>,
+    turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -181,6 +202,13 @@ struct AuditEvent {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct EncryptedAuditEvent {
+    format: u8,
+    encryption: ContentEncryption,
+    content: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PinState {
     format: u8,
@@ -193,14 +221,29 @@ enum PointerFilter {
     Field { key: String, value: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MemoryTurnState {
+    Committed,
+    Aborted,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
 enum StoreRecord {
-    Item { item: MemoryItem },
+    Item {
+        item: MemoryItem,
+    },
+    Turn {
+        turn_id: String,
+        state: MemoryTurnState,
+    },
     // Existing stores may contain inline audit records. New audit events are
     // written to audit.jsonl so rebuilding the content index does not scan
     // operational history.
-    Audit { audit: AuditEvent },
+    Audit {
+        audit: AuditEvent,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +251,7 @@ struct RecordLocation {
     offset: u64,
     length: usize,
     pointer: MemoryPointer,
+    turn_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -216,6 +260,7 @@ struct StoreIndex {
     order: Vec<String>,
     message_fingerprints: HashMap<String, String>,
     tool_fingerprints: HashMap<String, String>,
+    turn_states: HashMap<String, MemoryTurnState>,
 }
 
 #[derive(Debug)]
@@ -308,6 +353,7 @@ struct SessionMemory {
     pin_state_path: PathBuf,
     session_hash: u64,
     next_sequence: AtomicU64,
+    next_turn_sequence: AtomicU64,
     append_lock: AsyncMutex<()>,
     audit_append_lock: AsyncMutex<()>,
     dedupe_lock: AsyncMutex<()>,
@@ -315,15 +361,28 @@ struct SessionMemory {
     index: Mutex<StoreIndex>,
     pin_overrides: Mutex<BTreeMap<String, bool>>,
     cache: Mutex<HotCache>,
+    cipher: Option<MemoryCipher>,
+    needs_encryption_migration: bool,
 }
 
 impl SessionMemory {
-    async fn open(session_id: String, directory: PathBuf, cache_size: usize) -> Result<Self> {
+    async fn open(
+        session_id: String,
+        directory: PathBuf,
+        cache_size: usize,
+        encryption_key: Option<&MemoryEncryptionKey>,
+    ) -> Result<Self> {
         let records_path = directory.join(RECORDS_FILE);
         let audit_path = directory.join(AUDIT_FILE);
         let pin_state_path = directory.join(PIN_STATE_FILE);
+        let cipher = encryption_key
+            .map(|key| MemoryCipher::new(key, &session_id))
+            .transpose()?;
         let mut index = StoreIndex::default();
         let mut item_count = 0u64;
+        let mut turn_count = 0u64;
+        let mut verified_encryption = false;
+        let mut has_plaintext_records = false;
 
         match File::open(&records_path).await {
             Ok(file) => {
@@ -382,6 +441,18 @@ impl SessionMemory {
                     };
                     match record {
                         StoreRecord::Item { item } => {
+                            has_plaintext_records |= item.encryption.is_none();
+                            if let Some(encryption) = &item.encryption
+                                && !verified_encryption
+                            {
+                                cipher
+                                    .as_ref()
+                                    .context(
+                                        "memory content is encrypted; set ZEX_MEMORY_ENCRYPTION_KEY to unlock it",
+                                    )?
+                                    .decrypt(&item.pointer.id, &item.content, encryption)?;
+                                verified_encryption = true;
+                            }
                             validate_memory_id(&item.pointer.id)?;
                             if index.entries.contains_key(&item.pointer.id) {
                                 bail!(
@@ -391,22 +462,26 @@ impl SessionMemory {
                                 );
                             }
                             item_count += 1;
+                            if let Some(turn_id) = &item.turn_id {
+                                index
+                                    .turn_states
+                                    .entry(turn_id.clone())
+                                    .or_insert(MemoryTurnState::Aborted);
+                            }
                             index.order.push(item.pointer.id.clone());
                             if let Some(fingerprint) = item.pointer.metadata.get("fingerprint") {
                                 match item.pointer.kind {
                                     MemoryKind::ToolResult | MemoryKind::FileSnapshot => {
                                         index
                                             .tool_fingerprints
-                                            .entry(fingerprint.clone())
-                                            .or_insert_with(|| item.pointer.id.clone());
+                                            .insert(fingerprint.clone(), item.pointer.id.clone());
                                     }
                                     MemoryKind::Message
                                     | MemoryKind::Decision
                                     | MemoryKind::Summary => {
                                         index
                                             .message_fingerprints
-                                            .entry(fingerprint.clone())
-                                            .or_insert_with(|| item.pointer.id.clone());
+                                            .insert(fingerprint.clone(), item.pointer.id.clone());
                                     }
                                 }
                             }
@@ -416,8 +491,13 @@ impl SessionMemory {
                                     offset,
                                     length,
                                     pointer: item.pointer,
+                                    turn_id: item.turn_id,
                                 },
                             );
+                        }
+                        StoreRecord::Turn { turn_id, state } => {
+                            turn_count += 1;
+                            index.turn_states.insert(turn_id, state);
                         }
                         StoreRecord::Audit { audit } => match audit.action {
                             AuditAction::Pin => {
@@ -484,6 +564,7 @@ impl SessionMemory {
             audit_path,
             pin_state_path,
             next_sequence: AtomicU64::new(item_count),
+            next_turn_sequence: AtomicU64::new(turn_count),
             append_lock: AsyncMutex::new(()),
             audit_append_lock: AsyncMutex::new(()),
             dedupe_lock: AsyncMutex::new(()),
@@ -491,6 +572,8 @@ impl SessionMemory {
             index: Mutex::new(index),
             pin_overrides: Mutex::new(pin_overrides),
             cache: Mutex::new(HotCache::new(cache_size)),
+            needs_encryption_migration: cipher.is_some() && has_plaintext_records,
+            cipher,
         })
     }
 
@@ -503,6 +586,7 @@ impl SessionMemory {
             pinned,
             parent_id,
             metadata,
+            turn_id,
         } = item;
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let id = format!(
@@ -522,10 +606,7 @@ impl SessionMemory {
             parent_id,
             metadata,
         };
-        let item = MemoryItem {
-            pointer: pointer.clone(),
-            content: content.clone(),
-        };
+        let item = self.encode_item(pointer.clone(), turn_id.clone(), &content)?;
         let (offset, length) = self.append(&StoreRecord::Item { item }).await?;
 
         let mut index = self.index.lock().unwrap_or_else(|error| error.into_inner());
@@ -538,14 +619,12 @@ impl SessionMemory {
                 MemoryKind::ToolResult | MemoryKind::FileSnapshot => {
                     index
                         .tool_fingerprints
-                        .entry(fingerprint.clone())
-                        .or_insert_with(|| id.clone());
+                        .insert(fingerprint.clone(), id.clone());
                 }
                 MemoryKind::Message | MemoryKind::Decision | MemoryKind::Summary => {
                     index
                         .message_fingerprints
-                        .entry(fingerprint.clone())
-                        .or_insert_with(|| id.clone());
+                        .insert(fingerprint.clone(), id.clone());
                 }
             }
         }
@@ -555,6 +634,7 @@ impl SessionMemory {
                 offset,
                 length,
                 pointer: pointer.clone(),
+                turn_id,
             },
         );
         drop(index);
@@ -563,6 +643,180 @@ impl SessionMemory {
             .unwrap_or_else(|error| error.into_inner())
             .insert(id, content);
         Ok(pointer)
+    }
+
+    fn encode_item(
+        &self,
+        pointer: MemoryPointer,
+        turn_id: Option<String>,
+        content: &str,
+    ) -> Result<MemoryItem> {
+        let (content, encryption) = match &self.cipher {
+            Some(cipher) => {
+                let (content, encryption) = cipher.encrypt(&pointer.id, content)?;
+                (content, Some(encryption))
+            }
+            None => (content.to_owned(), None),
+        };
+        Ok(MemoryItem {
+            pointer,
+            turn_id,
+            encryption,
+            content,
+        })
+    }
+
+    async fn enforce_retention(
+        &self,
+        max_records: usize,
+        max_store_bytes: u64,
+        retention_days: u64,
+        protected: &HashSet<String>,
+    ) -> Result<bool> {
+        let visible = self.pointers(None);
+        let indexed_records = self
+            .index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entries
+            .len();
+        let store_bytes = match tokio::fs::metadata(&self.records_path).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", self.records_path.display()));
+            }
+        };
+        let retention_days = i64::try_from(retention_days).unwrap_or(i64::MAX);
+        let cutoff = OffsetDateTime::now_utc()
+            .checked_sub(time::Duration::days(retention_days))
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+        let is_expired = |pointer: &MemoryPointer| {
+            !pointer.pinned
+                && !protected.contains(&pointer.id)
+                && OffsetDateTime::parse(&pointer.created_at, &Rfc3339)
+                    .is_ok_and(|created_at| created_at < cutoff)
+        };
+        let needs_rewrite = indexed_records != visible.len()
+            || visible.len() > max_records
+            || store_bytes > max_store_bytes
+            || visible.iter().any(is_expired)
+            || self.needs_encryption_migration;
+        if !needs_rewrite {
+            return Ok(false);
+        }
+
+        let retained_by_age = visible
+            .into_iter()
+            .filter(|pointer| !is_expired(pointer))
+            .collect::<Vec<_>>();
+        let protected_count = retained_by_age
+            .iter()
+            .filter(|pointer| pointer.pinned || protected.contains(&pointer.id))
+            .count();
+        let unprotected_limit = max_records.saturating_sub(protected_count);
+        let retained_unpinned = retained_by_age
+            .iter()
+            .rev()
+            .filter(|pointer| !pointer.pinned && !protected.contains(&pointer.id))
+            .take(unprotected_limit)
+            .map(|pointer| pointer.id.clone())
+            .collect::<HashSet<_>>();
+        let retained_by_count = retained_by_age
+            .into_iter()
+            .filter(|pointer| {
+                pointer.pinned
+                    || protected.contains(&pointer.id)
+                    || retained_unpinned.contains(&pointer.id)
+            })
+            .collect::<Vec<_>>();
+
+        let mut encoded = Vec::with_capacity(retained_by_count.len());
+        for mut pointer in retained_by_count {
+            let (_, content) = self
+                .read(&pointer.id, None)
+                .await?
+                .with_context(|| format!("retained memory {} disappeared", pointer.id))?;
+            if self.cipher.is_some() {
+                pointer.metadata.remove("preview");
+            }
+            let item = self.encode_item(pointer.clone(), None, &content)?;
+            let mut line = serde_json::to_vec(&StoreRecord::Item { item })
+                .context("failed to serialize retained memory record")?;
+            line.push(b'\n');
+            encoded.push((pointer, line));
+        }
+
+        let protected_bytes = encoded
+            .iter()
+            .filter(|(pointer, _)| pointer.pinned || protected.contains(&pointer.id))
+            .map(|(_, line)| line.len() as u64)
+            .sum::<u64>();
+        let mut available = max_store_bytes.saturating_sub(protected_bytes);
+        let retained_unpinned = encoded
+            .iter()
+            .rev()
+            .filter(|(pointer, _)| !pointer.pinned && !protected.contains(&pointer.id))
+            .filter_map(|(pointer, line)| {
+                let length = line.len() as u64;
+                if length > available {
+                    return None;
+                }
+                available -= length;
+                Some(pointer.id.clone())
+            })
+            .collect::<HashSet<_>>();
+        let mut content = Vec::new();
+        let mut retained_ids = HashSet::new();
+        for (pointer, line) in encoded {
+            if pointer.pinned
+                || protected.contains(&pointer.id)
+                || retained_unpinned.contains(&pointer.id)
+            {
+                retained_ids.insert(pointer.id);
+                content.extend_from_slice(&line);
+            }
+        }
+        let overrides = {
+            let overrides = self
+                .pin_overrides
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            overrides
+                .iter()
+                .filter(|(id, _)| retained_ids.contains(*id))
+                .map(|(id, pinned)| (id.clone(), *pinned))
+                .collect::<BTreeMap<_, _>>()
+        };
+        self.persist_pin_state(&overrides).await?;
+        atomic_write(&self.records_path, &content)
+            .await
+            .with_context(|| format!("failed to compact {}", self.records_path.display()))?;
+        *self
+            .pin_overrides
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = overrides;
+        Ok(true)
+    }
+
+    fn allocate_turn_id(&self) -> String {
+        let sequence = self.next_turn_sequence.fetch_add(1, Ordering::Relaxed);
+        format!("tx-{:016x}-{sequence:08x}", self.session_hash)
+    }
+
+    async fn finish_turn(&self, turn_id: &str, state: MemoryTurnState) -> Result<()> {
+        self.append(&StoreRecord::Turn {
+            turn_id: turn_id.to_owned(),
+            state,
+        })
+        .await?;
+        self.index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .turn_states
+            .insert(turn_id.to_owned(), state);
+        Ok(())
     }
 
     async fn append(&self, record: &StoreRecord) -> Result<(u64, usize)> {
@@ -595,11 +849,27 @@ impl SessionMemory {
         file.flush()
             .await
             .with_context(|| format!("failed to flush {}", self.records_path.display()))?;
+        file.sync_data()
+            .await
+            .with_context(|| format!("failed to sync {}", self.records_path.display()))?;
         Ok((offset, line.len()))
     }
 
     async fn append_audit(&self, audit: AuditEvent) -> Result<()> {
-        let mut line = serde_json::to_vec(&audit).context("failed to serialize memory audit")?;
+        let mut line = match &self.cipher {
+            Some(cipher) => {
+                let audit =
+                    serde_json::to_string(&audit).context("failed to serialize memory audit")?;
+                let (content, encryption) = cipher.encrypt("audit", &audit)?;
+                serde_json::to_vec(&EncryptedAuditEvent {
+                    format: 1,
+                    encryption,
+                    content,
+                })
+                .context("failed to serialize encrypted memory audit")?
+            }
+            None => serde_json::to_vec(&audit).context("failed to serialize memory audit")?,
+        };
         line.push(b'\n');
         let _append = self.audit_append_lock.lock().await;
         tokio::fs::create_dir_all(&self.directory)
@@ -623,6 +893,9 @@ impl SessionMemory {
         file.flush()
             .await
             .with_context(|| format!("failed to flush {}", self.audit_path.display()))?;
+        file.sync_data()
+            .await
+            .with_context(|| format!("failed to sync {}", self.audit_path.display()))?;
         Ok(())
     }
 
@@ -689,12 +962,19 @@ impl SessionMemory {
         Ok(())
     }
 
-    async fn read(&self, id: &str) -> Result<Option<(MemoryPointer, Arc<String>)>> {
+    async fn read(
+        &self,
+        id: &str,
+        active_turn: Option<&str>,
+    ) -> Result<Option<(MemoryPointer, Arc<String>)>> {
         let pointer = {
             let index = self.index.lock().unwrap_or_else(|error| error.into_inner());
             let Some(location) = index.entries.get(id) else {
                 return Ok(None);
             };
+            if !Self::location_is_visible(&index, location, active_turn) {
+                return Ok(None);
+            }
             location.pointer.clone()
         };
         if let Some(content) = self
@@ -727,12 +1007,21 @@ impl SessionMemory {
             .context("failed to parse indexed memory record")?
         {
             StoreRecord::Item { item } => item,
-            StoreRecord::Audit { .. } => bail!("memory index points to an audit record"),
+            StoreRecord::Turn { .. } | StoreRecord::Audit { .. } => {
+                bail!("memory index points to a non-item record")
+            }
         };
         if item.pointer.id != id {
             bail!("memory index for {id} points to {}", item.pointer.id);
         }
-        let content = Arc::new(item.content);
+        let content = Arc::new(match item.encryption {
+            Some(encryption) => self
+                .cipher
+                .as_ref()
+                .context("memory content is encrypted; set ZEX_MEMORY_ENCRYPTION_KEY to unlock it")?
+                .decrypt(id, &item.content, &encryption)?,
+            None => item.content,
+        });
         self.cache
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -740,45 +1029,73 @@ impl SessionMemory {
         Ok(Some((pointer, content)))
     }
 
-    fn pointer(&self, id: &str) -> Option<MemoryPointer> {
-        self.index
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .entries
-            .get(id)
-            .map(|entry| entry.pointer.clone())
+    fn pointer(&self, id: &str, active_turn: Option<&str>) -> Option<MemoryPointer> {
+        let index = self.index.lock().unwrap_or_else(|error| error.into_inner());
+        let location = index.entries.get(id)?;
+        Self::location_is_visible(&index, location, active_turn).then(|| location.pointer.clone())
     }
 
-    fn pointer_by_message_fingerprint(&self, fingerprint: &str) -> Option<MemoryPointer> {
+    fn pointer_by_message_fingerprint(
+        &self,
+        fingerprint: &str,
+        active_turn: Option<&str>,
+    ) -> Option<MemoryPointer> {
         let index = self.index.lock().unwrap_or_else(|error| error.into_inner());
         let id = index.message_fingerprints.get(fingerprint)?;
-        index.entries.get(id).map(|entry| entry.pointer.clone())
+        let location = index.entries.get(id)?;
+        Self::location_is_visible(&index, location, active_turn).then(|| location.pointer.clone())
     }
 
-    fn pointer_by_tool_fingerprint(&self, fingerprint: &str) -> Option<MemoryPointer> {
+    fn pointer_by_tool_fingerprint(
+        &self,
+        fingerprint: &str,
+        active_turn: Option<&str>,
+    ) -> Option<MemoryPointer> {
         let index = self.index.lock().unwrap_or_else(|error| error.into_inner());
         let id = index.tool_fingerprints.get(fingerprint)?;
-        index.entries.get(id).map(|entry| entry.pointer.clone())
+        let location = index.entries.get(id)?;
+        Self::location_is_visible(&index, location, active_turn).then(|| location.pointer.clone())
     }
 
-    fn pointers(&self) -> Vec<MemoryPointer> {
+    fn pointers(&self, active_turn: Option<&str>) -> Vec<MemoryPointer> {
         let index = self.index.lock().unwrap_or_else(|error| error.into_inner());
         index
             .order
             .iter()
             .filter_map(|id| index.entries.get(id))
+            .filter(|location| Self::location_is_visible(&index, location, active_turn))
             .map(|entry| entry.pointer.clone())
             .collect()
     }
 
-    async fn set_pinned(&self, id: &str, pinned: bool) -> Result<MemoryPointer> {
+    fn location_is_visible(
+        index: &StoreIndex,
+        location: &RecordLocation,
+        active_turn: Option<&str>,
+    ) -> bool {
+        let Some(turn_id) = location.turn_id.as_deref() else {
+            return true;
+        };
+        match index.turn_states.get(turn_id) {
+            Some(MemoryTurnState::Committed) => true,
+            Some(MemoryTurnState::Aborted) => false,
+            None => active_turn == Some(turn_id),
+        }
+    }
+
+    async fn set_pinned(
+        &self,
+        id: &str,
+        pinned: bool,
+        active_turn: Option<&str>,
+    ) -> Result<MemoryPointer> {
         let _pin = self.pin_lock.lock().await;
         let action = if pinned {
             AuditAction::Pin
         } else {
             AuditAction::Unpin
         };
-        let Some(pointer) = self.pointer(id) else {
+        let Some(pointer) = self.pointer(id, active_turn) else {
             let message = missing_id_error(id);
             self.append_audit(AuditEvent {
                 action,
@@ -842,6 +1159,35 @@ impl SessionMemory {
         Ok(updated)
     }
 
+    async fn enforce_auto_pin_limit(&self, limit: usize, active_turn: Option<&str>) -> Result<()> {
+        let explicit = self
+            .pin_overrides
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let excess = {
+            let index = self.index.lock().unwrap_or_else(|error| error.into_inner());
+            let automatic = index
+                .order
+                .iter()
+                .filter_map(|id| index.entries.get(id))
+                .filter(|location| Self::location_is_visible(&index, location, active_turn))
+                .filter(|location| {
+                    location.pointer.pinned && !explicit.contains(&location.pointer.id)
+                })
+                .map(|location| location.pointer.id.clone())
+                .collect::<Vec<_>>();
+            let count = automatic.len().saturating_sub(limit);
+            automatic.into_iter().take(count).collect::<Vec<_>>()
+        };
+        for id in excess {
+            self.set_pinned(&id, false, active_turn).await?;
+        }
+        Ok(())
+    }
+
     async fn restore_pin_state(
         &self,
         id: &str,
@@ -890,26 +1236,9 @@ impl SessionMemory {
             overrides: overrides.clone(),
         })
         .context("failed to serialize memory pin state")?;
-        let temporary_path = self.directory.join(format!("{PIN_STATE_FILE}.tmp"));
-        tokio::fs::write(&temporary_path, content)
+        atomic_write(&self.pin_state_path, &content)
             .await
-            .with_context(|| format!("failed to write {}", temporary_path.display()))?;
-        if let Err(error) = tokio::fs::rename(&temporary_path, &self.pin_state_path).await {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                tokio::fs::remove_file(&self.pin_state_path)
-                    .await
-                    .with_context(|| {
-                        format!("failed to replace {}", self.pin_state_path.display())
-                    })?;
-                tokio::fs::rename(&temporary_path, &self.pin_state_path)
-                    .await
-                    .with_context(|| format!("failed to save {}", self.pin_state_path.display()))?;
-            } else {
-                return Err(error)
-                    .with_context(|| format!("failed to save {}", self.pin_state_path.display()));
-            }
-        }
-        Ok(())
+            .with_context(|| format!("failed to save {}", self.pin_state_path.display()))
     }
 }
 
@@ -917,6 +1246,7 @@ impl SessionMemory {
 pub struct MemoryRuntime {
     config: MemoryConfig,
     session: RwLock<Option<Arc<SessionMemory>>>,
+    active_turn: Mutex<Option<String>>,
     active_pointers: Mutex<Vec<String>>,
     recall_limiter: Mutex<RecallLimiter>,
 }
@@ -926,6 +1256,7 @@ impl MemoryRuntime {
         Self {
             config,
             session: RwLock::new(None),
+            active_turn: Mutex::new(None),
             active_pointers: Mutex::new(Vec::new()),
             recall_limiter: Mutex::new(RecallLimiter::default()),
         }
@@ -947,13 +1278,24 @@ impl MemoryRuntime {
         if !self.config.enabled {
             return Ok(());
         }
-        let session =
-            SessionMemory::open(session_id.to_owned(), directory, self.config.hot_cache_size)
-                .await?;
+        let session = SessionMemory::open(
+            session_id.to_owned(),
+            directory,
+            self.config.hot_cache_size,
+            self.config.encryption_key.as_ref(),
+        )
+        .await?;
+        session
+            .enforce_auto_pin_limit(self.config.max_auto_pins, None)
+            .await?;
         *self
             .session
             .write()
             .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(session));
+        *self
+            .active_turn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
         self.active_pointers
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -962,6 +1304,79 @@ impl MemoryRuntime {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .begin_model_turn();
+        Ok(())
+    }
+
+    pub async fn maintain(&self) -> Result<()> {
+        let session = self.active_session()?;
+        session
+            .enforce_auto_pin_limit(self.config.max_auto_pins, None)
+            .await?;
+        let protected = self
+            .active_pointers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        if !session
+            .enforce_retention(
+                self.config.max_records,
+                self.config.max_store_bytes,
+                self.config.retention_days,
+                &protected,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        let reopened = SessionMemory::open(
+            session.session_id.clone(),
+            session.directory.clone(),
+            self.config.hot_cache_size,
+            self.config.encryption_key.as_ref(),
+        )
+        .await?;
+        *self
+            .session
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(reopened));
+        Ok(())
+    }
+
+    pub fn begin_turn(&self) -> Result<()> {
+        let session = self.active_session()?;
+        let mut active_turn = self
+            .active_turn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if active_turn.is_some() {
+            bail!("addressable memory already has an active turn");
+        }
+        *active_turn = Some(session.allocate_turn_id());
+        Ok(())
+    }
+
+    pub async fn commit_turn(&self) -> Result<()> {
+        self.finish_active_turn(MemoryTurnState::Committed).await
+    }
+
+    pub async fn abort_turn(&self) -> Result<()> {
+        self.finish_active_turn(MemoryTurnState::Aborted).await
+    }
+
+    async fn finish_active_turn(&self, state: MemoryTurnState) -> Result<()> {
+        let Some(turn_id) = self.active_turn_id() else {
+            return Ok(());
+        };
+        self.active_session()?.finish_turn(&turn_id, state).await?;
+        let mut active_turn = self
+            .active_turn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if active_turn.as_deref() == Some(&turn_id) {
+            *active_turn = None;
+        }
         Ok(())
     }
 
@@ -979,15 +1394,18 @@ impl MemoryRuntime {
         content: String,
     ) -> Result<MemoryPointer> {
         let session = self.active_session()?;
+        let active_turn = self.active_turn_id();
         let fingerprint = tool_result_fingerprint(tool, arguments, &content)?;
         let _dedupe = session.dedupe_lock.lock().await;
-        if let Some(pointer) = session.pointer_by_tool_fingerprint(&fingerprint) {
+        if let Some(pointer) =
+            session.pointer_by_tool_fingerprint(&fingerprint, active_turn.as_deref())
+        {
             return Ok(pointer);
         }
         let importance = tool_importance(tool, &content);
         let mut metadata = tool_metadata(arguments);
         metadata.insert("fingerprint".to_owned(), fingerprint);
-        session
+        let pointer = session
             .store(NewMemoryItem {
                 kind: if tool == "read" {
                     MemoryKind::FileSnapshot
@@ -1000,9 +1418,17 @@ impl MemoryRuntime {
                 pinned: self.config.auto_pin_important && importance >= 85,
                 parent_id: None,
                 metadata,
+                turn_id: active_turn.clone(),
             })
             .await
-            .with_context(|| format!("failed to persist {tool} result in addressable memory"))
+            .with_context(|| format!("failed to persist {tool} result in addressable memory"))?;
+        if pointer.pinned && active_turn.is_none() {
+            session
+                .enforce_auto_pin_limit(self.config.max_auto_pins, active_turn.as_deref())
+                .await
+                .context("failed to enforce automatic memory pin limit")?;
+        }
+        Ok(pointer)
     }
 
     pub async fn store_message(
@@ -1012,14 +1438,19 @@ impl MemoryRuntime {
         content: String,
     ) -> Result<MemoryPointer> {
         let session = self.active_session()?;
+        let active_turn = self.active_turn_id();
         let fingerprint = message_fingerprint(role, &content);
         let _dedupe = session.dedupe_lock.lock().await;
-        if let Some(pointer) = session.pointer_by_message_fingerprint(&fingerprint) {
+        if let Some(pointer) =
+            session.pointer_by_message_fingerprint(&fingerprint, active_turn.as_deref())
+        {
             return Ok(pointer);
         }
         let mut metadata = BTreeMap::new();
         metadata.insert("role".to_owned(), role.to_owned());
-        metadata.insert("preview".to_owned(), one_line_preview(&content, 96));
+        if self.config.encryption_key.is_none() {
+            metadata.insert("preview".to_owned(), one_line_preview(&content, 96));
+        }
         metadata.insert("fingerprint".to_owned(), fingerprint);
         session
             .store(NewMemoryItem {
@@ -1030,6 +1461,7 @@ impl MemoryRuntime {
                 pinned: false,
                 parent_id: None,
                 metadata,
+                turn_id: active_turn,
             })
             .await
             .context("failed to persist compacted conversation in addressable memory")
@@ -1057,14 +1489,18 @@ impl MemoryRuntime {
     }
 
     pub fn citation_for_id(&self, id: &str) -> Option<String> {
+        let active_turn = self.active_turn_id();
         self.active_session()
             .ok()?
-            .pointer(id)
+            .pointer(id, active_turn.as_deref())
             .map(|pointer| self.citation(&pointer))
     }
 
     pub fn pointer_for_id(&self, id: &str) -> Option<MemoryPointer> {
-        self.active_session().ok()?.pointer(id)
+        let active_turn = self.active_turn_id();
+        self.active_session()
+            .ok()?
+            .pointer(id, active_turn.as_deref())
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -1075,10 +1511,13 @@ impl MemoryRuntime {
         let Ok(session) = self.active_session() else {
             return;
         };
+        let active_turn = self.active_turn_id();
         let mut seen = HashSet::new();
         let active = ids
             .into_iter()
-            .filter(|id| seen.insert(id.clone()) && session.pointer(id).is_some())
+            .filter(|id| {
+                seen.insert(id.clone()) && session.pointer(id, active_turn.as_deref()).is_some()
+            })
             .collect();
         *self
             .active_pointers
@@ -1105,8 +1544,22 @@ impl MemoryRuntime {
         self.pointer_manifest(ids, ACTIVE_POINTER_LIMIT, true)
     }
 
-    pub async fn recall(&self, id: &str, reason: Option<String>) -> Result<String> {
+    pub async fn recall(
+        &self,
+        id: &str,
+        reason: Option<String>,
+        offset_tokens: Option<usize>,
+        max_tokens: Option<usize>,
+    ) -> Result<String> {
         let session = self.active_session()?;
+        let active_turn = self.active_turn_id();
+        let offset_tokens = offset_tokens.unwrap_or(0);
+        let max_tokens = max_tokens
+            .unwrap_or(self.config.max_recall_tokens)
+            .min(self.config.max_recall_tokens);
+        if max_tokens == 0 {
+            bail!("recall max_tokens must be greater than zero");
+        }
         let rate_result = self
             .recall_limiter
             .lock()
@@ -1142,7 +1595,7 @@ impl MemoryRuntime {
                 .await?;
             bail!("{message}; do not infer or invent its contents");
         }
-        let Some((pointer, content)) = session.read(id).await? else {
+        let Some((pointer, content)) = session.read(id, active_turn.as_deref()).await? else {
             let message = missing_id_error(id);
             session
                 .append_audit(AuditEvent {
@@ -1157,8 +1610,27 @@ impl MemoryRuntime {
                 .await?;
             bail!(message);
         };
-        let (returned, truncated, returned_tokens) =
-            truncate_to_token_budget(&content, self.config.max_recall_tokens);
+        if offset_tokens >= pointer.token_estimate && pointer.token_estimate > 0 {
+            let message = format!(
+                "recall offset {offset_tokens} is outside {id}, which contains approximately {} tokens",
+                pointer.token_estimate
+            );
+            session
+                .append_audit(AuditEvent {
+                    action: AuditAction::Recall,
+                    id: id.to_owned(),
+                    created_at: timestamp()?,
+                    reason,
+                    returned_tokens: None,
+                    truncated: false,
+                    error: Some(message.clone()),
+                })
+                .await?;
+            bail!(message);
+        }
+        let window = token_window(&content, offset_tokens, max_tokens);
+        let truncated = window.start > 0 || window.end < window.total;
+        let returned_tokens = window.end.saturating_sub(window.start);
         session
             .append_audit(AuditEvent {
                 action: AuditAction::Recall,
@@ -1171,14 +1643,19 @@ impl MemoryRuntime {
             })
             .await?;
         if truncated {
+            let continuation = if window.end < window.total {
+                format!("; next_offset={}", window.end)
+            } else {
+                "; end of content".to_owned()
+            };
             Ok(format!(
-                "[recalled {id}: controlled excerpt ~{returned_tokens} of ~{} tokens; the complete content remains stored at the same ID]\n{returned}",
-                pointer.token_estimate
+                "[recalled {id}: token window {}..{} of ~{} tokens{continuation}]\n{}",
+                window.start, window.end, window.total, window.content
             ))
         } else {
             Ok(format!(
-                "[recalled {id}: exact content, ~{} tokens]\n{returned}",
-                pointer.token_estimate
+                "[recalled {id}: exact content, ~{} tokens]\n{}",
+                pointer.token_estimate, window.content
             ))
         }
     }
@@ -1193,8 +1670,9 @@ impl MemoryRuntime {
         Ok(format!("Unpinned {}", self.citation(&pointer)))
     }
 
-    pub fn list_pointers(&self, filter: Option<&str>) -> Result<String> {
+    pub async fn list_pointers(&self, filter: Option<&str>) -> Result<String> {
         let session = self.active_session()?;
+        let active_turn = self.active_turn_id();
         let filter = filter.map(str::trim).filter(|filter| !filter.is_empty());
         let parsed_filter = filter.map(parse_pointer_filters).transpose()?;
         let active = self
@@ -1203,27 +1681,51 @@ impl MemoryRuntime {
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         let candidates = if filter.is_some() {
-            session.pointers()
+            session.pointers(active_turn.as_deref())
         } else {
             let active_set = active.iter().cloned().collect::<HashSet<_>>();
             let mut pointers = session
-                .pointers()
+                .pointers(active_turn.as_deref())
                 .into_iter()
                 .filter(|pointer| pointer.pinned && !active_set.contains(&pointer.id))
                 .collect::<Vec<_>>();
-            pointers.extend(active.into_iter().filter_map(|id| session.pointer(&id)));
+            pointers.extend(
+                active
+                    .into_iter()
+                    .filter_map(|id| session.pointer(&id, active_turn.as_deref())),
+            );
             pointers
         };
-        let mut matches = candidates
-            .into_iter()
-            .filter(|pointer| {
-                parsed_filter.as_ref().is_none_or(|filters| {
-                    filters
-                        .iter()
-                        .all(|filter| self.pointer_matches_filter(pointer, filter))
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut matches = Vec::new();
+        for pointer in candidates {
+            let mut content = None;
+            let mut matched = true;
+            for filter in parsed_filter.as_deref().unwrap_or_default() {
+                if self.pointer_matches_filter(&pointer, filter) {
+                    continue;
+                }
+                let PointerFilter::Text(value) = filter else {
+                    matched = false;
+                    break;
+                };
+                if content.is_none() {
+                    content = session
+                        .read(&pointer.id, active_turn.as_deref())
+                        .await?
+                        .map(|(_, content)| content);
+                }
+                if !content
+                    .as_deref()
+                    .is_some_and(|content| contains_case_insensitive(content, value))
+                {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                matches.push(pointer);
+            }
+        }
         matches.sort_by(|left, right| {
             right
                 .pinned
@@ -1238,11 +1740,21 @@ impl MemoryRuntime {
                 None => "No active or pinned addressable pointers.".to_owned(),
             });
         }
-        let mut output = matches
-            .iter()
-            .map(|pointer| format!("- {}", self.citation(pointer)))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut lines = Vec::with_capacity(matches.len());
+        for pointer in &matches {
+            let preview = session
+                .read(&pointer.id, active_turn.as_deref())
+                .await?
+                .map(|(_, content)| one_line_preview(&content, 160))
+                .unwrap_or_default();
+            let suffix = if preview.is_empty() {
+                String::new()
+            } else {
+                format!(" — {preview}")
+            };
+            lines.push(format!("- {}{suffix}", self.citation(pointer)));
+        }
+        let mut output = lines.join("\n");
         if total > matches.len() {
             output.push_str(&format!(
                 "\n- [{} more pointers omitted; pass a narrower filter]",
@@ -1304,6 +1816,7 @@ impl MemoryRuntime {
 
     async fn update_pin(&self, id: &str, pinned: bool) -> Result<MemoryPointer> {
         let session = self.active_session()?;
+        let active_turn = self.active_turn_id();
         if let Err(error) = validate_memory_id(id) {
             let message = format!("invalid memory ID {id:?}: {error}");
             session
@@ -1323,7 +1836,7 @@ impl MemoryRuntime {
                 .await?;
             bail!(message);
         }
-        session.set_pinned(id, pinned).await
+        session.set_pinned(id, pinned, active_turn.as_deref()).await
     }
 
     fn active_session(&self) -> Result<Arc<SessionMemory>> {
@@ -1337,6 +1850,13 @@ impl MemoryRuntime {
             .context("addressable memory has no active session")
     }
 
+    fn active_turn_id(&self) -> Option<String> {
+        self.active_turn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     fn pointer_manifest(
         &self,
         ids: impl IntoIterator<Item = String>,
@@ -1346,10 +1866,11 @@ impl MemoryRuntime {
         let Ok(session) = self.active_session() else {
             return Vec::new();
         };
+        let active_turn = self.active_turn_id();
         let mut seen = HashSet::new();
         let mut pinned = if include_pinned {
             session
-                .pointers()
+                .pointers(active_turn.as_deref())
                 .into_iter()
                 .filter(|pointer| pointer.pinned && seen.insert(pointer.id.clone()))
                 .collect::<Vec<_>>()
@@ -1364,7 +1885,7 @@ impl MemoryRuntime {
         let mut recent = ids
             .into_iter()
             .filter(|id| seen.insert(id.clone()))
-            .filter_map(|id| session.pointer(&id))
+            .filter_map(|id| session.pointer(&id, active_turn.as_deref()))
             .collect::<Vec<_>>();
         if recent.len() > remaining {
             let split = recent.len() - remaining;
@@ -1485,7 +2006,14 @@ fn parse_pointer_filters(filter: &str) -> Result<Vec<PointerFilter>> {
 }
 
 fn contains_case_insensitive(candidate: &str, value: &str) -> bool {
-    candidate.to_ascii_lowercase().contains(value)
+    let value = value.as_bytes();
+    if value.is_empty() {
+        return true;
+    }
+    candidate
+        .as_bytes()
+        .windows(value.len())
+        .any(|window| window.eq_ignore_ascii_case(value))
 }
 
 fn tool_metadata(arguments: &Value) -> BTreeMap<String, String> {
@@ -1596,8 +2124,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AUDIT_ARCHIVE_LIMIT, AUDIT_FILE, MemoryConfig, MemoryRuntime, PIN_STATE_FILE,
-        extract_memory_ids,
+        AUDIT_ARCHIVE_LIMIT, AUDIT_FILE, MemoryConfig, MemoryEncryptionKey, MemoryKind,
+        MemoryRuntime, PIN_STATE_FILE, extract_memory_ids,
     };
 
     fn temporary_directory(label: &str) -> PathBuf {
@@ -1634,12 +2162,23 @@ mod tests {
             vec![pointer.id.clone()]
         );
         let recalled = runtime
-            .recall(&pointer.id, Some("verify exact source".to_owned()))
+            .recall(
+                &pointer.id,
+                Some("verify exact source".to_owned()),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert!(recalled.ends_with(&content));
         assert!(runtime.pin(&pointer.id).await.unwrap().contains("Pinned"));
-        assert!(runtime.list_pointers(None).unwrap().contains(&pointer.id));
+        assert!(
+            runtime
+                .list_pointers(None)
+                .await
+                .unwrap()
+                .contains(&pointer.id)
+        );
         assert!(
             runtime
                 .unpin(&pointer.id)
@@ -1654,16 +2193,19 @@ mod tests {
         assert!(missing_pin.to_string().contains("does not exist"));
 
         let missing = runtime
-            .recall("§obs_000000000000000000000000", None)
+            .recall("§obs_000000000000000000000000", None, None, None)
             .await
             .unwrap_err();
         assert!(missing.to_string().contains("does not exist"));
 
         runtime.begin_model_turn();
         for _ in 0..3 {
-            runtime.recall(&pointer.id, None).await.unwrap();
+            runtime.recall(&pointer.id, None, None, None).await.unwrap();
         }
-        let limited = runtime.recall(&pointer.id, None).await.unwrap_err();
+        let limited = runtime
+            .recall(&pointer.id, None, None, None)
+            .await
+            .unwrap_err();
         assert!(limited.to_string().contains("rate limit exceeded"));
 
         let records_path = runtime.records_path().unwrap();
@@ -1688,7 +2230,10 @@ mod tests {
             .activate("20260815-120000-deadbeef", directory.clone())
             .await
             .unwrap();
-        let recalled = reopened.recall(&pointer.id, None).await.unwrap();
+        let recalled = reopened
+            .recall(&pointer.id, None, None, None)
+            .await
+            .unwrap();
         assert!(recalled.ends_with(&content));
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
@@ -1713,10 +2258,60 @@ mod tests {
             .await
             .unwrap();
 
-        let recalled = runtime.recall(&pointer.id, None).await.unwrap();
+        let recalled = runtime.recall(&pointer.id, None, None, None).await.unwrap();
 
-        assert!(recalled.contains("controlled excerpt"));
+        assert!(recalled.contains("token window"));
         assert!(crate::agent::estimate_tokens(&recalled) < 96);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recall_pages_to_middle_and_tail_windows() {
+        let directory = temporary_directory("paged");
+        let runtime = MemoryRuntime::new(MemoryConfig {
+            recall_rate_limit: 10,
+            max_recall_tokens: 16,
+            ..MemoryConfig::default()
+        });
+        runtime
+            .activate("20260815-120000-abcdef12", directory.clone())
+            .await
+            .unwrap();
+        let content = format!("{}TAIL_SENTINEL", "pageable-content ".repeat(200));
+        let pointer = runtime
+            .store_tool_result("read", &json!({"path": "paged.txt"}), content)
+            .await
+            .unwrap();
+
+        let first = runtime
+            .recall(&pointer.id, None, Some(0), Some(8))
+            .await
+            .unwrap();
+        let middle = runtime
+            .recall(&pointer.id, None, Some(8), Some(8))
+            .await
+            .unwrap();
+        let tail = runtime
+            .recall(
+                &pointer.id,
+                None,
+                Some(pointer.token_estimate.saturating_sub(16)),
+                Some(16),
+            )
+            .await
+            .unwrap();
+
+        assert!(first.contains("next_offset="));
+        assert_ne!(first, middle);
+        assert!(tail.contains("TAIL_SENTINEL"));
+
+        runtime.begin_model_turn();
+        let error = runtime
+            .recall(&pointer.id, None, Some(pointer.token_estimate), Some(8))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outside"));
+
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
@@ -1763,18 +2358,233 @@ mod tests {
 
         let read_matches = runtime
             .list_pointers(Some("tool=read path=src/main.rs kind=file_snapshot"))
+            .await
             .unwrap();
         assert!(read_matches.contains(&first.id));
         assert!(!read_matches.contains(&search.id));
         let grep_matches = runtime
             .list_pointers(Some("tool=grep pattern=needle"))
+            .await
             .unwrap();
         assert!(grep_matches.contains(&search.id));
-        let invalid = runtime.list_pointers(Some("unknown=value")).unwrap_err();
+        let content_matches = runtime.list_pointers(Some("same source")).await.unwrap();
+        assert!(content_matches.contains(&first.id));
+        assert!(content_matches.contains("same source"));
+        let invalid = runtime
+            .list_pointers(Some("unknown=value"))
+            .await
+            .unwrap_err();
         assert!(
             invalid
                 .to_string()
                 .contains("unsupported pointer filter field")
+        );
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_pins_are_bounded_without_evicting_manual_pins() {
+        let directory = temporary_directory("pin-lifecycle");
+        let runtime = MemoryRuntime::new(MemoryConfig {
+            max_auto_pins: 1,
+            ..MemoryConfig::default()
+        });
+        runtime
+            .activate("20260815-120000-31323334", directory.clone())
+            .await
+            .unwrap();
+        let first = runtime
+            .store_tool_result(
+                "write",
+                &json!({"path": "first.txt"}),
+                "first write".to_owned(),
+            )
+            .await
+            .unwrap();
+        let second = runtime
+            .store_tool_result(
+                "edit",
+                &json!({"path": "second.txt"}),
+                "second edit".to_owned(),
+            )
+            .await
+            .unwrap();
+        assert!(!runtime.pointer_for_id(&first.id).unwrap().pinned);
+        assert!(runtime.pointer_for_id(&second.id).unwrap().pinned);
+
+        runtime.pin(&first.id).await.unwrap();
+        let third = runtime
+            .store_tool_result(
+                "write",
+                &json!({"path": "third.txt"}),
+                "third write".to_owned(),
+            )
+            .await
+            .unwrap();
+        assert!(runtime.pointer_for_id(&first.id).unwrap().pinned);
+        assert!(!runtime.pointer_for_id(&second.id).unwrap().pinned);
+        assert!(runtime.pointer_for_id(&third.id).unwrap().pinned);
+
+        runtime.begin_turn().unwrap();
+        let aborted = runtime
+            .store_tool_result(
+                "edit",
+                &json!({"path": "aborted.txt"}),
+                "aborted edit".to_owned(),
+            )
+            .await
+            .unwrap();
+        runtime.abort_turn().await.unwrap();
+        runtime.maintain().await.unwrap();
+        assert!(runtime.pointer_for_id(&aborted.id).is_none());
+        assert!(runtime.pointer_for_id(&third.id).unwrap().pinned);
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_compacts_records_but_preserves_active_pointers() {
+        let directory = temporary_directory("retention");
+        let runtime = MemoryRuntime::new(MemoryConfig {
+            max_records: 10,
+            max_store_bytes: 2_500,
+            ..MemoryConfig::default()
+        });
+        runtime
+            .activate("20260815-120000-41424344", directory.clone())
+            .await
+            .unwrap();
+        let mut pointers = Vec::new();
+        for index in 0..4 {
+            pointers.push(
+                runtime
+                    .store_tool_result(
+                        "read",
+                        &json!({"path": format!("{index}.txt")}),
+                        format!("record {index} {}", "x".repeat(1_600)),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        runtime.set_active_pointers([pointers[0].id.clone(), pointers[3].id.clone()]);
+        runtime.maintain().await.unwrap();
+
+        assert!(runtime.contains(&pointers[0].id));
+        assert!(runtime.contains(&pointers[3].id));
+        assert!(!runtime.contains(&pointers[1].id));
+        assert!(!runtime.contains(&pointers[2].id));
+        let records = tokio::fs::read_to_string(runtime.records_path().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(records.lines().count(), 2);
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn encrypted_memory_never_writes_plaintext_and_requires_the_key() {
+        let directory = temporary_directory("encrypted");
+        let session_id = "20260815-120000-51525354";
+        let key = MemoryEncryptionKey::new("correct horse battery staple".to_owned()).unwrap();
+        let config = MemoryConfig {
+            encryption_key: Some(key.clone()),
+            ..MemoryConfig::default()
+        };
+        let runtime = MemoryRuntime::new(config.clone());
+        runtime
+            .activate(session_id, directory.clone())
+            .await
+            .unwrap();
+        let secret = "private observation that must stay encrypted";
+        let pointer = runtime
+            .store_tool_result("read", &json!({"path": "secret.txt"}), secret.to_owned())
+            .await
+            .unwrap();
+        let stored = tokio::fs::read_to_string(runtime.records_path().unwrap())
+            .await
+            .unwrap();
+        assert!(!stored.contains(secret));
+        assert!(stored.contains("\"encryption\""));
+        drop(runtime);
+
+        let reopened = MemoryRuntime::new(config);
+        reopened
+            .activate(session_id, directory.clone())
+            .await
+            .unwrap();
+        assert!(
+            reopened
+                .recall(
+                    &pointer.id,
+                    Some("private audit reason".to_owned()),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .ends_with(secret)
+        );
+        let audit = tokio::fs::read_to_string(directory.join(AUDIT_FILE))
+            .await
+            .unwrap();
+        assert!(!audit.contains("private audit reason"));
+        assert!(audit.contains("\"encryption\""));
+        drop(reopened);
+
+        let locked = MemoryRuntime::new(MemoryConfig::default());
+        let error = locked
+            .activate(session_id, directory.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ZEX_MEMORY_ENCRYPTION_KEY"));
+
+        let wrong_key = MemoryRuntime::new(MemoryConfig {
+            encryption_key: MemoryEncryptionKey::new("wrong key".to_owned()),
+            ..MemoryConfig::default()
+        });
+        let error = wrong_key
+            .activate(session_id, directory.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("authentication failed"));
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabling_encryption_migrates_existing_memory_records() {
+        let directory = temporary_directory("encryption-migration");
+        let session_id = "20260815-120000-61626364";
+        let secret = "legacy plaintext memory";
+        let plain = MemoryRuntime::new(MemoryConfig::default());
+        plain.activate(session_id, directory.clone()).await.unwrap();
+        let pointer = plain
+            .store_message(MemoryKind::Message, "user", secret.to_owned())
+            .await
+            .unwrap();
+        drop(plain);
+
+        let encrypted = MemoryRuntime::new(MemoryConfig {
+            encryption_key: MemoryEncryptionKey::new("migration key".to_owned()),
+            ..MemoryConfig::default()
+        });
+        encrypted
+            .activate(session_id, directory.clone())
+            .await
+            .unwrap();
+        encrypted.maintain().await.unwrap();
+        let stored = tokio::fs::read_to_string(encrypted.records_path().unwrap())
+            .await
+            .unwrap();
+        assert!(!stored.contains(secret));
+        assert!(
+            encrypted
+                .recall(&pointer.id, None, None, None)
+                .await
+                .unwrap()
+                .ends_with(secret)
         );
 
         tokio::fs::remove_dir_all(directory).await.unwrap();

@@ -52,6 +52,10 @@ impl OpenAiProvider {
         })
     }
 
+    pub(crate) fn api(&self) -> OpenAiApi {
+        self.api
+    }
+
     pub(crate) fn prepare_normalized(
         &self,
         model: &str,
@@ -202,6 +206,26 @@ fn parse_models_response(body: &[u8]) -> Result<Vec<String>> {
 impl Provider for OpenAiProvider {
     type Request = OpenAiPreparedRequest;
 
+    fn sanitize_history(&self, model: &str, messages: &[Message]) -> Vec<Message> {
+        let source = crate::provider::ProviderStateSource::new(
+            self.endpoint.clone(),
+            model.to_owned(),
+            self.api,
+        );
+        crate::provider::sanitize_history_provider_states(messages, Some(&source))
+    }
+
+    fn encode_provider_state(&self, model: &str, state: Value) -> Option<Value> {
+        Some(crate::provider::encode_provider_state(
+            &crate::provider::ProviderStateSource::new(
+                self.endpoint.clone(),
+                model.to_owned(),
+                self.api,
+            ),
+            state,
+        ))
+    }
+
     fn prepare_request(
         &self,
         model: &str,
@@ -215,6 +239,11 @@ impl Provider for OpenAiProvider {
         let messages = crate::provider::sanitize_messages(
             messages,
             capabilities.supports_interleaved_thinking,
+            Some(&crate::provider::ProviderStateSource::new(
+                self.endpoint.clone(),
+                model.to_owned(),
+                self.api,
+            )),
         );
         self.prepare_normalized(model, &thinking, &messages, tools, max_output_tokens)
     }

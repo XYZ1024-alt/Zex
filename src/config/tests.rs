@@ -31,6 +31,11 @@ const TEST_ENV: &[&str] = &[
     "ZEX_MEMORY_MAX_RECALL_TOKENS",
     "ZEX_MEMORY_HOT_CACHE_SIZE",
     "ZEX_MEMORY_AUTO_PIN_IMPORTANT",
+    "ZEX_MEMORY_MAX_AUTO_PINS",
+    "ZEX_MEMORY_MAX_RECORDS",
+    "ZEX_MEMORY_MAX_STORE_BYTES",
+    "ZEX_MEMORY_RETENTION_DAYS",
+    "ZEX_MEMORY_ENCRYPTION_KEY",
     "ZEX_DEFAULT_THINKING_LEVEL",
     "ZEX_HIDE_THINKING_BLOCK",
     "ZEX_SESSION_DIR",
@@ -578,6 +583,10 @@ recall_rate_limit = 4
 max_recall_tokens = 1024
 hot_cache_size = 8
 auto_pin_important = false
+max_auto_pins = 16
+max_records = 500
+max_store_bytes = 1048576
+retention_days = 60
 "#,
     )
     .await;
@@ -588,12 +597,15 @@ auto_pin_important = false
 enabled = false
 mode = "pointer_priority"
 max_recall_tokens = 2048
+max_records = 250
 "#,
     )
     .await;
     unsafe {
         std::env::set_var("ZEX_MEMORY_ENABLED", "true");
         std::env::set_var("ZEX_MEMORY_RECALL_RATE_LIMIT", "7");
+        std::env::set_var("ZEX_MEMORY_MAX_AUTO_PINS", "8");
+        std::env::set_var("ZEX_MEMORY_ENCRYPTION_KEY", "test-only-secret");
     }
 
     let config = Config::load_from(&project, &global).await.unwrap();
@@ -607,6 +619,11 @@ max_recall_tokens = 2048
     assert_eq!(config.memory.max_recall_tokens, 2_048);
     assert_eq!(config.memory.hot_cache_size, 8);
     assert!(!config.memory.auto_pin_important);
+    assert_eq!(config.memory.max_auto_pins, 8);
+    assert_eq!(config.memory.max_records, 250);
+    assert_eq!(config.memory.max_store_bytes, 1_048_576);
+    assert_eq!(config.memory.retention_days, 60);
+    assert!(config.memory.encryption_key.is_some());
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 

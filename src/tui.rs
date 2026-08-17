@@ -383,7 +383,7 @@ async fn run_loop(
                                     }
                                 }
                                 Ok(None) => {
-                                    run_turn(
+                                    let completed = run_turn(
                                         terminal,
                                         &mut app,
                                         agent,
@@ -392,6 +392,18 @@ async fn run_loop(
                                         prompt,
                                     )
                                     .await?;
+                                    if completed {
+                                        *session_id = Some(
+                                            session_store
+                                                .save(
+                                                    session_id.as_deref(),
+                                                    agent.model(),
+                                                    agent.thinking_preference(),
+                                                    agent.messages(),
+                                                )
+                                                .await?,
+                                        );
+                                    }
                                     app.sync_agent_status(agent, session_id.as_deref());
                                 }
                                 Err(error) => app.record_error(format!("{error:#}")),
@@ -505,7 +517,7 @@ async fn run_turn<P>(
     event_receiver: &mut mpsc::UnboundedReceiver<AgentEvent>,
     terminal_events: &mut EventStream,
     prompt: String,
-) -> Result<()>
+) -> Result<bool>
 where
     P: Provider,
 {
@@ -538,6 +550,8 @@ where
                         if app.busy {
                             app.finish_turn(Status::Idle);
                         }
+                        draw_frame(terminal, app)?;
+                        return Ok(true);
                     }
                     Ok(PromptOutcome::Cancelled) => {
                         if app.busy {
@@ -550,7 +564,7 @@ where
                     }
                 }
                 draw_frame(terminal, app)?;
-                return Ok(());
+                return Ok(false);
             }
             event = event_receiver.recv() => {
                 match event {
@@ -587,7 +601,7 @@ where
                     Some(Err(error)) => {
                         return Err(error).context("failed to read terminal event");
                     }
-                    None => return Ok(()),
+                    None => return Ok(false),
                 }
                 dirty = true;
             }

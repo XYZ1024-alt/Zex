@@ -25,6 +25,10 @@ struct RecallArguments {
     id: String,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    offset_tokens: Option<usize>,
+    #[serde(default)]
+    max_tokens: Option<usize>,
 }
 
 impl Tool for RecallTool {
@@ -42,6 +46,16 @@ impl Tool for RecallTool {
                     "reason": {
                         "type": "string",
                         "description": "Optional short explanation of the decision that requires exact content"
+                    },
+                    "offset_tokens": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Optional zero-based token offset for paginating a large record; use next_offset from the previous recall"
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional requested window size, capped by memory.max_recall_tokens"
                     }
                 },
                 "required": ["id"],
@@ -55,7 +69,14 @@ impl Tool for RecallTool {
             let arguments: RecallArguments =
                 serde_json::from_value(arguments).context("invalid recall arguments")?;
             Ok(ToolOutcome::output_only(
-                self.memory.recall(&arguments.id, arguments.reason).await?,
+                self.memory
+                    .recall(
+                        &arguments.id,
+                        arguments.reason,
+                        arguments.offset_tokens,
+                        arguments.max_tokens,
+                    )
+                    .await?,
             ))
         })
     }
@@ -144,7 +165,7 @@ impl Tool for ListPointersTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_pointers".to_owned(),
-            description: "List valid addressable memory IDs. Without a filter it shows active and pinned pointers. A filter may contain plain text or structured terms such as tool=read, path=src/main.rs, kind=file_snapshot, role=user, pinned=true, or multiple AND-combined terms. Use this before recall when the exact ID is not visible. Do not use it as semantic search or repeatedly enumerate the whole store.".to_owned(),
+            description: "List valid addressable memory IDs with bounded content previews. Without a filter it shows active and pinned pointers. Plain-text filters search metadata and full stored content; structured terms such as tool=read, path=src/main.rs, kind=file_snapshot, role=user, or pinned=true may be AND-combined. Use this before recall when the exact ID is not visible. This is substring search, not semantic search.".to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -163,7 +184,9 @@ impl Tool for ListPointersTool {
             let arguments: ListArguments =
                 serde_json::from_value(arguments).context("invalid list_pointers arguments")?;
             Ok(ToolOutcome::output_only(
-                self.memory.list_pointers(arguments.filter.as_deref())?,
+                self.memory
+                    .list_pointers(arguments.filter.as_deref())
+                    .await?,
             ))
         })
     }

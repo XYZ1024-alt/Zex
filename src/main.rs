@@ -8,7 +8,7 @@ use zex::{
     cli::{Cli, Command},
     config::Config,
     headless,
-    memory::MemoryRuntime,
+    memory::{MemoryEncryptionKey, MemoryRuntime},
     provider::ProviderRegistry,
     session::{SessionStore, format_session_summaries},
     tools::{
@@ -21,7 +21,10 @@ use zex::{
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let session_store = SessionStore::new(Config::session_dir().await?);
+    let session_store = SessionStore::with_encryption(
+        Config::session_dir().await?,
+        MemoryEncryptionKey::from_environment(),
+    );
 
     if matches!(&cli.command, Some(Command::Sessions)) {
         print_sessions(&session_store).await?;

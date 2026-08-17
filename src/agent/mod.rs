@@ -7,4 +7,4 @@ pub use change::{CHANGE_MAX_BYTES, FileChange, change_counts, changed_line_range
 pub use event::{AgentEvent, EventSender, MessageRole};
 pub use r#loop::{Agent, AgentOptions, CompactStats};
 pub use message::{AssistantMessage, CompletionUsage, Message, PromptOutcome, ToolCall};
-pub(crate) use message::{estimate_tokens, truncate_to_token_budget};
+pub(crate) use message::{estimate_tokens, token_window};

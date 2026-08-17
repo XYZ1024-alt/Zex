@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::{
     agent::{
         AgentEvent, AssistantMessage, EventSender, Message, MessageRole, PromptOutcome,
-        estimate_tokens,
+        estimate_tokens, token_window,
     },
     memory::{MemoryKind, MemoryMode, MemoryPointer, MemoryRuntime, extract_memory_ids},
     provider::{PreparedRequest, Provider, ThinkingLevel, ToolDefinition},
@@ -33,7 +33,7 @@ const AUTO_COMPACT_PERCENT: usize = 85;
 const OUTPUT_RESERVE_TOKENS: u64 = 8_192;
 const SUMMARY_ITEM_CHARS: usize = 480;
 const POINTER_SUMMARY_ITEM_CHARS: usize = 180;
-const SUMMARY_MAX_CHARS: usize = 12_000;
+const SUMMARY_MAX_TOKENS: usize = 3_072;
 const TOOL_SUMMARY_EDGE_CHARS: usize = 180;
 const ANCHOR_MAX_CHARS: usize = 4_000;
 const PRUNE_KEEP_TOOL_RESULTS: usize = 4;
@@ -92,11 +92,15 @@ where
         messages: Option<Vec<Message>>,
     ) -> Self {
         let memory = tools.memory().cloned();
+        let messages = provider.sanitize_history(
+            &options.model,
+            &normalize_messages(messages.unwrap_or_default()),
+        );
         let mut agent = Self {
             provider,
             tools,
             model: options.model,
-            messages: normalize_messages(messages.unwrap_or_default()),
+            messages,
             events,
             turn_timeout: options.turn_timeout,
             max_turns: options.max_turns,
@@ -119,6 +123,8 @@ where
 
     pub fn set_model(&mut self, model: String) {
         self.model = model;
+        self.messages = self.provider.sanitize_history(&self.model, &self.messages);
+        self.sync_memory_context();
     }
 
     pub fn thinking_level(&self) -> ThinkingLevel {
@@ -194,7 +200,9 @@ where
     }
 
     pub async fn replace_messages(&mut self, messages: Vec<Message>) -> Result<()> {
-        self.messages = normalize_messages(messages);
+        self.messages = self
+            .provider
+            .sanitize_history(&self.model, &normalize_messages(messages));
         self.initialize_memory().await?;
         let definitions = self.tools.definitions();
         let _ = self.prepare_with_compaction(&definitions).await?;
@@ -276,6 +284,11 @@ where
             }
         }
         self.sync_memory_context();
+        memory
+            .maintain()
+            .await
+            .context("failed to maintain addressable memory")?;
+        self.sync_memory_context();
         Ok(())
     }
 
@@ -293,9 +306,46 @@ where
         let definitions = self.tools.definitions();
         self.sync_memory_context();
         let request = self.prepare_request(&definitions)?;
-        let (stats, request) = self.compact_prepared(&definitions, request).await?;
+        let (stats, request) = self
+            .reduce_prepared_context(&definitions, request, true)
+            .await?;
         self.ensure_request_fits(&request)?;
         Ok(stats)
+    }
+
+    async fn reduce_prepared_context(
+        &mut self,
+        definitions: &[ToolDefinition],
+        mut request: PreparedRequest<P::Request>,
+        force_compaction: bool,
+    ) -> Result<(CompactStats, PreparedRequest<P::Request>)> {
+        let before_tokens = request.input_tokens();
+        let threshold = self.context_budget().saturating_mul(AUTO_COMPACT_PERCENT) / 100;
+        let pruned_tool_outputs = prune_tool_outputs(&mut self.messages, self.memory.as_deref());
+        if pruned_tool_outputs > 0 {
+            self.sync_memory_context();
+            request = self.prepare_request(definitions)?;
+        }
+        let (mut stats, request) = if force_compaction || request.input_tokens() >= threshold {
+            self.compact_prepared(definitions, request).await?
+        } else {
+            (
+                CompactStats {
+                    before_tokens,
+                    after_tokens: request.input_tokens(),
+                    freed_tokens: before_tokens.saturating_sub(request.input_tokens()),
+                    kept_turns: 0,
+                    summarized_turns: 0,
+                    summarized_tool_outputs: 0,
+                    pruned_tool_outputs: 0,
+                },
+                request,
+            )
+        };
+        stats.before_tokens = before_tokens;
+        stats.freed_tokens = before_tokens.saturating_sub(stats.after_tokens);
+        stats.pruned_tool_outputs = pruned_tool_outputs;
+        Ok((stats, request))
     }
 
     async fn compact_prepared(
@@ -307,6 +357,7 @@ where
         let before_tokens = request.input_tokens();
         let mut current_tokens = before_tokens;
         let mut keep_turns = self.compact_keep_turns;
+        let summary_token_budget = (budget / 4).clamp(1, SUMMARY_MAX_TOKENS);
         let mut stats = CompactStats {
             before_tokens,
             after_tokens: before_tokens,
@@ -321,6 +372,7 @@ where
             let next = compact_messages(
                 &mut self.messages,
                 keep_turns,
+                summary_token_budget,
                 self.memory.as_deref(),
                 &archived,
             );
@@ -495,9 +547,17 @@ where
         let checkpoint = self.messages.len();
         let prompt = prompt.into();
         if let Some(memory) = &self.memory {
-            memory
+            memory.begin_turn()?;
+            if let Err(error) = memory
                 .store_message(MemoryKind::Message, "user", prompt.clone())
-                .await?;
+                .await
+            {
+                memory
+                    .abort_turn()
+                    .await
+                    .context("failed to abort memory turn after storing the user prompt failed")?;
+                return Err(error);
+            }
         }
         self.messages.push(Message::User {
             content: prompt.clone(),
@@ -521,17 +581,56 @@ where
 
         match resolution {
             None => {
+                if let Some(memory) = &self.memory {
+                    memory
+                        .abort_turn()
+                        .await
+                        .context("failed to abort the cancelled memory turn")?;
+                }
                 retain_user_prompt(&mut self.messages, checkpoint);
                 let _ = self.events.send(AgentEvent::TurnCancelled);
                 Ok(PromptOutcome::Cancelled)
             }
             Some(result) => match result {
-                Ok(Ok(message)) => Ok(PromptOutcome::Completed(message)),
+                Ok(Ok(message)) => {
+                    if let Some(memory) = &self.memory
+                        && let Err(error) = memory.commit_turn().await
+                    {
+                        let abort_error = memory.abort_turn().await.err();
+                        retain_user_prompt(&mut self.messages, checkpoint);
+                        return Err(match abort_error {
+                            Some(abort_error) => error.context(format!(
+                                "failed to commit memory turn; abort also failed: {abort_error:#}"
+                            )),
+                            None => error.context("failed to commit memory turn"),
+                        });
+                    }
+                    if let Some(memory) = &self.memory
+                        && let Err(error) = memory.maintain().await
+                    {
+                        let _ = self.events.send(AgentEvent::Error {
+                            message: format!("addressable memory maintenance failed: {error:#}"),
+                        });
+                    }
+                    Ok(PromptOutcome::Completed(message))
+                }
                 Ok(Err(error)) => {
+                    if let Some(memory) = &self.memory {
+                        memory
+                            .abort_turn()
+                            .await
+                            .context("failed to abort memory turn after agent error")?;
+                    }
                     retain_user_prompt(&mut self.messages, checkpoint);
                     Err(error)
                 }
                 Err(_) => {
+                    if let Some(memory) = &self.memory {
+                        memory
+                            .abort_turn()
+                            .await
+                            .context("failed to abort timed-out memory turn")?;
+                    }
                     retain_user_prompt(&mut self.messages, checkpoint);
                     let message = format!(
                         "agent turn exceeded its {} second timeout",
@@ -573,7 +672,10 @@ where
                 content: assistant.content.clone(),
                 thinking: assistant.thinking.clone(),
                 tool_calls: assistant.tool_calls.clone(),
-                provider_state: assistant.provider_state.clone(),
+                provider_state: assistant
+                    .provider_state
+                    .clone()
+                    .and_then(|state| self.provider.encode_provider_state(&self.model, state)),
             };
             if let Some(memory) = &self.memory {
                 memory
@@ -677,38 +779,15 @@ where
         definitions: &[ToolDefinition],
     ) -> Result<PreparedRequest<P::Request>> {
         self.sync_memory_context();
-        let mut request = self.prepare_request(definitions)?;
+        let request = self.prepare_request(definitions)?;
         let threshold = self.context_budget().saturating_mul(AUTO_COMPACT_PERCENT) / 100;
         if request.input_tokens() < threshold {
             self.ensure_request_fits(&request)?;
             return Ok(request);
         }
-        let before_tokens = request.input_tokens();
-        let pruned_tool_outputs = prune_tool_outputs(&mut self.messages, self.memory.as_deref());
-        if pruned_tool_outputs > 0 {
-            self.sync_memory_context();
-            request = self.prepare_request(definitions)?;
-        }
-        let (mut stats, request) = if request.input_tokens() >= threshold {
-            self.compact_prepared(definitions, request).await?
-        } else {
-            let after_tokens = request.input_tokens();
-            (
-                CompactStats {
-                    before_tokens,
-                    after_tokens,
-                    freed_tokens: before_tokens.saturating_sub(after_tokens),
-                    kept_turns: 0,
-                    summarized_turns: 0,
-                    summarized_tool_outputs: 0,
-                    pruned_tool_outputs: 0,
-                },
-                request,
-            )
-        };
-        stats.before_tokens = before_tokens;
-        stats.freed_tokens = before_tokens.saturating_sub(stats.after_tokens);
-        stats.pruned_tool_outputs = pruned_tool_outputs;
+        let (stats, request) = self
+            .reduce_prepared_context(definitions, request, false)
+            .await?;
         if stats.freed_tokens > 0 {
             self.sync_memory_context();
             let _ = self.events.send(AgentEvent::ContextCompacted {
@@ -842,6 +921,7 @@ fn prune_tool_outputs(messages: &mut [Message], memory: Option<&MemoryRuntime>) 
 fn compact_messages(
     messages: &mut Vec<Message>,
     keep_turns: usize,
+    summary_token_budget: usize,
     memory: Option<&MemoryRuntime>,
     archived: &HashMap<usize, MemoryPointer>,
 ) -> CompactionResult {
@@ -854,6 +934,17 @@ fn compact_messages(
     let kept_turns = user_indices.len().min(keep_turns);
     let summarized_turns = user_indices.len().saturating_sub(kept_turns);
     if summarized_turns == 0 {
+        if existing_summary
+            && let Some(Message::System { content }) = messages.get_mut(1)
+            && let Some((header, body)) = content.split_once('\n')
+        {
+            let bounded = bounded_summary_lines(
+                body.lines().map(str::to_owned).collect(),
+                summary_token_budget,
+            )
+            .join("\n");
+            *content = format!("{header}\n{bounded}");
+        }
         return CompactionResult {
             kept_turns,
             summarized_turns: 0,
@@ -861,7 +952,7 @@ fn compact_messages(
         };
     }
 
-    let anchor_index = user_indices[0];
+    let anchor_index = (!existing_summary).then_some(user_indices[0]);
     let keep_start = user_indices[summarized_turns];
     let mode = memory.map(MemoryRuntime::mode);
     let pointer_mode = matches!(mode, Some(MemoryMode::PointerPriority | MemoryMode::Hybrid));
@@ -870,7 +961,9 @@ fn compact_messages(
     let mut pointer_ids = Vec::new();
     // Keep the original task statement visible across compactions instead of
     // reducing it to a summary line.
-    if let Message::User { content } = &messages[anchor_index] {
+    if let Some(anchor_index) = anchor_index
+        && let Message::User { content } = &messages[anchor_index]
+    {
         let pointer = archived.get(&anchor_index);
         if let Some(pointer) = pointer {
             pointer_ids.push(pointer.id.clone());
@@ -902,7 +995,7 @@ fn compact_messages(
                 summary_lines.push(format!("Prior context: {}", summarize_text(content)));
             }
             Message::System { .. } => {}
-            Message::User { content } if index != anchor_index => {
+            Message::User { content } if Some(index) != anchor_index => {
                 let pointer = archived.get(&index);
                 if let Some(pointer) = pointer {
                     pointer_ids.push(pointer.id.clone());
@@ -921,7 +1014,6 @@ fn compact_messages(
             Message::User { .. } => {}
             Message::Assistant {
                 content,
-                thinking,
                 tool_calls,
                 ..
             } => {
@@ -941,15 +1033,6 @@ fn compact_messages(
                     };
                     summary_lines.push(format!("Assistant{id}: {summary}"));
                 } else {
-                    if let Some(thinking) = thinking
-                        .as_deref()
-                        .filter(|thinking| !thinking.trim().is_empty())
-                    {
-                        summary_lines.push(format!(
-                            "Assistant{id} thinking: {}",
-                            summarize_text(thinking)
-                        ));
-                    }
                     if !content.trim().is_empty() {
                         summary_lines.push(format!("Assistant{id}: {}", summarize_text(content)));
                     }
@@ -1004,20 +1087,14 @@ fn compact_messages(
     }
 
     let total_summarized_turns = prior_summary_turns(messages).saturating_add(summarized_turns);
-    let mut summary_body = bounded_summary_lines(summary_lines).join("\n");
     if pointer_mode && let Some(memory) = memory {
         let manifest = memory.compaction_pointer_manifest(pointer_ids);
         if !manifest.is_empty() {
-            summary_body.push_str("\n[Available addressable pointers]\n");
-            summary_body.push_str(
-                &manifest
-                    .into_iter()
-                    .map(|citation| format!("- {citation}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
+            summary_lines.push("[Available addressable pointers]".to_owned());
+            summary_lines.extend(manifest.into_iter().map(|citation| format!("- {citation}")));
         }
     }
+    let summary_body = bounded_summary_lines(summary_lines, summary_token_budget).join("\n");
     let summary = Message::System {
         content: format!(
             "[Compacted earlier conversation: {} turn(s)]\n{}",
@@ -1060,33 +1137,45 @@ fn summarize_text_to(content: &str, max_chars: usize) -> String {
     truncate_middle(&content.replace(['\r', '\n'], " "), max_chars)
 }
 
-fn bounded_summary_lines(lines: Vec<String>) -> Vec<String> {
-    let total_chars = lines
+fn bounded_summary_lines(lines: Vec<String>, max_tokens: usize) -> Vec<String> {
+    let total_tokens = lines
         .iter()
-        .map(|line| line.chars().count() + 1)
+        .map(|line| estimate_tokens(line).saturating_add(1))
         .sum::<usize>();
-    if total_chars <= SUMMARY_MAX_CHARS {
+    if total_tokens <= max_tokens {
         return lines;
     }
     let Some(first) = lines.first().cloned() else {
         return lines;
     };
-    let mut remaining = SUMMARY_MAX_CHARS.saturating_sub(first.chars().count() + 1);
+    const OMITTED_MARKER: &str =
+        "[older structured summary entries omitted; exact records remain addressable]";
+    let marker_tokens = estimate_tokens(OMITTED_MARKER).saturating_add(1);
+    if max_tokens <= marker_tokens {
+        return vec![token_window(&first, 0, max_tokens).content];
+    }
+    let content_budget = max_tokens.saturating_sub(marker_tokens);
+    let first_budget = (content_budget / 2).max(1);
+    let first = token_window(&first, 0, first_budget).content;
+    let mut remaining = max_tokens.saturating_sub(estimate_tokens(&first).saturating_add(1));
+    remaining = remaining.saturating_sub(marker_tokens);
     let mut recent = Vec::new();
     for line in lines.into_iter().skip(1).rev() {
-        let chars = line.chars().count() + 1;
-        if chars > remaining {
-            break;
+        let tokens = estimate_tokens(&line).saturating_add(1);
+        if tokens > remaining {
+            if recent.is_empty() && remaining > 1 {
+                recent.push(token_window(&line, 0, remaining.saturating_sub(1)).content);
+                remaining = 0;
+            }
+            continue;
         }
-        remaining -= chars;
+        remaining -= tokens;
         recent.push(line);
     }
     recent.reverse();
     let mut bounded = Vec::with_capacity(recent.len() + 2);
     bounded.push(first);
-    bounded.push(
-        "[older structured summary entries omitted; exact records remain addressable]".to_owned(),
-    );
+    bounded.push(OMITTED_MARKER.to_owned());
     bounded.extend(recent);
     bounded
 }

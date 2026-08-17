@@ -1,6 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -8,12 +12,17 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::agent::Message;
-use crate::provider::ThinkingLevel;
+use crate::{
+    agent::Message,
+    provider::ThinkingLevel,
+    secure::{Cipher, EncryptedContent, EncryptionKey},
+};
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     directory: PathBuf,
+    encryption_key: Option<EncryptionKey>,
+    ciphers: Arc<Mutex<HashMap<String, Arc<Cipher>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,9 +59,28 @@ enum SessionRecord {
     Message { message: Message },
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct EncryptedSessionFile {
+    format: u8,
+    encryption: EncryptedContent,
+    content: String,
+}
+
 impl SessionStore {
     pub fn new(directory: PathBuf) -> Self {
-        Self { directory }
+        Self {
+            directory,
+            encryption_key: None,
+            ciphers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn with_encryption(directory: PathBuf, encryption_key: Option<EncryptionKey>) -> Self {
+        Self {
+            directory,
+            encryption_key,
+            ciphers: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn allocate_id(&self) -> Result<String> {
@@ -126,29 +154,10 @@ impl SessionStore {
             model: Some(model.to_owned()),
             thinking_level: Some(thinking_level),
         };
-        let content = serialize_session(header, messages)?;
-        let temporary_path = self.directory.join(format!("{id}.jsonl.tmp"));
-        tokio::fs::write(&temporary_path, content)
+        let content = self.encode_session(&id, serialize_session(header, messages)?)?;
+        atomic_write(&path, &content)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to write temporary session {}",
-                    temporary_path.display()
-                )
-            })?;
-        if let Err(error) = tokio::fs::rename(&temporary_path, &path).await {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                tokio::fs::remove_file(&path)
-                    .await
-                    .with_context(|| format!("failed to replace session {}", path.display()))?;
-                tokio::fs::rename(&temporary_path, &path)
-                    .await
-                    .with_context(|| format!("failed to save session {}", path.display()))?;
-            } else {
-                return Err(error)
-                    .with_context(|| format!("failed to save session {}", path.display()));
-            }
-        }
+            .with_context(|| format!("failed to save session {}", path.display()))?;
         Ok(id)
     }
 
@@ -161,7 +170,8 @@ impl SessionStore {
             },
         };
         let path = self.path_for(&id);
-        match read_session(&path).await {
+        let cipher = self.cipher(&id)?;
+        match read_session(&path, cipher.as_deref()).await {
             Ok((header, messages)) => Ok(Some(LoadedSession {
                 id: header.id,
                 messages,
@@ -202,7 +212,12 @@ impl SessionStore {
             if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
                 continue;
             }
-            let (header, messages) = read_session(&path).await?;
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .with_context(|| format!("session path {} has no UTF-8 ID", path.display()))?;
+            let cipher = self.cipher(id)?;
+            let (header, messages) = read_session(&path, cipher.as_deref()).await?;
             let updated_at = OffsetDateTime::parse(&header.updated_at, &Rfc3339)
                 .with_context(|| format!("invalid updated_at in {}", path.display()))?;
             sessions.insert(
@@ -220,18 +235,183 @@ impl SessionStore {
     }
 
     async fn read_header(&self, path: &Path) -> Result<Option<SessionHeader>> {
-        match tokio::fs::read_to_string(path).await {
-            Ok(content) => parse_header(&content).map(Some),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => {
-                Err(error).with_context(|| format!("failed to read session {}", path.display()))
+        let id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .with_context(|| format!("session path {} has no UTF-8 ID", path.display()))?;
+        let cipher = self.cipher(id)?;
+        match read_session(path, cipher.as_deref()).await {
+            Ok((header, _)) => Ok(Some(header)),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
             }
+            Err(error) => Err(error),
         }
+    }
+
+    fn encode_session(&self, id: &str, content: Vec<u8>) -> Result<Vec<u8>> {
+        if self.encryption_key.is_none() {
+            return Ok(content);
+        }
+        let content = String::from_utf8(content).context("serialized session is not UTF-8")?;
+        let cipher = self
+            .cipher(id)?
+            .context("session encryption key disappeared")?;
+        let (content, encryption) = cipher.encrypt(id, &content)?;
+        serde_json::to_vec(&EncryptedSessionFile {
+            format: 1,
+            encryption,
+            content,
+        })
+        .context("failed to serialize encrypted session")
+    }
+
+    fn cipher(&self, id: &str) -> Result<Option<Arc<Cipher>>> {
+        let Some(key) = &self.encryption_key else {
+            return Ok(None);
+        };
+        if let Some(cipher) = self
+            .ciphers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(id)
+            .cloned()
+        {
+            return Ok(Some(cipher));
+        }
+        let derived = Arc::new(Cipher::new(key, &format!("session:{id}"))?);
+        let mut ciphers = self
+            .ciphers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(cipher) = ciphers.get(id) {
+            return Ok(Some(Arc::clone(cipher)));
+        }
+        ciphers.insert(id.to_owned(), Arc::clone(&derived));
+        Ok(Some(derived))
     }
 
     fn path_for(&self, id: &str) -> PathBuf {
         self.directory.join(format!("{id}.jsonl"))
     }
+}
+
+pub(crate) async fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut temporary_name = path
+        .file_name()
+        .context("atomic write target has no file name")?
+        .to_os_string();
+    temporary_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
+    let temporary_path = parent.join(temporary_name);
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)
+            .await
+            .with_context(|| format!("failed to create {}", temporary_path.display()))?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, content)
+            .await
+            .with_context(|| format!("failed to write {}", temporary_path.display()))?;
+        tokio::io::AsyncWriteExt::flush(&mut file)
+            .await
+            .with_context(|| format!("failed to flush {}", temporary_path.display()))?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("failed to sync {}", temporary_path.display()))?;
+        drop(file);
+        atomic_replace(&temporary_path, path).await?;
+        sync_parent_directory(parent).await
+    }
+    .await;
+    if let Err(error) = result {
+        return match tokio::fs::remove_file(&temporary_path).await {
+            Ok(()) => Err(error),
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "also failed to remove temporary file {}: {cleanup}",
+                temporary_path.display()
+            ))),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        let replaced = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if replaced == 0 {
+            return Err(std::io::Error::last_os_error()).context("MoveFileExW failed");
+        }
+        Ok(())
+    })
+    .await
+    .context("atomic replacement task failed")?
+}
+
+#[cfg(not(windows))]
+async fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
+    tokio::fs::rename(source, destination)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to replace {} with {}",
+                destination.display(),
+                source.display()
+            )
+        })
+}
+
+#[cfg(windows)]
+async fn sync_parent_directory(_parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn sync_parent_directory(parent: &Path) -> Result<()> {
+    let parent = parent.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::File::open(&parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("failed to sync {}", parent.display()))
+    })
+    .await
+    .context("directory sync task failed")?
 }
 
 pub fn format_session_summaries(sessions: &[SessionSummary]) -> Result<String> {
@@ -303,10 +483,31 @@ fn serialize_session(header: SessionHeader, messages: &[Message]) -> Result<Vec<
     Ok(output)
 }
 
-async fn read_session(path: &Path) -> Result<(SessionHeader, Vec<Message>)> {
-    let content = tokio::fs::read_to_string(path)
+async fn read_session(
+    path: &Path,
+    cipher: Option<&Cipher>,
+) -> Result<(SessionHeader, Vec<Message>)> {
+    let content = tokio::fs::read(path)
         .await
         .with_context(|| format!("failed to read session {}", path.display()))?;
+    let content = if let Ok(encrypted) = serde_json::from_slice::<EncryptedSessionFile>(&content) {
+        if encrypted.format != 1 {
+            bail!(
+                "unsupported encrypted session format {} in {}",
+                encrypted.format,
+                path.display()
+            );
+        }
+        let id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .context("encrypted session path has no UTF-8 ID")?;
+        let cipher =
+            cipher.context("session is encrypted; set ZEX_MEMORY_ENCRYPTION_KEY to unlock it")?;
+        cipher.decrypt(id, &encrypted.content, &encrypted.encryption)?
+    } else {
+        String::from_utf8(content).context("session file is not UTF-8")?
+    };
     let mut lines = content.lines();
     let header = parse_header_line(
         lines
@@ -335,10 +536,6 @@ async fn read_session(path: &Path) -> Result<(SessionHeader, Vec<Message>)> {
         }
     }
     Ok((header, messages))
-}
-
-fn parse_header(content: &str) -> Result<SessionHeader> {
-    parse_header_line(content.lines().next().context("session is empty")?)
 }
 
 fn parse_header_line(line: &str) -> Result<SessionHeader> {
@@ -375,7 +572,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::agent::Message;
+    use crate::{agent::Message, memory::MemoryEncryptionKey};
 
     use super::{SessionStore, SessionSummary, format_session_summaries};
 
@@ -447,6 +644,48 @@ mod tests {
             .await
             .unwrap();
         assert!(persisted.contains("\"thinking\":\"Completed the saved task.\""));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn encrypted_sessions_hide_transcript_content_and_require_the_key() {
+        let directory = temp_directory("encrypted-session");
+        let key = MemoryEncryptionKey::new("session encryption key".to_owned()).unwrap();
+        let store = SessionStore::with_encryption(directory.clone(), Some(key.clone()));
+        let secret = "private user prompt and reasoning";
+        let id = store
+            .save(
+                None,
+                "model-a",
+                crate::provider::ThinkingLevel::High,
+                &[Message::User {
+                    content: secret.to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+        let stored = tokio::fs::read_to_string(directory.join(format!("{id}.jsonl")))
+            .await
+            .unwrap();
+        assert!(!stored.contains(secret));
+        assert!(stored.contains("\"encryption\""));
+        assert_eq!(
+            store.load(Some(&id)).await.unwrap().unwrap().messages,
+            vec![Message::User {
+                content: secret.to_owned()
+            }]
+        );
+
+        let locked = SessionStore::new(directory.clone());
+        let error = locked.load(Some(&id)).await.unwrap_err();
+        assert!(error.to_string().contains("ZEX_MEMORY_ENCRYPTION_KEY"));
+        let wrong = SessionStore::with_encryption(
+            directory.clone(),
+            MemoryEncryptionKey::new("wrong key".to_owned()),
+        );
+        let error = wrong.load(Some(&id)).await.unwrap_err();
+        assert!(error.to_string().contains("authentication failed"));
+
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

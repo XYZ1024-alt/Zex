@@ -386,8 +386,9 @@ fn last_enabled_level(levels: &[ThinkingLevel]) -> Option<ThinkingLevel> {
 #[cfg(test)]
 mod thinking_tests {
     use super::{
-        ThinkingCapabilities, ThinkingCompat, ThinkingConfig, ThinkingLevel, ThinkingMode,
-        normalize_thinking_level, sanitize_messages,
+        OpenAiApi, ProviderStateSource, ThinkingCapabilities, ThinkingCompat, ThinkingConfig,
+        ThinkingLevel, ThinkingMode, encode_provider_state, normalize_thinking_level,
+        sanitize_messages,
     };
     use crate::agent::{Message, ToolCall};
 
@@ -597,6 +598,11 @@ mod thinking_tests {
 
     #[test]
     fn request_history_keeps_reasoning_only_for_interleaved_tool_turns() {
+        let source = ProviderStateSource::new(
+            "provider-a".to_owned(),
+            "model-a".to_owned(),
+            OpenAiApi::Responses,
+        );
         let tool_turn = Message::Assistant {
             content: String::new(),
             thinking: Some("Need the tool.".to_owned()),
@@ -605,16 +611,26 @@ mod thinking_tests {
                 name: "read".to_owned(),
                 arguments: "{}".to_owned(),
             }],
-            provider_state: Some(serde_json::json!({"reasoning_content": "Need the tool."})),
+            provider_state: Some(encode_provider_state(
+                &source,
+                serde_json::json!({"reasoning_content": "Need the tool."}),
+            )),
         };
         let final_turn = Message::Assistant {
             content: "Done".to_owned(),
             thinking: Some("Finished.".to_owned()),
             tool_calls: Vec::new(),
-            provider_state: Some(serde_json::json!({"reasoning_content": "Finished."})),
+            provider_state: Some(encode_provider_state(
+                &source,
+                serde_json::json!({"reasoning_content": "Finished."}),
+            )),
         };
 
-        let interleaved = sanitize_messages(&[tool_turn.clone(), final_turn.clone()], true);
+        let interleaved = sanitize_messages(
+            &[tool_turn.clone(), final_turn.clone()],
+            true,
+            Some(&source),
+        );
         assert!(matches!(
             &interleaved[0],
             Message::Assistant {
@@ -632,7 +648,7 @@ mod thinking_tests {
             }
         ));
 
-        let stripped = sanitize_messages(&[tool_turn, final_turn], false);
+        let stripped = sanitize_messages(&[tool_turn, final_turn], false, Some(&source));
         assert!(stripped.iter().all(|message| matches!(
             message,
             Message::Assistant {
@@ -641,6 +657,68 @@ mod thinking_tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn provider_state_is_removed_for_different_models_and_legacy_payloads() {
+        let source = ProviderStateSource::new(
+            "provider-a".to_owned(),
+            "model-a".to_owned(),
+            OpenAiApi::Responses,
+        );
+        let target = ProviderStateSource::new(
+            "provider-a".to_owned(),
+            "model-b".to_owned(),
+            OpenAiApi::Responses,
+        );
+        let message = Message::Assistant {
+            content: String::new(),
+            thinking: Some("Use the tool.".to_owned()),
+            tool_calls: vec![ToolCall {
+                id: "call".to_owned(),
+                name: "read".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+            provider_state: Some(encode_provider_state(
+                &source,
+                serde_json::json!([{"type": "reasoning", "id": "opaque"}]),
+            )),
+        };
+        let legacy = Message::Assistant {
+            content: String::new(),
+            thinking: Some("Use the tool.".to_owned()),
+            tool_calls: vec![ToolCall {
+                id: "call".to_owned(),
+                name: "read".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+            provider_state: Some(serde_json::json!([{"type": "reasoning", "id": "legacy"}])),
+        };
+
+        let compatible = sanitize_messages(std::slice::from_ref(&message), true, Some(&source));
+        assert!(matches!(
+            &compatible[0],
+            Message::Assistant {
+                provider_state: Some(state),
+                ..
+            } if state.is_array()
+        ));
+        let switched = sanitize_messages(&[message], true, Some(&target));
+        assert!(matches!(
+            &switched[0],
+            Message::Assistant {
+                provider_state: None,
+                ..
+            }
+        ));
+        let legacy = sanitize_messages(&[legacy], true, Some(&source));
+        assert!(matches!(
+            &legacy[0],
+            Message::Assistant {
+                provider_state: None,
+                ..
+            }
+        ));
     }
 }
 
@@ -728,6 +806,94 @@ impl<T> PreparedRequest<T> {
     }
 }
 
+const PROVIDER_STATE_FORMAT: u8 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderStateSource {
+    provider_id: String,
+    model_id: String,
+    api: OpenAiApi,
+}
+
+impl ProviderStateSource {
+    pub(crate) fn new(provider_id: String, model_id: String, api: OpenAiApi) -> Self {
+        Self {
+            provider_id,
+            model_id,
+            api,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProviderStateEnvelope {
+    format: u8,
+    provider_id: String,
+    model_id: String,
+    api: OpenAiApi,
+    payload: Value,
+}
+
+fn encode_provider_state(source: &ProviderStateSource, payload: Value) -> Value {
+    serde_json::to_value(ProviderStateEnvelope {
+        format: PROVIDER_STATE_FORMAT,
+        provider_id: source.provider_id.clone(),
+        model_id: source.model_id.clone(),
+        api: source.api,
+        payload,
+    })
+    .expect("provider state envelope is JSON serializable")
+}
+
+fn decode_provider_state(state: Value, target: Option<&ProviderStateSource>) -> Option<Value> {
+    let target = target?;
+    let envelope = serde_json::from_value::<ProviderStateEnvelope>(state).ok()?;
+    (envelope.format == PROVIDER_STATE_FORMAT
+        && envelope.provider_id == target.provider_id
+        && envelope.model_id == target.model_id
+        && envelope.api == target.api)
+        .then_some(envelope.payload)
+}
+
+fn sanitize_history_provider_states(
+    messages: &[Message],
+    target: Option<&ProviderStateSource>,
+) -> Vec<Message> {
+    messages
+        .iter()
+        .cloned()
+        .map(|message| match message {
+            Message::Assistant {
+                content,
+                thinking,
+                tool_calls,
+                provider_state,
+            } => {
+                let provider_state = provider_state.filter(|state| {
+                    let Some(target) = target else {
+                        return false;
+                    };
+                    serde_json::from_value::<ProviderStateEnvelope>(state.clone())
+                        .ok()
+                        .is_some_and(|envelope| {
+                            envelope.format == PROVIDER_STATE_FORMAT
+                                && envelope.provider_id == target.provider_id
+                                && envelope.model_id == target.model_id
+                                && envelope.api == target.api
+                        })
+                });
+                Message::Assistant {
+                    content,
+                    thinking,
+                    tool_calls,
+                    provider_state,
+                }
+            }
+            message => message,
+        })
+        .collect()
+}
+
 pub trait Provider: Send + Sync {
     type Request: Send;
 
@@ -736,6 +902,14 @@ pub trait Provider: Send + Sync {
     }
 
     fn context_limit(&self, _model: &str) -> Option<ModelLimit> {
+        None
+    }
+
+    fn sanitize_history(&self, _model: &str, messages: &[Message]) -> Vec<Message> {
+        sanitize_history_provider_states(messages, None)
+    }
+
+    fn encode_provider_state(&self, _model: &str, _state: Value) -> Option<Value> {
         None
     }
 
@@ -851,6 +1025,34 @@ impl Provider for ProviderRegistry {
             .and_then(|state| state.models.get(model).and_then(|(_, _, limit)| *limit))
     }
 
+    fn sanitize_history(&self, model: &str, messages: &[Message]) -> Vec<Message> {
+        let Ok(state) = self.inner.read() else {
+            return sanitize_history_provider_states(messages, None);
+        };
+        if !state.models.contains_key(model) {
+            return sanitize_history_provider_states(messages, None);
+        };
+        let Some((provider_id, model_id)) = model.split_once('/') else {
+            return sanitize_history_provider_states(messages, None);
+        };
+        let Some(provider) = state.providers.get(provider_id) else {
+            return sanitize_history_provider_states(messages, None);
+        };
+        let source =
+            ProviderStateSource::new(provider_id.to_owned(), model_id.to_owned(), provider.api());
+        sanitize_history_provider_states(messages, Some(&source))
+    }
+
+    fn encode_provider_state(&self, model: &str, state: Value) -> Option<Value> {
+        let (provider_id, model_id) = model.split_once('/')?;
+        let registry = self.inner.read().ok()?;
+        let provider = registry.providers.get(provider_id)?;
+        Some(encode_provider_state(
+            &ProviderStateSource::new(provider_id.to_owned(), model_id.to_owned(), provider.api()),
+            state,
+        ))
+    }
+
     fn prepare_request(
         &self,
         model: &str,
@@ -882,8 +1084,13 @@ impl Provider for ProviderRegistry {
             };
         let (_, capabilities, _) = configured;
         let normalized = normalize_thinking_level(&capabilities, thinking_level);
-        let request_messages =
-            sanitize_messages(messages, capabilities.supports_interleaved_thinking);
+        let source =
+            ProviderStateSource::new(provider_id.to_owned(), model_id.to_owned(), provider.api());
+        let request_messages = sanitize_messages(
+            messages,
+            capabilities.supports_interleaved_thinking,
+            Some(&source),
+        );
         provider
             .prepare_normalized(
                 model_id,
@@ -919,7 +1126,11 @@ impl Provider for ProviderRegistry {
     }
 }
 
-fn sanitize_messages(messages: &[Message], supports_interleaved_thinking: bool) -> Vec<Message> {
+fn sanitize_messages(
+    messages: &[Message],
+    supports_interleaved_thinking: bool,
+    target: Option<&ProviderStateSource>,
+) -> Vec<Message> {
     messages
         .iter()
         .cloned()
@@ -935,7 +1146,10 @@ fn sanitize_messages(messages: &[Message], supports_interleaved_thinking: bool) 
                     content,
                     thinking: keep_reasoning.then_some(thinking).flatten(),
                     tool_calls,
-                    provider_state: keep_reasoning.then_some(provider_state).flatten(),
+                    provider_state: keep_reasoning
+                        .then_some(provider_state)
+                        .flatten()
+                        .and_then(|state| decode_provider_state(state, target)),
                 }
             }
             message => message,

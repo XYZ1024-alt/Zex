@@ -343,7 +343,7 @@ mod tests {
         let pointer = outcome.memory.expect("read result should be addressable");
 
         assert!(outcome.output.contains("[truncated:"));
-        let recalled = memory.recall(&pointer.id, None).await.unwrap();
+        let recalled = memory.recall(&pointer.id, None, None, None).await.unwrap();
         assert!(recalled.ends_with(&original));
         tokio::fs::remove_dir_all(working_dir).await.unwrap();
     }
