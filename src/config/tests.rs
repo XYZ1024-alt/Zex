@@ -581,6 +581,7 @@ enabled = true
 mode = "summary"
 recall_rate_limit = 4
 max_recall_tokens = 1024
+max_inline_tool_tokens = 3000
 hot_cache_size = 8
 auto_pin_important = false
 max_auto_pins = 16
@@ -604,6 +605,7 @@ max_records = 250
     unsafe {
         std::env::set_var("ZEX_MEMORY_ENABLED", "true");
         std::env::set_var("ZEX_MEMORY_RECALL_RATE_LIMIT", "7");
+        std::env::set_var("ZEX_MEMORY_RECALL_PER_TURN_LIMIT", "5");
         std::env::set_var("ZEX_MEMORY_MAX_AUTO_PINS", "8");
         std::env::set_var("ZEX_MEMORY_ENCRYPTION_KEY", "test-only-secret");
     }
@@ -616,7 +618,11 @@ max_records = 250
         crate::memory::MemoryMode::PointerPriority
     );
     assert_eq!(config.memory.recall_rate_limit, 7);
+    assert_eq!(config.memory.recall_per_turn_limit, 5);
     assert_eq!(config.memory.max_recall_tokens, 2_048);
+    // Inline size is independent of the recall window size, and inherits from
+    // the global file when the project does not override it.
+    assert_eq!(config.memory.max_inline_tool_tokens, 3_000);
     assert_eq!(config.memory.hot_cache_size, 8);
     assert!(!config.memory.auto_pin_important);
     assert_eq!(config.memory.max_auto_pins, 8);

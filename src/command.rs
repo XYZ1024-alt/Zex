@@ -571,9 +571,17 @@ mod execution_tests {
         );
         let recalled = runtime.recall(&pointer.id, None, None, None).await.unwrap();
         assert!(recalled.ends_with("exact resumed observation"));
+        // The manifest is rebuilt as request-time state rather than written
+        // into the system prompt, so resume is observable through the runtime.
+        assert!(
+            runtime
+                .system_pointer_manifest()
+                .iter()
+                .any(|citation| citation.contains(&pointer.id))
+        );
         assert!(matches!(
             agent.messages().first(),
-            Some(Message::System { content }) if content.contains(&pointer.id)
+            Some(Message::System { content }) if !content.contains(&pointer.id)
         ));
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }

@@ -628,12 +628,28 @@ impl Config {
                             defaults.recall_rate_limit,
                         )?,
                     )?,
+                    recall_per_turn_limit: positive(
+                        "memory.recall_per_turn_limit",
+                        env_or_file(
+                            "ZEX_MEMORY_RECALL_PER_TURN_LIMIT",
+                            file.memory.recall_per_turn_limit,
+                            defaults.recall_per_turn_limit,
+                        )?,
+                    )?,
                     max_recall_tokens: positive(
                         "memory.max_recall_tokens",
                         env_or_file(
                             "ZEX_MEMORY_MAX_RECALL_TOKENS",
                             file.memory.max_recall_tokens,
                             defaults.max_recall_tokens,
+                        )?,
+                    )?,
+                    max_inline_tool_tokens: positive(
+                        "memory.max_inline_tool_tokens",
+                        env_or_file(
+                            "ZEX_MEMORY_MAX_INLINE_TOOL_TOKENS",
+                            file.memory.max_inline_tool_tokens,
+                            defaults.max_inline_tool_tokens,
                         )?,
                     )?,
                     hot_cache_size: positive(
@@ -741,7 +757,9 @@ struct FileMemoryConfig {
     enabled: Option<bool>,
     mode: Option<MemoryMode>,
     recall_rate_limit: Option<usize>,
+    recall_per_turn_limit: Option<usize>,
     max_recall_tokens: Option<usize>,
+    max_inline_tool_tokens: Option<usize>,
     hot_cache_size: Option<usize>,
     auto_pin_important: Option<bool>,
     max_auto_pins: Option<usize>,
@@ -756,7 +774,11 @@ impl FileMemoryConfig {
             enabled: project.enabled.or(self.enabled),
             mode: project.mode.or(self.mode),
             recall_rate_limit: project.recall_rate_limit.or(self.recall_rate_limit),
+            recall_per_turn_limit: project.recall_per_turn_limit.or(self.recall_per_turn_limit),
             max_recall_tokens: project.max_recall_tokens.or(self.max_recall_tokens),
+            max_inline_tool_tokens: project
+                .max_inline_tool_tokens
+                .or(self.max_inline_tool_tokens),
             hot_cache_size: project.hot_cache_size.or(self.hot_cache_size),
             auto_pin_important: project.auto_pin_important.or(self.auto_pin_important),
             max_auto_pins: project.max_auto_pins.or(self.max_auto_pins),

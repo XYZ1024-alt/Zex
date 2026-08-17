@@ -21,6 +21,7 @@ use crate::{
 
 const SYSTEM_PROMPT: &str = "You are Zex, a minimal AI agent core. Be concise and accurate. Use grep to search file contents, glob to find files, and bash only for other system commands. Use read, write, and edit for file operations. Use tool results to finish the task.";
 const MEMORY_POLICY_MARKER: &str = "\n\n[Addressable memory policy]";
+const POINTER_MANIFEST_MARKER: &str = "[Current valid addressable pointers]";
 const MEMORY_POLICY: &str = "[Addressable memory policy]\n\
 - Large observations may appear only as §id citations. Call recall with an exact visible ID only when missing details directly affect the current decision.\n\
 - Never invent, alter, or guess an ID. If an ID is not visible, use list_pointers with a narrow filter. Prefer pinned and recently listed pointers.\n\
@@ -38,6 +39,14 @@ const TOOL_SUMMARY_EDGE_CHARS: usize = 180;
 const ANCHOR_MAX_CHARS: usize = 4_000;
 const PRUNE_KEEP_TOOL_RESULTS: usize = 4;
 const PRUNE_MIN_CHARS: usize = 2_000;
+/// Bounds on the estimate-to-billed ratio we are willing to trust. The JSON
+/// body we measure is not the wire format a provider tokenizes, so a modest
+/// offset is expected; a sample far outside this band means the provider is
+/// reporting something else entirely — cache-excluded input tokens, most
+/// often — and budgeting against it would be worse than not calibrating.
+const CALIBRATION_MIN: f64 = 0.7;
+const CALIBRATION_MAX: f64 = 1.5;
+const CALIBRATION_WEIGHT: f64 = 0.5;
 
 pub struct Agent<P> {
     provider: P,
@@ -51,6 +60,7 @@ pub struct Agent<P> {
     compact_keep_turns: usize,
     thinking_level: ThinkingLevel,
     memory: Option<Arc<MemoryRuntime>>,
+    calibration: Option<f64>,
 }
 
 pub struct AgentOptions {
@@ -108,6 +118,7 @@ where
             compact_keep_turns: options.compact_keep_turns,
             thinking_level: options.thinking_level,
             memory,
+            calibration: None,
         };
         agent.sync_memory_context();
         agent
@@ -123,6 +134,9 @@ where
 
     pub fn set_model(&mut self, model: String) {
         self.model = model;
+        // Calibration is per model and per request shape; carrying it across a
+        // switch would budget the new model against the old one's billing.
+        self.calibration = None;
         self.messages = self.provider.sanitize_history(&self.model, &self.messages);
         self.sync_memory_context();
     }
@@ -181,13 +195,77 @@ where
         definitions: &[ToolDefinition],
     ) -> Result<PreparedRequest<P::Request>> {
         let (_, max_output_tokens) = self.request_budgets();
+        // The pointer manifest is wire-only state: it changes on every tool
+        // result, so keeping it in `self.messages[0]` would rewrite the system
+        // prompt each turn and defeat provider prefix caching. Appending it
+        // last leaves the whole prefix byte-identical between turns.
+        let Some(manifest) = self.pointer_manifest_message() else {
+            return self.provider.prepare_request(
+                &self.model,
+                self.thinking_level,
+                &self.messages,
+                definitions,
+                max_output_tokens,
+            );
+        };
+        let mut messages = Vec::with_capacity(self.messages.len() + 1);
+        messages.extend_from_slice(&self.messages);
+        messages.push(manifest);
         self.provider.prepare_request(
             &self.model,
             self.thinking_level,
-            &self.messages,
+            &messages,
             definitions,
             max_output_tokens,
         )
+    }
+
+    fn pointer_manifest_message(&self) -> Option<Message> {
+        let manifest = self.memory.as_ref()?.system_pointer_manifest();
+        if manifest.is_empty() {
+            return None;
+        }
+        let pointers = manifest
+            .into_iter()
+            .map(|citation| format!("- {citation}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(Message::System {
+            content: format!("{POINTER_MANIFEST_MARKER}\n{pointers}"),
+        })
+    }
+
+    /// Input tokens for a prepared request, scaled by what the provider
+    /// actually billed for earlier requests on this model. Every budget
+    /// decision goes through here so the 85% threshold lands on the real
+    /// number rather than on the raw JSON-body estimate.
+    fn measured_tokens(&self, request: &PreparedRequest<P::Request>) -> usize {
+        self.scaled_tokens(request.input_tokens())
+    }
+
+    fn scaled_tokens(&self, tokens: usize) -> usize {
+        let Some(calibration) = self.calibration else {
+            return tokens;
+        };
+        ((tokens as f64) * calibration).round() as usize
+    }
+
+    /// Folds one billed request into the running calibration.
+    fn record_usage(&mut self, estimated: usize, usage: Option<crate::agent::CompletionUsage>) {
+        let Some(actual) = usage.and_then(|usage| usage.input_tokens) else {
+            return;
+        };
+        if estimated == 0 || actual == 0 {
+            return;
+        }
+        let ratio = actual as f64 / estimated as f64;
+        if !(CALIBRATION_MIN..=CALIBRATION_MAX).contains(&ratio) {
+            return;
+        }
+        self.calibration = Some(match self.calibration {
+            Some(previous) => previous + (ratio - previous) * CALIBRATION_WEIGHT,
+            None => ratio,
+        });
     }
 
     pub fn default_tool_timeout(&self) -> Duration {
@@ -297,9 +375,11 @@ where
     /// definitions.
     pub fn context_tokens(&self) -> usize {
         let definitions = self.tools.definitions();
-        self.prepare_request(&definitions)
+        let tokens = self
+            .prepare_request(&definitions)
             .map(|request| request.input_tokens())
-            .unwrap_or_else(|_| fallback_request_tokens(&self.messages, &definitions))
+            .unwrap_or_else(|_| fallback_request_tokens(&self.messages, &definitions));
+        self.scaled_tokens(tokens)
     }
 
     pub async fn compact(&mut self) -> Result<CompactStats> {
@@ -319,29 +399,31 @@ where
         mut request: PreparedRequest<P::Request>,
         force_compaction: bool,
     ) -> Result<(CompactStats, PreparedRequest<P::Request>)> {
-        let before_tokens = request.input_tokens();
+        let before_tokens = self.measured_tokens(&request);
         let threshold = self.context_budget().saturating_mul(AUTO_COMPACT_PERCENT) / 100;
         let pruned_tool_outputs = prune_tool_outputs(&mut self.messages, self.memory.as_deref());
         if pruned_tool_outputs > 0 {
             self.sync_memory_context();
             request = self.prepare_request(definitions)?;
         }
-        let (mut stats, request) = if force_compaction || request.input_tokens() >= threshold {
-            self.compact_prepared(definitions, request).await?
-        } else {
-            (
-                CompactStats {
-                    before_tokens,
-                    after_tokens: request.input_tokens(),
-                    freed_tokens: before_tokens.saturating_sub(request.input_tokens()),
-                    kept_turns: 0,
-                    summarized_turns: 0,
-                    summarized_tool_outputs: 0,
-                    pruned_tool_outputs: 0,
-                },
-                request,
-            )
-        };
+        let (mut stats, request) =
+            if force_compaction || self.measured_tokens(&request) >= threshold {
+                self.compact_prepared(definitions, request).await?
+            } else {
+                let after_tokens = self.measured_tokens(&request);
+                (
+                    CompactStats {
+                        before_tokens,
+                        after_tokens,
+                        freed_tokens: before_tokens.saturating_sub(after_tokens),
+                        kept_turns: 0,
+                        summarized_turns: 0,
+                        summarized_tool_outputs: 0,
+                        pruned_tool_outputs: 0,
+                    },
+                    request,
+                )
+            };
         stats.before_tokens = before_tokens;
         stats.freed_tokens = before_tokens.saturating_sub(stats.after_tokens);
         stats.pruned_tool_outputs = pruned_tool_outputs;
@@ -354,7 +436,7 @@ where
         mut request: PreparedRequest<P::Request>,
     ) -> Result<(CompactStats, PreparedRequest<P::Request>)> {
         let budget = self.context_budget();
-        let before_tokens = request.input_tokens();
+        let before_tokens = self.measured_tokens(&request);
         let mut current_tokens = before_tokens;
         let mut keep_turns = self.compact_keep_turns;
         let summary_token_budget = (budget / 4).clamp(1, SUMMARY_MAX_TOKENS);
@@ -378,7 +460,7 @@ where
             );
             self.sync_memory_context();
             let next_request = self.prepare_request(definitions)?;
-            stats.after_tokens = next_request.input_tokens();
+            stats.after_tokens = self.measured_tokens(&next_request);
             stats.kept_turns = next.kept_turns;
             stats.summarized_turns += next.summarized_turns;
             stats.summarized_tool_outputs += next.summarized_tool_outputs;
@@ -464,6 +546,10 @@ where
         Ok(archived)
     }
 
+    /// Refreshes which citations the memory runtime treats as active. The
+    /// system prompt only ever receives the static policy text: everything
+    /// that varies per turn is appended at request time instead, so
+    /// `messages[0]` stays byte-stable for the life of the session.
     fn sync_memory_context(&mut self) {
         let Some(Message::System { content }) = self.messages.first() else {
             return;
@@ -486,20 +572,8 @@ where
             .flat_map(|message| extract_memory_ids(message_content(message)))
             .collect::<Vec<_>>();
         memory.set_active_pointers(ids);
-        let manifest = memory.system_pointer_manifest();
-        let pointers = if manifest.is_empty() {
-            "- No active or pinned citations.".to_owned()
-        } else {
-            manifest
-                .into_iter()
-                .map(|citation| format!("- {citation}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
         if let Some(Message::System { content }) = self.messages.first_mut() {
-            *content = format!(
-                "{base}\n\n{MEMORY_POLICY}\n\n[Current valid addressable pointers]\n{pointers}"
-            );
+            *content = format!("{base}\n\n{MEMORY_POLICY}");
         }
     }
 
@@ -651,6 +725,7 @@ where
 
         for _ in 0..self.max_turns {
             let request = self.prepare_with_compaction(&definitions).await?;
+            let estimated_tokens = request.input_tokens();
             if let Some(memory) = &self.memory {
                 memory.begin_model_turn();
             }
@@ -667,6 +742,7 @@ where
                     return Err(error);
                 }
             };
+            self.record_usage(estimated_tokens, assistant.usage);
 
             let assistant_message = Message::Assistant {
                 content: assistant.content.clone(),
@@ -781,7 +857,7 @@ where
         self.sync_memory_context();
         let request = self.prepare_request(definitions)?;
         let threshold = self.context_budget().saturating_mul(AUTO_COMPACT_PERCENT) / 100;
-        if request.input_tokens() < threshold {
+        if self.measured_tokens(&request) < threshold {
             self.ensure_request_fits(&request)?;
             return Ok(request);
         }
@@ -800,12 +876,13 @@ where
 
     fn ensure_request_fits(&self, request: &PreparedRequest<P::Request>) -> Result<()> {
         let budget = self.context_budget();
-        if request.input_tokens() <= budget {
+        let tokens = self.measured_tokens(request);
+        if tokens <= budget {
             return Ok(());
         }
         bail!(
             "prepared request requires approximately {} input tokens, exceeding the {} token input budget with {} output tokens reserved; shorten the current prompt or use a model with a larger context window",
-            request.input_tokens(),
+            tokens,
             budget,
             request.max_output_tokens()
         )
@@ -897,20 +974,30 @@ fn prune_tool_outputs(messages: &mut [Message], memory: Option<&MemoryRuntime>) 
         if let Message::Tool { content, .. } = &mut messages[index] {
             let chars = content.chars().count();
             if chars > PRUNE_MIN_CHARS && !content.starts_with("[tool output cleared") {
-                match memory.map(MemoryRuntime::mode) {
-                    Some(MemoryMode::PointerPriority | MemoryMode::Hybrid) => {
-                        if let Some(citation) = extract_memory_ids(content)
-                            .into_iter()
-                            .find_map(|id| memory.and_then(|memory| memory.citation_for_id(&id)))
-                        {
-                            *content = citation;
-                            pruned += 1;
-                        }
+                let citation = memory.and_then(|memory| {
+                    extract_memory_ids(content)
+                        .into_iter()
+                        .find_map(|id| memory.citation_for_id(&id))
+                });
+                let pointer_mode = matches!(
+                    memory.map(MemoryRuntime::mode),
+                    Some(MemoryMode::PointerPriority | MemoryMode::Hybrid)
+                );
+                match citation {
+                    // The body is still in the store in every mode, so name it
+                    // rather than stranding a record the model can no longer
+                    // address.
+                    Some(citation) => {
+                        *content = citation;
+                        pruned += 1;
                     }
-                    Some(MemoryMode::Summary) | None => {
+                    None if !pointer_mode => {
                         *content = format!("[tool output cleared to free context: {chars} chars]");
                         pruned += 1;
                     }
+                    // Unaddressable output under a pointer mode is the only
+                    // copy left; keep it rather than destroy it.
+                    None => {}
                 }
             }
         }

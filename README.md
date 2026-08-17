@@ -50,7 +50,9 @@ hide_thinking_block = false
 enabled = true
 mode = "hybrid"
 recall_rate_limit = 5
-max_recall_tokens = 2048
+recall_per_turn_limit = 3
+max_recall_tokens = 4096
+max_inline_tool_tokens = 8192
 hot_cache_size = 32
 auto_pin_important = true
 max_auto_pins = 32
@@ -101,8 +103,10 @@ max = "max"
 | `compact_keep_turns` | `6` | compact 时完整保留的最近用户轮次数 |
 | `memory.enabled` | `true` | ARC 总开关；关闭后不注册 memory 工具，并回退到原有工具输出与 summary compact 路径 |
 | `memory.mode` | `"hybrid"` | `pointer_priority` 优先 citation、`summary` 使用传统摘要、`hybrid` 保留轻量流程摘要并用 citation 保存精确恢复路径 |
-| `memory.recall_rate_limit` | `5` | 每分钟 recall 上限；同时每个模型工具轮最多 3 次 |
-| `memory.max_recall_tokens` | `2048` | 单次 recall 返回 token 上限；超限返回受控前缀片段，全文继续保留在原 ID |
+| `memory.recall_rate_limit` | `5` | 每分钟 recall 上限 |
+| `memory.recall_per_turn_limit` | `3` | 每个模型工具轮的 recall 上限；实际生效值取它与 `recall_rate_limit` 的较小者 |
+| `memory.max_recall_tokens` | `4096` | 单次 recall 返回 token 上限；超限返回受控窗口片段，全文继续保留在原 ID |
+| `memory.max_inline_tool_tokens` | `8192` | 工具结果保持原样进入 Active View 的 token 上限；超过才只留 citation。默认为 `max_recall_tokens` 的两倍，因此被指针化的观察仍可在一个模型轮内读回。调高它会让上下文更完整但更占预算，调低会更早触发 recall 往返 |
 | `memory.hot_cache_size` | `32` | 进程内最近访问内容的 LRU 条目数；重启后由 Store 按需重建 |
 | `memory.auto_pin_important` | `true` | 自动 pin 高价值修改类工具结果；可用 `unpin` 解除 |
 | `memory.max_auto_pins` | `32` | 每个 session 最多保留的自动 pin 数；超限时按最旧优先解除，手动 pin 不受影响 |
@@ -153,7 +157,9 @@ Zex 启动时从 `https://models.dev/api.json` 刷新模型思考能力，并把
 | `ZEX_MEMORY_ENABLED` | 无 | `memory.enabled` |
 | `ZEX_MEMORY_MODE` | 无 | `memory.mode` |
 | `ZEX_MEMORY_RECALL_RATE_LIMIT` | 无 | `memory.recall_rate_limit` |
+| `ZEX_MEMORY_RECALL_PER_TURN_LIMIT` | 无 | `memory.recall_per_turn_limit` |
 | `ZEX_MEMORY_MAX_RECALL_TOKENS` | 无 | `memory.max_recall_tokens` |
+| `ZEX_MEMORY_MAX_INLINE_TOOL_TOKENS` | 无 | `memory.max_inline_tool_tokens` |
 | `ZEX_MEMORY_HOT_CACHE_SIZE` | 无 | `memory.hot_cache_size` |
 | `ZEX_MEMORY_AUTO_PIN_IMPORTANT` | 无 | `memory.auto_pin_important` |
 | `ZEX_MEMORY_MAX_AUTO_PINS` | 无 | `memory.max_auto_pins` |
@@ -330,13 +336,14 @@ zex resume -p "继续上一轮工作并给出结论"
 [file snapshot] read → §obs_8f2c… (~6.2k tokens, path=src/main.rs; recall available)
 ```
 
-- 大结果只进入 citation；小结果保留当前可见文本并附带 addressable copy。
+- 超过 `memory.max_inline_tool_tokens`（默认 8192）的结果才只进入 citation；其余保留当前可见文本并附带 addressable copy。指针化会多花一次 recall 往返，因此只对真正威胁预算的输出这样做；中等结果留在上下文里，等预算真正吃紧时再由 prune 阶段降级为 citation。
 - `/compact` 和 auto-compact 在删除旧轮次前，把用户/assistant 原消息写为 `§turn_...`，把工具观察保留为 `§obs_...`，再生成有界 structured summary 和 pointer manifest。
 - `recall({"id":"§obs_...","reason":"该诊断直接决定修复"})` 精确取回未超上限的原文；大内容返回受控片段，全文仍保留在同一 ID。
 - 相同工具、参数和完整输出只保存一次，重复观察复用已有 ID。
 - `pin` / `unpin` 调整 compact 和 pointer manifest 的优先级；自动 pin 默认最多 32 个，最旧自动 pin 会被解除，手动 pin 不被自动驱逐。
-- `list_pointers` 无 filter 时列出 active/pinned ID 和有界内容预览；普通文本 filter 会扫描 metadata 与完整 Store 内容，结构化 filter 支持 `tool=read path=src/main.rs kind=file_snapshot pinned=true` 等 AND 组合。它是精确子串检索，不是语义检索。
-- 不存在或格式错误的 ID 会返回明确错误；recall 默认每个模型工具轮最多 3 次、每分钟最多 5 次。recall、失败、限流和 pin 操作写入独立轮转审计日志，内容 Store 不混入操作事件。
+- `list_pointers` 无 filter 时列出 active/pinned ID 和有界内容预览；普通文本 filter 会扫描 metadata 与 Store 内容，结构化 filter 支持 `tool=read path=src/main.rs kind=file_snapshot pinned=true` 等 AND 组合。它是精确子串检索，不是语义检索。内容扫描按由新到旧最多读取 256 条记录，超出部分在输出末尾明确标注，避免一次工具调用变成全量读取与解密。
+- 不存在或格式错误的 ID 会返回明确错误；recall 默认每个模型工具轮最多 3 次（`memory.recall_per_turn_limit`）、每分钟最多 5 次。recall、失败、限流和 pin 操作写入独立轮转审计日志，内容 Store 不混入操作事件。
+- 记录 ID 的序号来自已有记录本身而非计数：retention 会从中间淘汰记录，按数量恢复会重新发放存活记录仍持有的序号。ID 在写盘前先在索引中预占，冲突不会进入 `records.jsonl`。若旧版本已写入重复 ID，载入时按后写优先恢复，会话不会因此永久打不开。
 - Store 在上下文载入和成功轮次后执行保留维护：过期、超记录数或超字节预算的非 active/non-pinned 记录被淘汰，保留集通过 crash-safe 原子替换重写。active/pinned 是安全豁免项，因此目标容量不是会破坏当前引用的硬上限。
 
 可选的本地内容加密只通过环境变量启用：
@@ -386,12 +393,16 @@ enabled = false
 
 ### 上下文 compact
 
-Compact 是 core 的确定性规则，不调用外部总结模型。每次 Provider 调用前先生成一次 `PreparedRequest`：按当前模型能力移除不会回传的历史 reasoning，构造 Chat Completions 或 Responses 的实际 JSON 请求，加入完整工具定义和需要连续传递的 interleaved reasoning/provider state，再使用内置 tiktoken o200k_base 估算整个 wire payload。计量后的同一份序列化请求直接发送，不再依赖可能属于旧模型或旧 system manifest 的 usage baseline。预算取模型 context window（models.dev `limit.context` 或模型配置的 `context_window` 覆盖）扣除输出预留，未知时用 `max_context_tokens` 作为输入预算兜底：
+Compact 是 core 的确定性规则，不调用外部总结模型。每次 Provider 调用前先生成一次 `PreparedRequest`：按当前模型能力移除不会回传的历史 reasoning，构造 Chat Completions 或 Responses 的实际 JSON 请求，加入完整工具定义和需要连续传递的 interleaved reasoning/provider state，再使用内置 tiktoken o200k_base 估算整个 wire payload。同一份序列化请求直接发送。相同 body 的估算结果会被小容量缓存复用，因为一轮内状态刷新、预算判定和每次 compact 重试都会重复准备同一个请求，而整段 BPE 是其中最贵的一步。
 
-1. system prompt 始终完整保留。
+Provider 返回的 `usage` 不再被当作陈旧 baseline，但会作为校准回灌：实际计费输入 token 与本次估算的比值在 0.7–1.5 之间时按指数平滑更新一个系数，之后所有预算判定都用校准后的数值。落在带外的样本（典型如只报未命中缓存部分的 provider）会被丢弃而不是采信，切换模型时系数清零。
+
+预算取模型 context window（models.dev `limit.context` 或模型配置的 `context_window` 覆盖）扣除输出预留，未知时用 `max_context_tokens` 作为输入预算兜底：
+
+1. system prompt 始终完整保留，且在整个会话中逐字节稳定。启用 ARC 时它只包含静态策略文本；每轮都会变化的 pointer manifest 作为请求末尾的一条临时 system 消息追加，不写入消息历史，因此 provider 的前缀缓存不会被每次工具调用打断。
 2. 最近 `compact_keep_turns` 个用户轮次及其 assistant/tool 消息完整保留。
 3. `pointer_priority` / `hybrid` 下，更早轮次在移除前写入 Store；摘要保留唯一的 Original request、关键流程和 `§turn_...` / `§obs_...` citation，工具结果不再退化成不可恢复的首尾片段。摘要不重新注入 assistant thinking/provider reasoning；摘要 token 上限按当前输入预算动态计算，保留原始任务锚点与最新结构化条目。`summary` 模式使用相同的动态预算规则。
-4. 上下文达到预算的 85% 时，先把较旧的超长 tool 输出替换为已存在 ID 的 citation（ARC）或原占位（传统 summary），保留最近 4 条；仍超阈值再走全量 compact。`/compact` 与 auto-compact 共用同一条 prune + summary pipeline。若保留配置轮数后仍超过预算，会逐步减少完整保留轮次，但至少保留最近 1 轮。Compact 后请求仍超过输入预算时，会在调用 Provider 前返回明确错误。
+4. 上下文达到预算的 85% 时，先把较旧的超长 tool 输出替换为已存在 ID 的 citation，保留最近 4 条；仍超阈值再走全量 compact。只要记录仍可寻址，`summary` 模式同样保留 citation 而不是写成不可恢复的占位；只有在没有任何可用 ID 时才退回占位文本，且此时 `pointer_priority` / `hybrid` 会保留原文而非销毁唯一副本。`/compact` 与 auto-compact 共用同一条 prune + summary pipeline。若保留配置轮数后仍超过预算，会逐步减少完整保留轮次，但至少保留最近 1 轮。Compact 后请求仍超过输入预算时，会在调用 Provider 前返回明确错误。
 5. TUI/REPL 反馈约释放 token 数、compact 前后占用、保留完整轮次、摘要旧轮次和清理的 tool 输出数量。Compact 后的消息直接用于后续 Provider 请求和会话持久化。
 
 OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两种协议都优先请求流式响应，并兼容网关忽略 `stream` 后返回普通 JSON。Chat Completions 的 `max_completion_tokens` 和 Responses 的 `max_output_tokens` 与上下文预算预留使用同一数值，保证预算和实际输出上限一致。Responses 模式使用扁平 function tool 定义、`function_call`/`function_call_output` 输入项，并保留 Provider 输出项以支持推理模型的连续工具调用。

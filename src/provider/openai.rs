@@ -1,5 +1,7 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -24,6 +26,23 @@ pub struct OpenAiProvider {
     api_key: String,
     endpoint: String,
     api: OpenAiApi,
+    /// Memo for the whole-body token count. Preparing a request happens
+    /// several times per turn on byte-identical input — status refresh,
+    /// budget check, each compaction retry — and BPE over a full context is
+    /// by far the most expensive part of it.
+    token_cache: Arc<Mutex<VecDeque<(BodyKey, usize)>>>,
+}
+
+/// Body hash plus length. The length makes an already negligible hash
+/// collision unable to hand back another request's token count.
+type BodyKey = (u64, usize);
+
+const TOKEN_CACHE_ENTRIES: usize = 4;
+
+fn body_key(body: &[u8]) -> BodyKey {
+    let mut hasher = DefaultHasher::new();
+    body.hash(&mut hasher);
+    (hasher.finish(), body.len())
 }
 
 #[derive(Debug)]
@@ -49,6 +68,7 @@ impl OpenAiProvider {
             api_key,
             endpoint,
             api,
+            token_cache: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
@@ -81,13 +101,37 @@ impl OpenAiProvider {
             )),
         }
         .context("failed to serialize the prepared provider request")?;
-        let serialized = std::str::from_utf8(&body)
-            .context("prepared provider request was not valid UTF-8 JSON")?;
+        let input_tokens = self.count_body_tokens(&body)?;
         Ok(PreparedRequest::new(
-            estimate_tokens(serialized),
+            input_tokens,
             max_output_tokens,
             OpenAiPreparedRequest { body },
         ))
+    }
+
+    fn count_body_tokens(&self, body: &[u8]) -> Result<usize> {
+        let key = body_key(body);
+        if let Some(tokens) = self
+            .token_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .find_map(|(cached, tokens)| (*cached == key).then_some(*tokens))
+        {
+            return Ok(tokens);
+        }
+        let serialized = std::str::from_utf8(body)
+            .context("prepared provider request was not valid UTF-8 JSON")?;
+        let tokens = estimate_tokens(serialized);
+        let mut cache = self
+            .token_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        cache.push_back((key, tokens));
+        while cache.len() > TOKEN_CACHE_ENTRIES {
+            cache.pop_front();
+        }
+        Ok(tokens)
     }
 
     async fn send_request(&self, request: OpenAiPreparedRequest) -> Result<reqwest::Response> {

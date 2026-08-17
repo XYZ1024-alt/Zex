@@ -36,10 +36,12 @@ const AUDIT_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
 const AUDIT_ROTATE_BYTES: u64 = 4 * 1024;
 const MEMORY_ID_HEX_LEN: usize = 24;
 const ACTIVE_POINTER_LIMIT: usize = 64;
+/// Upper bound on how many stored bodies one `list_pointers` call may read.
+/// Text filters fall back to scanning content, and an unbounded fallback
+/// turns a single tool call into a full-store read and decrypt.
+const CONTENT_SCAN_LIMIT: usize = 256;
 const SYSTEM_POINTER_LIMIT: usize = 24;
-const MAX_INLINE_TOOL_TOKENS: usize = 1_024;
 const RECALL_WINDOW: Duration = Duration::from_secs(60);
-const PER_MODEL_TURN_RECALL_LIMIT: usize = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,7 +72,9 @@ pub struct MemoryConfig {
     pub enabled: bool,
     pub mode: MemoryMode,
     pub recall_rate_limit: usize,
+    pub recall_per_turn_limit: usize,
     pub max_recall_tokens: usize,
+    pub max_inline_tool_tokens: usize,
     pub hot_cache_size: usize,
     pub auto_pin_important: bool,
     pub max_auto_pins: usize,
@@ -86,7 +90,13 @@ impl Default for MemoryConfig {
             enabled: true,
             mode: MemoryMode::Hybrid,
             recall_rate_limit: 5,
-            max_recall_tokens: 2_048,
+            recall_per_turn_limit: 3,
+            // Two recalls cover one full inline threshold, leaving a third for
+            // anything else the turn needs. Keep that relationship in mind
+            // before raising `max_inline_tool_tokens` on its own: past it, a
+            // pointerized observation can no longer be read back in one turn.
+            max_recall_tokens: 4_096,
+            max_inline_tool_tokens: 8_192,
             hot_cache_size: 32,
             auto_pin_important: true,
             max_auto_pins: 32,
@@ -257,6 +267,10 @@ struct RecordLocation {
 #[derive(Debug, Default)]
 struct StoreIndex {
     entries: HashMap<String, RecordLocation>,
+    /// IDs claimed by an in-flight `store` that has not finished appending.
+    /// Kept out of `entries` so readers never see a record whose offset and
+    /// length are not yet known.
+    reserved: HashSet<String>,
     order: Vec<String>,
     message_fingerprints: HashMap<String, String>,
     tool_fingerprints: HashMap<String, String>,
@@ -318,7 +332,7 @@ impl RecallLimiter {
         self.current_model_turn = 0;
     }
 
-    fn acquire(&mut self, configured_limit: usize) -> Result<()> {
+    fn acquire(&mut self, per_minute_limit: usize, per_turn_limit: usize) -> Result<()> {
         let now = Instant::now();
         while self
             .recent
@@ -327,15 +341,15 @@ impl RecallLimiter {
         {
             self.recent.pop_front();
         }
-        let per_turn_limit = configured_limit.min(PER_MODEL_TURN_RECALL_LIMIT);
+        let per_turn_limit = per_turn_limit.min(per_minute_limit);
         if self.current_model_turn >= per_turn_limit {
             bail!(
                 "recall rate limit exceeded: at most {per_turn_limit} recall calls are allowed per model turn"
             );
         }
-        if self.recent.len() >= configured_limit {
+        if self.recent.len() >= per_minute_limit {
             bail!(
-                "recall rate limit exceeded: at most {configured_limit} recall calls are allowed per minute"
+                "recall rate limit exceeded: at most {per_minute_limit} recall calls are allowed per minute"
             );
         }
         self.current_model_turn += 1;
@@ -379,8 +393,8 @@ impl SessionMemory {
             .map(|key| MemoryCipher::new(key, &session_id))
             .transpose()?;
         let mut index = StoreIndex::default();
-        let mut item_count = 0u64;
-        let mut turn_count = 0u64;
+        let mut next_sequence = 0u64;
+        let mut next_turn_sequence = 0u64;
         let mut verified_encryption = false;
         let mut has_plaintext_records = false;
 
@@ -454,21 +468,29 @@ impl SessionMemory {
                                 verified_encryption = true;
                             }
                             validate_memory_id(&item.pointer.id)?;
-                            if index.entries.contains_key(&item.pointer.id) {
-                                bail!(
-                                    "memory store {} reuses ID {}",
-                                    records_path.display(),
-                                    item.pointer.id
-                                );
+                            // Sequences come from the IDs themselves, not from
+                            // a running count: retention rewrites drop records
+                            // from the middle, so counting would hand out a
+                            // sequence that a surviving record still owns.
+                            next_sequence = next_sequence
+                                .max(sequence_from_memory_id(&item.pointer.id).saturating_add(1));
+                            // A duplicate means an earlier build wrote a
+                            // colliding ID. Last write wins so the session
+                            // stays openable instead of failing forever.
+                            let replaced = index.entries.contains_key(&item.pointer.id);
+                            if !replaced {
+                                index.order.push(item.pointer.id.clone());
                             }
-                            item_count += 1;
                             if let Some(turn_id) = &item.turn_id {
+                                next_turn_sequence = next_turn_sequence.max(
+                                    sequence_from_turn_id(turn_id)
+                                        .map_or(0, |sequence| sequence.saturating_add(1)),
+                                );
                                 index
                                     .turn_states
                                     .entry(turn_id.clone())
                                     .or_insert(MemoryTurnState::Aborted);
                             }
-                            index.order.push(item.pointer.id.clone());
                             if let Some(fingerprint) = item.pointer.metadata.get("fingerprint") {
                                 match item.pointer.kind {
                                     MemoryKind::ToolResult | MemoryKind::FileSnapshot => {
@@ -496,7 +518,10 @@ impl SessionMemory {
                             );
                         }
                         StoreRecord::Turn { turn_id, state } => {
-                            turn_count += 1;
+                            next_turn_sequence = next_turn_sequence.max(
+                                sequence_from_turn_id(&turn_id)
+                                    .map_or(0, |sequence| sequence.saturating_add(1)),
+                            );
                             index.turn_states.insert(turn_id, state);
                         }
                         StoreRecord::Audit { audit } => match audit.action {
@@ -563,8 +588,8 @@ impl SessionMemory {
             records_path,
             audit_path,
             pin_state_path,
-            next_sequence: AtomicU64::new(item_count),
-            next_turn_sequence: AtomicU64::new(turn_count),
+            next_sequence: AtomicU64::new(next_sequence),
+            next_turn_sequence: AtomicU64::new(next_turn_sequence),
             append_lock: AsyncMutex::new(()),
             audit_append_lock: AsyncMutex::new(()),
             dedupe_lock: AsyncMutex::new(()),
@@ -588,17 +613,17 @@ impl SessionMemory {
             metadata,
             turn_id,
         } = item;
-        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        let id = format!(
-            "§{}_{:016x}{:08x}",
-            kind.id_prefix(),
-            self.session_hash,
-            sequence
-        );
+        let id = self.reserve_id(kind);
         let pointer = MemoryPointer {
             id: id.clone(),
             kind,
-            created_at: timestamp()?,
+            created_at: match timestamp() {
+                Ok(created_at) => created_at,
+                Err(error) => {
+                    self.release_id(&id);
+                    return Err(error);
+                }
+            },
             source_tool,
             token_estimate: estimate_tokens(&content),
             importance,
@@ -606,13 +631,23 @@ impl SessionMemory {
             parent_id,
             metadata,
         };
-        let item = self.encode_item(pointer.clone(), turn_id.clone(), &content)?;
-        let (offset, length) = self.append(&StoreRecord::Item { item }).await?;
+        let record = match self.encode_item(pointer.clone(), turn_id.clone(), &content) {
+            Ok(item) => StoreRecord::Item { item },
+            Err(error) => {
+                self.release_id(&id);
+                return Err(error);
+            }
+        };
+        let (offset, length) = match self.append(&record).await {
+            Ok(location) => location,
+            Err(error) => {
+                self.release_id(&id);
+                return Err(error);
+            }
+        };
 
         let mut index = self.index.lock().unwrap_or_else(|error| error.into_inner());
-        if index.entries.contains_key(&id) {
-            bail!("memory ID {id} was generated more than once");
-        }
+        index.reserved.remove(&id);
         index.order.push(id.clone());
         if let Some(fingerprint) = pointer.metadata.get("fingerprint") {
             match pointer.kind {
@@ -645,6 +680,33 @@ impl SessionMemory {
         Ok(pointer)
     }
 
+    /// Claims an unused ID under the index lock. Reserving before the append
+    /// is what keeps a collision out of `records.jsonl`: a duplicate that
+    /// reached the log would survive every restart.
+    fn reserve_id(&self, kind: MemoryKind) -> String {
+        let mut index = self.index.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+            let id = format!(
+                "§{}_{:016x}{:08x}",
+                kind.id_prefix(),
+                self.session_hash,
+                sequence
+            );
+            if !index.entries.contains_key(&id) && index.reserved.insert(id.clone()) {
+                return id;
+            }
+        }
+    }
+
+    fn release_id(&self, id: &str) {
+        self.index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .reserved
+            .remove(id);
+    }
+
     fn encode_item(
         &self,
         pointer: MemoryPointer,
@@ -673,13 +735,6 @@ impl SessionMemory {
         retention_days: u64,
         protected: &HashSet<String>,
     ) -> Result<bool> {
-        let visible = self.pointers(None);
-        let indexed_records = self
-            .index
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .entries
-            .len();
         let store_bytes = match tokio::fs::metadata(&self.records_path).await {
             Ok(metadata) => metadata.len(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
@@ -698,15 +753,38 @@ impl SessionMemory {
                 && OffsetDateTime::parse(&pointer.created_at, &Rfc3339)
                     .is_ok_and(|created_at| created_at < cutoff)
         };
-        let needs_rewrite = indexed_records != visible.len()
-            || visible.len() > max_records
+        // This runs after every successful turn, so the common "nothing to do"
+        // answer must not clone the whole pointer set. Records are appended in
+        // time order, so the oldest evictable one decides expiry for all.
+        let (indexed_records, visible_count, has_expired) = {
+            let index = self.index.lock().unwrap_or_else(|error| error.into_inner());
+            let mut visible_count = 0usize;
+            let mut has_expired = false;
+            let mut checked_expiry = false;
+            for location in index.order.iter().filter_map(|id| index.entries.get(id)) {
+                if !Self::location_is_visible(&index, location, None) {
+                    continue;
+                }
+                visible_count += 1;
+                if !checked_expiry
+                    && !location.pointer.pinned
+                    && !protected.contains(&location.pointer.id)
+                {
+                    checked_expiry = true;
+                    has_expired = is_expired(&location.pointer);
+                }
+            }
+            (index.entries.len(), visible_count, has_expired)
+        };
+        let needs_rewrite = indexed_records != visible_count
+            || visible_count > max_records
             || store_bytes > max_store_bytes
-            || visible.iter().any(is_expired)
+            || has_expired
             || self.needs_encryption_migration;
         if !needs_rewrite {
             return Ok(false);
         }
-
+        let visible = self.pointers(None);
         let retained_by_age = visible
             .into_iter()
             .filter(|pointer| !is_expired(pointer))
@@ -1467,24 +1545,23 @@ impl MemoryRuntime {
             .context("failed to persist compacted conversation in addressable memory")
     }
 
+    /// Chooses what the model actually sees for a stored tool result.
+    /// Replacing an observation with a bare citation costs a round trip and
+    /// invites the model to guess, so only outputs large enough to threaten
+    /// the context budget are worth the trade. Everything smaller stays
+    /// inline and is downgraded later by `prune_tool_outputs`, which only
+    /// runs once the budget is genuinely under pressure.
     pub fn render_tool_result(&self, pointer: &MemoryPointer, visible_output: String) -> String {
         match self.config.mode {
-            MemoryMode::Summary => format!(
-                "{visible_output}\n\n[addressable copy] {}",
-                self.citation(pointer)
-            ),
             MemoryMode::PointerPriority | MemoryMode::Hybrid
-                if pointer.token_estimate
-                    > self.config.max_recall_tokens.min(MAX_INLINE_TOOL_TOKENS) =>
+                if pointer.token_estimate > self.config.max_inline_tool_tokens =>
             {
                 self.citation(pointer)
             }
-            MemoryMode::PointerPriority | MemoryMode::Hybrid => {
-                format!(
-                    "{visible_output}\n\n[addressable copy] {}",
-                    self.citation(pointer)
-                )
-            }
+            _ => format!(
+                "{visible_output}\n\n[addressable copy] {}",
+                self.citation(pointer)
+            ),
         }
     }
 
@@ -1564,7 +1641,10 @@ impl MemoryRuntime {
             .recall_limiter
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .acquire(self.config.recall_rate_limit);
+            .acquire(
+                self.config.recall_rate_limit,
+                self.config.recall_per_turn_limit,
+            );
         if let Err(error) = rate_result {
             let message = error.to_string();
             session
@@ -1697,7 +1777,12 @@ impl MemoryRuntime {
             pointers
         };
         let mut matches = Vec::new();
-        for pointer in candidates {
+        let mut content_reads = 0usize;
+        let mut unscanned = 0usize;
+        // Newest first: a bounded scan should spend its reads on the pointers
+        // most likely to matter, and an unfiltered store can be far larger
+        // than a single tool call should ever page through.
+        for pointer in candidates.into_iter().rev() {
             let mut content = None;
             let mut matched = true;
             for filter in parsed_filter.as_deref().unwrap_or_default() {
@@ -1709,6 +1794,12 @@ impl MemoryRuntime {
                     break;
                 };
                 if content.is_none() {
+                    if content_reads >= CONTENT_SCAN_LIMIT {
+                        matched = false;
+                        unscanned += 1;
+                        break;
+                    }
+                    content_reads += 1;
                     content = session
                         .read(&pointer.id, active_turn.as_deref())
                         .await?
@@ -1759,6 +1850,11 @@ impl MemoryRuntime {
             output.push_str(&format!(
                 "\n- [{} more pointers omitted; pass a narrower filter]",
                 total - matches.len()
+            ));
+        }
+        if unscanned > 0 {
+            output.push_str(&format!(
+                "\n- [{unscanned} older pointers were not searched by content after {CONTENT_SCAN_LIMIT} reads; narrow the filter with tool=, path=, or kind=]"
             ));
         }
         Ok(output)
@@ -1956,6 +2052,20 @@ pub fn extract_memory_ids(content: &str) -> Vec<String> {
     ids
 }
 
+/// Sequence encoded in the trailing hex digits of a memory ID. Callers
+/// validate the ID first; a malformed suffix yields 0 so a corrupt line can
+/// never wind the allocator back past a valid record.
+fn sequence_from_memory_id(id: &str) -> u64 {
+    id.rsplit_once('_')
+        .and_then(|(_, suffix)| suffix.get(suffix.len().checked_sub(8)?..))
+        .and_then(|sequence| u64::from_str_radix(sequence, 16).ok())
+        .unwrap_or(0)
+}
+
+fn sequence_from_turn_id(turn_id: &str) -> Option<u64> {
+    u64::from_str_radix(turn_id.rsplit_once('-')?.1, 16).ok()
+}
+
 pub fn validate_memory_id(id: &str) -> Result<&str> {
     let Some((prefix, suffix)) = id.split_once('_') else {
         bail!("expected §obs_<hex>, §turn_<hex>, §decision_<hex>, or §summary_<hex>");
@@ -2119,7 +2229,7 @@ fn fingerprint_bytes(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, process, time::SystemTime};
+    use std::{collections::HashSet, path::PathBuf, process, time::SystemTime};
 
     use serde_json::json;
 
@@ -2479,6 +2589,156 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(records.lines().count(), 2);
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_does_not_hand_out_ids_that_surviving_records_still_own() {
+        let directory = temporary_directory("sequence-reuse");
+        let session_id = "20260815-120000-51525354";
+        let config = MemoryConfig {
+            max_records: 10,
+            max_store_bytes: 2_500,
+            ..MemoryConfig::default()
+        };
+        let runtime = MemoryRuntime::new(config.clone());
+        runtime
+            .activate(session_id, directory.clone())
+            .await
+            .unwrap();
+        let mut pointers = Vec::new();
+        for index in 0..4 {
+            pointers.push(
+                runtime
+                    .store_tool_result(
+                        "read",
+                        &json!({"path": format!("{index}.txt")}),
+                        format!("record {index} {}", "x".repeat(1_600)),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        // Retention drops the middle records, so a count-derived allocator
+        // would walk straight back onto the surviving newest ID.
+        runtime.set_active_pointers([pointers[0].id.clone(), pointers[3].id.clone()]);
+        runtime.maintain().await.unwrap();
+
+        let mut fresh = Vec::new();
+        for index in 0..8 {
+            fresh.push(
+                runtime
+                    .store_tool_result(
+                        "grep",
+                        &json!({"pattern": format!("p{index}")}),
+                        format!("fresh {index}"),
+                    )
+                    .await
+                    .expect("storing after retention must not collide"),
+            );
+        }
+        for pointer in &fresh {
+            assert_ne!(pointer.id, pointers[0].id);
+            assert_ne!(pointer.id, pointers[3].id);
+        }
+        let unique = fresh
+            .iter()
+            .map(|pointer| pointer.id.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(unique.len(), fresh.len());
+
+        // The store must still open cleanly: a colliding ID on disk used to
+        // make the session unrecoverable.
+        let reopened = MemoryRuntime::new(config);
+        reopened
+            .activate(session_id, directory.clone())
+            .await
+            .expect("a session must stay resumable after retention");
+        assert!(reopened.contains(&fresh[7].id));
+        assert!(reopened.contains(&pointers[3].id));
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_store_poisoned_by_an_older_build_still_opens() {
+        let directory = temporary_directory("duplicate-recovery");
+        let session_id = "20260815-120000-61626364";
+        let runtime = MemoryRuntime::new(MemoryConfig::default());
+        runtime
+            .activate(session_id, directory.clone())
+            .await
+            .unwrap();
+        let original = runtime
+            .store_tool_result("read", &json!({"path": "a.txt"}), "first body".to_owned())
+            .await
+            .unwrap();
+
+        // Replay the duplicate line an older build could append before its
+        // guard fired, with different content so last-write-wins is visible.
+        let records_path = runtime.records_path().unwrap();
+        let poisoned = tokio::fs::read_to_string(&records_path)
+            .await
+            .unwrap()
+            .replace("first body", "second body");
+        let mut appended = tokio::fs::read_to_string(&records_path).await.unwrap();
+        appended.push_str(&poisoned);
+        tokio::fs::write(&records_path, appended).await.unwrap();
+
+        let reopened = MemoryRuntime::new(MemoryConfig::default());
+        reopened
+            .activate(session_id, directory.clone())
+            .await
+            .expect("a duplicated ID must not make the session unopenable");
+        let recalled = reopened
+            .recall(&original.id, None, None, None)
+            .await
+            .unwrap();
+        assert!(recalled.contains("second body"));
+        let next = reopened
+            .store_tool_result("grep", &json!({"pattern": "x"}), "later".to_owned())
+            .await
+            .unwrap();
+        assert_ne!(next.id, original.id);
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_outputs_past_the_inline_threshold_lose_their_body() {
+        let directory = temporary_directory("inline-threshold");
+        let runtime = MemoryRuntime::new(MemoryConfig {
+            max_inline_tool_tokens: 1_000,
+            max_recall_tokens: 500,
+            ..MemoryConfig::default()
+        });
+        runtime
+            .activate("20260815-120000-71727374", directory.clone())
+            .await
+            .unwrap();
+
+        // Mid-sized results used to be pointerized too, which cost a round
+        // trip and more total context than simply showing them.
+        let moderate = "moderate line\n".repeat(100);
+        let pointer = runtime
+            .store_tool_result("grep", &json!({"pattern": "m"}), moderate.clone())
+            .await
+            .unwrap();
+        assert!(pointer.token_estimate < 1_000);
+        let rendered = runtime.render_tool_result(&pointer, moderate.clone());
+        assert!(rendered.starts_with(&moderate));
+        assert!(rendered.contains(&pointer.id));
+
+        let huge = "huge line of output\n".repeat(1_000);
+        let pointer = runtime
+            .store_tool_result("grep", &json!({"pattern": "h"}), huge.clone())
+            .await
+            .unwrap();
+        assert!(pointer.token_estimate > 1_000);
+        let rendered = runtime.render_tool_result(&pointer, huge);
+        assert!(!rendered.contains("huge line of output"));
+        assert!(rendered.contains(&pointer.id));
 
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
