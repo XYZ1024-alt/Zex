@@ -2436,7 +2436,11 @@ mod tests {
         assert!(limited.to_string().contains("rate limit reached"));
         // A throttle must not read as an absent record: the model is told to
         // treat those two very differently.
-        assert!(limited.to_string().contains("does not mean the record is missing"));
+        assert!(
+            limited
+                .to_string()
+                .contains("does not mean the record is missing")
+        );
 
         let records_path = runtime.records_path().unwrap();
         let log = tokio::fs::read_to_string(&records_path).await.unwrap();
@@ -2994,14 +2998,9 @@ mod tests {
         // digest would let anyone holding this file confirm a guess about what
         // the session observed.
         assert!(stored.contains(KEYED_FINGERPRINT_PREFIX));
-        assert!(
-            !stored.contains(&fingerprint_bytes(&tool_result_fingerprint_input(
-                "read",
-                &json!({"path": "secret.txt"}),
-                secret
-            )
-            .unwrap()))
-        );
+        assert!(!stored.contains(&fingerprint_bytes(
+            &tool_result_fingerprint_input("read", &json!({"path": "secret.txt"}), secret).unwrap()
+        )));
         drop(runtime);
 
         let reopened = MemoryRuntime::new(config);
@@ -3076,7 +3075,11 @@ mod tests {
         assert!(!stored.contains(secret));
         // Migration must not carry the old unkeyed digest forward: it is a
         // plaintext handle on content that is now encrypted.
-        assert!(!stored.contains(&fingerprint_bytes(&message_fingerprint_input("user", secret))));
+        assert!(
+            !stored.contains(&fingerprint_bytes(&message_fingerprint_input(
+                "user", secret
+            )))
+        );
         assert!(
             encrypted
                 .recall(&pointer.id, None, None, None)

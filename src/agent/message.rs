@@ -1,17 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::OnceLock;
 
-/// Shared o200k_base tokenizer used for context budgeting. It approximates
-/// the vocab of the models Zex talks to closely enough for threshold
-/// decisions; if construction ever fails we fall back to a character
-/// heuristic instead of breaking the agent.
-fn tokenizer() -> Option<&'static tiktoken_rs::CoreBPE> {
-    static TOKENIZER: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
-    TOKENIZER
-        .get_or_init(|| tiktoken_rs::o200k_base().ok())
-        .as_ref()
-}
+const ASCII_CHARS_PER_TOKEN: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "role", rename_all = "lowercase")]
@@ -95,12 +85,24 @@ impl Message {
 }
 
 pub(crate) fn estimate_tokens(content: &str) -> usize {
-    if let Some(bpe) = tokenizer() {
-        // `encode_ordinary` treats special-token-looking text as plain text,
-        // so untrusted file contents can never panic the counter.
-        return bpe.encode_ordinary(content).len();
+    let mut tokens = 0usize;
+    let mut ascii_run = 0usize;
+    for character in content.chars() {
+        if character.is_ascii() {
+            ascii_run += 1;
+            if ascii_run == ASCII_CHARS_PER_TOKEN {
+                tokens = tokens.saturating_add(1);
+                ascii_run = 0;
+            }
+            continue;
+        }
+        if ascii_run > 0 {
+            tokens = tokens.saturating_add(1);
+            ascii_run = 0;
+        }
+        tokens = tokens.saturating_add(1);
     }
-    heuristic_estimate(content)
+    tokens.saturating_add(usize::from(ascii_run > 0))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,52 +114,11 @@ pub(crate) struct TokenWindow {
 }
 
 pub(crate) fn token_window(content: &str, offset: usize, max_tokens: usize) -> TokenWindow {
-    if let Some(bpe) = tokenizer() {
-        let tokens = bpe.encode_ordinary(content);
-        let total = tokens.len();
-        let mut start = offset.min(total);
-        while start > 0 && bpe.decode(&tokens[..start]).is_err() {
-            start -= 1;
-        }
-        let mut end = offset.saturating_add(max_tokens).min(total);
-        while end > start && bpe.decode(&tokens[..end]).is_err() {
-            end -= 1;
-        }
-        let content = bpe.decode(&tokens[start..end]).unwrap_or_default();
-        return TokenWindow {
-            content,
-            start,
-            end,
-            total,
-        };
-    }
-
-    let total = heuristic_estimate(content);
-    let mut ascii = 0usize;
-    let mut non_ascii = 0usize;
-    let mut start_byte = content.len();
-    let mut end_byte = content.len();
-    let requested_end = offset.saturating_add(max_tokens);
-    for (byte, character) in content.char_indices() {
-        let tokens = ascii / 4 + non_ascii;
-        if start_byte == content.len() && tokens >= offset {
-            start_byte = byte;
-        }
-        if tokens >= requested_end {
-            end_byte = byte;
-            break;
-        }
-        if character.is_ascii() {
-            ascii += 1;
-        } else {
-            non_ascii += 1;
-        }
-    }
-    if offset == 0 {
-        start_byte = 0;
-    }
+    let total = estimate_tokens(content);
     let start = offset.min(total);
-    let end = requested_end.min(total);
+    let end = offset.saturating_add(max_tokens).min(total);
+    let start_byte = estimated_token_byte_offset(content, start);
+    let end_byte = estimated_token_byte_offset(content, end);
     TokenWindow {
         content: content[start_byte..end_byte].to_owned(),
         start,
@@ -166,18 +127,70 @@ pub(crate) fn token_window(content: &str, offset: usize, max_tokens: usize) -> T
     }
 }
 
-/// Last-resort estimate when the tokenizer is unavailable: ASCII text
-/// averages ~4 characters per token while CJK and other non-ASCII scripts
-/// are closer to 1 token per character.
-fn heuristic_estimate(content: &str) -> usize {
-    let mut ascii = 0usize;
-    let mut non_ascii = 0usize;
-    for character in content.chars() {
+/// Maps the lightweight estimate back to a UTF-8 byte boundary without a
+/// tokenizer. Consecutive ASCII is grouped four characters at a time; a
+/// partial run and every non-ASCII character each form one estimated token.
+fn estimated_token_byte_offset(content: &str, token_offset: usize) -> usize {
+    if token_offset == 0 {
+        return 0;
+    }
+    let mut tokens = 0usize;
+    let mut ascii_run = 0usize;
+    for (byte, character) in content.char_indices() {
         if character.is_ascii() {
-            ascii += 1;
-        } else {
-            non_ascii += 1;
+            ascii_run += 1;
+            if ascii_run == ASCII_CHARS_PER_TOKEN {
+                tokens += 1;
+                ascii_run = 0;
+                if tokens == token_offset {
+                    return byte + character.len_utf8();
+                }
+            }
+            continue;
+        }
+        if ascii_run > 0 {
+            tokens += 1;
+            ascii_run = 0;
+            if tokens == token_offset {
+                return byte;
+            }
+        }
+        tokens += 1;
+        if tokens == token_offset {
+            return byte + character.len_utf8();
         }
     }
-    ascii / 4 + non_ascii
+    content.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{estimate_tokens, token_window};
+
+    #[test]
+    fn estimates_ascii_runs_and_non_ascii_without_a_model_tokenizer() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("a"), 1);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+        assert_eq!(estimate_tokens("你好"), 2);
+        assert_eq!(estimate_tokens("ab你cd"), 3);
+    }
+
+    #[test]
+    fn token_windows_page_without_splitting_utf8_or_losing_content() {
+        let content = "abcdefgh你好ijkl";
+        let first = token_window(content, 0, 2);
+        let middle = token_window(content, first.end, 2);
+        let last = token_window(content, middle.end, 1);
+
+        assert_eq!(first.content, "abcdefgh");
+        assert_eq!(middle.content, "你好");
+        assert_eq!(last.content, "ijkl");
+        assert_eq!(
+            format!("{}{}{}", first.content, middle.content, last.content),
+            content
+        );
+        assert_eq!(last.end, last.total);
+    }
 }

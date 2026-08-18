@@ -397,9 +397,9 @@ enabled = false
 
 ### 上下文 compact
 
-Compact 是 core 的确定性规则，不调用外部总结模型。每次 Provider 调用前先生成一次 `PreparedRequest`：按当前模型能力移除不会回传的历史 reasoning，构造 Chat Completions 或 Responses 的实际 JSON 请求，加入完整工具定义和需要连续传递的 interleaved reasoning/provider state，再使用内置 tiktoken o200k_base 估算整个 wire payload。同一份序列化请求直接发送。相同 body 的估算结果会被小容量缓存复用，因为一轮内状态刷新、预算判定和每次 compact 重试都会重复准备同一个请求，而整段 BPE 是其中最贵的一步。
+Compact 是 core 的确定性规则，不调用外部总结模型。每次 Provider 调用前先生成一次 `PreparedRequest`：按当前模型能力移除不会回传的历史 reasoning，构造 Chat Completions 或 Responses 的实际 JSON 请求，加入完整工具定义和需要连续传递的 interleaved reasoning/provider state，再对整个 wire payload 使用轻量、模型无关的字符估算：连续 ASCII 文本约每 4 个字符计 1 token，非 ASCII 字符按每个 1 token 计；不依赖 tiktoken、BPE 或某个模型的专用词表。同一份序列化请求直接发送，相同 body 的估算结果会被小容量缓存复用，避免一轮内状态刷新、预算判定和 compact 重试重复扫描。
 
-Provider 返回的 `usage` 不再被当作陈旧 baseline，但会作为校准回灌：实际计费输入 token 与本次估算的比值在 0.7–1.5 之间时按指数平滑更新一个系数，之后所有预算判定都用校准后的数值。落在带外的样本（典型如只报未命中缓存部分的 provider）会被丢弃而不是采信，切换模型时系数清零。
+Provider 返回的 `usage` 不再被当作陈旧 baseline，但会作为权威反馈校准本地估算：实际计费输入 token 与本次估算的比值在 0.7–4.0 之间时按指数平滑更新一个系数，之后所有预算判定都用校准后的数值。上限允许不同词表、标点密集 JSON 和不透明 provider state 对轻量估算产生较大偏差；过低样本（典型如只报未命中缓存部分的 provider）仍会被丢弃而不是错误缩小上下文，切换模型时系数清零。
 
 预算取模型 context window（models.dev `limit.context` 或模型配置的 `context_window` 覆盖）扣除输出预留，未知时用 `max_context_tokens` 作为输入预算兜底：
 

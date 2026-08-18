@@ -308,6 +308,16 @@ async fn billed_usage_calibrates_later_context_estimates() {
 }
 
 #[tokio::test]
+async fn plausible_large_ratio_calibrates_the_lightweight_estimate() {
+    let (agent, last_estimate) = calibrated_agent(2.5).await;
+
+    let reported = agent.context_tokens();
+    let raw = last_estimate.load(Ordering::Relaxed);
+    assert!(raw > 0);
+    assert_eq!(reported, (raw as f64 * 2.5).round() as usize);
+}
+
+#[tokio::test]
 async fn implausible_billing_is_ignored_rather_than_trusted() {
     // A provider that reports cache-excluded input tokens looks like this.
     // Scaling the budget by it would badly under-count the real context.
@@ -1419,19 +1429,16 @@ impl Provider for OversizedProvider {
 }
 
 #[test]
-fn fallback_message_estimate_uses_bpe_and_skips_reasoning_state() {
-    // o200k_base merges common ASCII runs into single tokens.
+fn fallback_message_estimate_uses_character_runs_and_skips_reasoning_state() {
     let ascii = crate::agent::Message::User {
         content: "abcdefgh".repeat(8),
     };
-    assert_eq!(ascii.token_estimate(), 8);
+    assert_eq!(ascii.token_estimate(), 16);
 
-    // CJK text tokenizes at roughly one token per two characters, far below
-    // the one-token-per-character worst case of the character heuristic.
     let cjk = crate::agent::Message::User {
         content: "你好".repeat(32),
     };
-    assert_eq!(cjk.token_estimate(), 32);
+    assert_eq!(cjk.token_estimate(), 64);
 
     let thinking = crate::agent::Message::Assistant {
         content: "answer".to_owned(),

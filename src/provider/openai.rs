@@ -28,8 +28,8 @@ pub struct OpenAiProvider {
     api: OpenAiApi,
     /// Memo for the whole-body token count. Preparing a request happens
     /// several times per turn on byte-identical input — status refresh,
-    /// budget check, each compaction retry — and BPE over a full context is
-    /// by far the most expensive part of it.
+    /// budget check, each compaction retry — so even the lightweight linear
+    /// estimate should not rescan an unchanged body.
     token_cache: Arc<Mutex<VecDeque<(BodyKey, usize)>>>,
 }
 

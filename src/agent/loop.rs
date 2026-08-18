@@ -45,12 +45,12 @@ const PRUNE_MIN_CHARS: usize = 2_000;
 /// if it were an observation, or cleared a second time.
 const CLEARED_TOOL_OUTPUT_PREFIX: &str = "[tool output cleared to free context:";
 /// Bounds on the estimate-to-billed ratio we are willing to trust. The JSON
-/// body we measure is not the wire format a provider tokenizes, so a modest
-/// offset is expected; a sample far outside this band means the provider is
-/// reporting something else entirely — cache-excluded input tokens, most
-/// often — and budgeting against it would be worse than not calibrating.
+/// body uses a cheap model-agnostic character estimate, so substantial
+/// under-counting is plausible for punctuation-dense JSON, base64 state, and
+/// models with different vocabularies. Very low ratios still usually mean the
+/// provider reports only cache-miss tokens, which must not shrink the budget.
 const CALIBRATION_MIN: f64 = 0.7;
-const CALIBRATION_MAX: f64 = 1.5;
+const CALIBRATION_MAX: f64 = 4.0;
 const CALIBRATION_WEIGHT: f64 = 0.5;
 
 pub struct Agent<P> {
