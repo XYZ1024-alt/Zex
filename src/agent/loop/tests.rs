@@ -657,7 +657,11 @@ async fn large_tool_result_compacts_to_a_recallable_citation() {
         .unwrap();
     let id = extract_memory_ids(tool_content).pop().unwrap();
     assert!(tool_content.contains("recall available"));
-    assert!(!tool_content.contains("precise-large-observation"));
+    // The bulk is gone, but a bounded head rides along with the citation so the
+    // model can judge relevance without spending a recall to find out.
+    assert!(tool_content.contains("precise-large-observation"));
+    assert!(tool_content.matches("precise-large-observation").count() < 100);
+    assert!(tool_content.len() * 4 < original.len());
     // The system prompt carries the static policy only. The volatile pointer
     // manifest rides at the end of the wire request so the cached prefix
     // survives every turn.
@@ -665,7 +669,8 @@ async fn large_tool_result_compacts_to_a_recallable_citation() {
         agent.messages().first(),
         Some(crate::agent::Message::System { content })
             if content.contains("Never invent")
-                && content.contains("A recall failure means the content is unavailable")
+                && content.contains("A missing or invalid ID means that content is unavailable")
+                && content.contains("A rate-limit error is temporary")
                 && !content.contains("[Current valid addressable pointers]")
                 && !content.contains(&id)
     ));

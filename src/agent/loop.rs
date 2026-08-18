@@ -23,10 +23,11 @@ const SYSTEM_PROMPT: &str = "You are Zex, a minimal AI agent core. Be concise an
 const MEMORY_POLICY_MARKER: &str = "\n\n[Addressable memory policy]";
 const POINTER_MANIFEST_MARKER: &str = "[Current valid addressable pointers]";
 const MEMORY_POLICY: &str = "[Addressable memory policy]\n\
-- Large observations may appear only as §id citations. Call recall with an exact visible ID only when missing details directly affect the current decision.\n\
+- Large observations may appear only as §id citations, sometimes with a bounded head excerpt. Call recall with an exact visible ID only when the head is not enough and the missing details directly affect the current decision.\n\
 - Never invent, alter, or guess an ID. If an ID is not visible, use list_pointers with a narrow filter. Prefer pinned and recently listed pointers.\n\
 - Recall is rate-limited. Do not recall information already present in the active context, and do not batch speculative recalls.\n\
-- A recall failure means the content is unavailable. State that fact and never reconstruct or hallucinate it.\n\
+- A missing or invalid ID means that content is unavailable. State that fact and never reconstruct or hallucinate it.\n\
+- A rate-limit error is temporary and is not evidence that a record is gone. Continue with the context you have and recall in a later turn if the detail still matters.\n\
 - pin preserves high-value evidence or decisions; unpin it when no longer central.\n\
 Good: a compiler error cites §obs_abcd... and the exact diagnostic affects the fix, so recall that exact ID once.\n\
 Bad: invent §obs_latest, repeatedly recall every pointer, or guess file contents after recall reports a missing ID.";
@@ -39,6 +40,10 @@ const TOOL_SUMMARY_EDGE_CHARS: usize = 180;
 const ANCHOR_MAX_CHARS: usize = 4_000;
 const PRUNE_KEEP_TOOL_RESULTS: usize = 4;
 const PRUNE_MIN_CHARS: usize = 2_000;
+/// Marker `prune_tool_outputs` leaves in place of a discarded body. Archival
+/// and pruning both have to recognize it so a placeholder is never stored as
+/// if it were an observation, or cleared a second time.
+const CLEARED_TOOL_OUTPUT_PREFIX: &str = "[tool output cleared to free context:";
 /// Bounds on the estimate-to-billed ratio we are willing to trust. The JSON
 /// body we measure is not the wire format a provider tokenizes, so a modest
 /// offset is expected; a sample far outside this band means the provider is
@@ -340,7 +345,7 @@ where
                 if extract_memory_ids(content)
                     .iter()
                     .any(|id| memory.contains(id))
-                    || content.starts_with("[tool output cleared")
+                    || is_cleared_tool_output(content)
                 {
                     return None;
                 }
@@ -526,9 +531,7 @@ where
                     let Some((name, arguments)) = tool_calls.get(tool_call_id) else {
                         continue;
                     };
-                    if MemoryRuntime::is_control_tool(name)
-                        || content.starts_with("[tool output cleared")
-                    {
+                    if MemoryRuntime::is_control_tool(name) || is_cleared_tool_output(content) {
                         None
                     } else {
                         Some(
@@ -922,6 +925,15 @@ fn fallback_request_tokens(messages: &[Message], tools: &[ToolDefinition]) -> us
         .unwrap_or_else(|_| messages.iter().map(Message::token_estimate).sum())
 }
 
+/// Whether a tool message body is the placeholder left behind by
+/// `prune_tool_outputs` rather than real output. This is a prefix test, so a
+/// tool whose genuine output opened with the same sentence would be taken for
+/// a cleared one; the marker is specific enough that this is not a realistic
+/// collision.
+fn is_cleared_tool_output(content: &str) -> bool {
+    content.starts_with(CLEARED_TOOL_OUTPUT_PREFIX)
+}
+
 fn message_content(message: &Message) -> &str {
     match message {
         Message::System { content }
@@ -973,7 +985,7 @@ fn prune_tool_outputs(messages: &mut [Message], memory: Option<&MemoryRuntime>) 
     for &index in &tool_indices[..prunable] {
         if let Message::Tool { content, .. } = &mut messages[index] {
             let chars = content.chars().count();
-            if chars > PRUNE_MIN_CHARS && !content.starts_with("[tool output cleared") {
+            if chars > PRUNE_MIN_CHARS && !is_cleared_tool_output(content) {
                 let citation = memory.and_then(|memory| {
                     extract_memory_ids(content)
                         .into_iter()
@@ -992,7 +1004,7 @@ fn prune_tool_outputs(messages: &mut [Message], memory: Option<&MemoryRuntime>) 
                         pruned += 1;
                     }
                     None if !pointer_mode => {
-                        *content = format!("[tool output cleared to free context: {chars} chars]");
+                        *content = format!("{CLEARED_TOOL_OUTPUT_PREFIX} {chars} chars]");
                         pruned += 1;
                     }
                     // Unaddressable output under a pointer mode is the only

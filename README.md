@@ -49,7 +49,7 @@ hide_thinking_block = false
 [memory]
 enabled = true
 mode = "hybrid"
-recall_rate_limit = 5
+recall_rate_limit = 12
 recall_per_turn_limit = 3
 max_recall_tokens = 4096
 max_inline_tool_tokens = 8192
@@ -103,12 +103,12 @@ max = "max"
 | `compact_keep_turns` | `6` | compact 时完整保留的最近用户轮次数 |
 | `memory.enabled` | `true` | ARC 总开关；关闭后不注册 memory 工具，并回退到原有工具输出与 summary compact 路径 |
 | `memory.mode` | `"hybrid"` | `pointer_priority` 优先 citation、`summary` 使用传统摘要、`hybrid` 保留轻量流程摘要并用 citation 保存精确恢复路径 |
-| `memory.recall_rate_limit` | `5` | 每分钟 recall 上限 |
+| `memory.recall_rate_limit` | `12` | 每分钟 recall 上限。真正约束单轮的是 `recall_per_turn_limit`；这个值只用于拦截跨轮次的循环，因此设为若干轮的额度，避免一分钟内的第二轮就被拒 |
 | `memory.recall_per_turn_limit` | `3` | 每个模型工具轮的 recall 上限；实际生效值取它与 `recall_rate_limit` 的较小者 |
 | `memory.max_recall_tokens` | `4096` | 单次 recall 返回 token 上限；超限返回受控窗口片段，全文继续保留在原 ID |
-| `memory.max_inline_tool_tokens` | `8192` | 工具结果保持原样进入 Active View 的 token 上限；超过才只留 citation。默认为 `max_recall_tokens` 的两倍，因此被指针化的观察仍可在一个模型轮内读回。调高它会让上下文更完整但更占预算，调低会更早触发 recall 往返 |
+| `memory.max_inline_tool_tokens` | `8192` | 工具结果保持原样进入 Active View 的 token 上限；超过则只留 citation 加一段有界头部摘录。默认约等于 `max_tool_output_chars` 的 ASCII token 数，也是 `max_recall_tokens` 的两倍，因此被指针化的观察仍可在一个模型轮内读回。调高它会让上下文更完整但更占预算，调低会更早触发 recall 往返 |
 | `memory.hot_cache_size` | `32` | 进程内最近访问内容的 LRU 条目数；重启后由 Store 按需重建 |
-| `memory.auto_pin_important` | `true` | 自动 pin 高价值修改类工具结果；可用 `unpin` 解除 |
+| `memory.auto_pin_important` | `true` | 自动 pin 失败类工具结果（后续轮次真正会回头查的记录）；写入/编辑成功确认不再自动 pin，可用 `pin` / `unpin` 手动调整 |
 | `memory.max_auto_pins` | `32` | 每个 session 最多保留的自动 pin 数；超限时按最旧优先解除，手动 pin 不受影响 |
 | `memory.max_records` | `10000` | 每个 session Store 的目标记录上限；active/pinned 记录始终保留，因此可能暂时超过 |
 | `memory.max_store_bytes` | `67108864` | 每个 session `records.jsonl` 的目标字节上限；维护时保留 active/pinned 记录并原子重写 |
@@ -334,17 +334,21 @@ zex resume -p "继续上一轮工作并给出结论"
 
 ```text
 [file snapshot] read → §obs_8f2c… (~6.2k tokens, path=src/main.rs; recall available)
+[head ~192 tokens; recall the ID above for the rest]
+use std::collections::HashMap;
+…
 ```
 
-- 超过 `memory.max_inline_tool_tokens`（默认 8192）的结果才只进入 citation；其余保留当前可见文本并附带 addressable copy。指针化会多花一次 recall 往返，因此只对真正威胁预算的输出这样做；中等结果留在上下文里，等预算真正吃紧时再由 prune 阶段降级为 citation。
+- 超过 `memory.max_inline_tool_tokens`（默认 8192）的结果才降级为 citation；其余保留当前可见文本并附带 addressable copy。指针化会多花一次 recall 往返，因此只对真正威胁预算的输出这样做；中等结果留在上下文里，等预算真正吃紧时再由 prune 阶段降级为 citation。
+- 被指针化的结果不是只剩一行元数据：citation 后面跟一段 token 有界的头部摘录（约 192 token），让模型不必先花一次 recall 才知道这条记录是否相关。
 - `/compact` 和 auto-compact 在删除旧轮次前，把用户/assistant 原消息写为 `§turn_...`，把工具观察保留为 `§obs_...`，再生成有界 structured summary 和 pointer manifest。
 - `recall({"id":"§obs_...","reason":"该诊断直接决定修复"})` 精确取回未超上限的原文；大内容返回受控片段，全文仍保留在同一 ID。
 - 相同工具、参数和完整输出只保存一次，重复观察复用已有 ID。
-- `pin` / `unpin` 调整 compact 和 pointer manifest 的优先级；自动 pin 默认最多 32 个，最旧自动 pin 会被解除，手动 pin 不被自动驱逐。
+- `pin` / `unpin` 调整 compact 和 pointer manifest 的优先级；自动 pin 只作用于失败类结果（`write` / `edit` 的成功确认不再自动 pin——它们的改动已经落盘，却会把 pin 额度占满），默认最多 32 个，最旧自动 pin 会被解除，手动 pin 不被自动驱逐。pinned 记录在 pointer manifest 中最多占一半名额，剩下的名额始终留给当前 active 指针，避免长会话里积累的 pin 把模型自己刚产生的观察挤出清单。
 - `list_pointers` 无 filter 时列出 active/pinned ID 和有界内容预览；普通文本 filter 会扫描 metadata 与 Store 内容，结构化 filter 支持 `tool=read path=src/main.rs kind=file_snapshot pinned=true` 等 AND 组合。它是精确子串检索，不是语义检索。内容扫描按由新到旧最多读取 256 条记录，超出部分在输出末尾明确标注，避免一次工具调用变成全量读取与解密。
-- 不存在或格式错误的 ID 会返回明确错误；recall 默认每个模型工具轮最多 3 次（`memory.recall_per_turn_limit`）、每分钟最多 5 次。recall、失败、限流和 pin 操作写入独立轮转审计日志，内容 Store 不混入操作事件。
+- 不存在或格式错误的 ID 会返回明确错误；recall 默认每个模型工具轮最多 3 次（`memory.recall_per_turn_limit`）、每分钟最多 12 次。限流错误明确说明这是临时的、记录并未丢失，避免模型把节流当成内容不存在。recall、失败、限流和 pin 操作写入独立轮转审计日志，内容 Store 不混入操作事件。
 - 记录 ID 的序号来自已有记录本身而非计数：retention 会从中间淘汰记录，按数量恢复会重新发放存活记录仍持有的序号。ID 在写盘前先在索引中预占，冲突不会进入 `records.jsonl`。若旧版本已写入重复 ID，载入时按后写优先恢复，会话不会因此永久打不开。
-- Store 在上下文载入和成功轮次后执行保留维护：过期、超记录数或超字节预算的非 active/non-pinned 记录被淘汰，保留集通过 crash-safe 原子替换重写。active/pinned 是安全豁免项，因此目标容量不是会破坏当前引用的硬上限。
+- Store 在上下文载入和成功轮次后执行保留维护：过期、超记录数或超字节预算的非 active/non-pinned 记录被淘汰，保留集通过 crash-safe 原子替换重写。active/pinned 是安全豁免项，因此目标容量不是会破坏当前引用的硬上限。当保留集与当前可见集完全相同（例如超出预算的部分全部被 pin 或正在被引用）时跳过重写：此时重写只会把同一批记录写回去，再让维护逻辑重新索引整个文件，等于每轮付一次全量 I/O。这种情况下 Store 只是停在目标之上，需要 `unpin` 才会继续收缩。
 
 可选的本地内容加密只通过环境变量启用：
 
@@ -352,7 +356,7 @@ zex resume -p "继续上一轮工作并给出结论"
 $env:ZEX_MEMORY_ENCRYPTION_KEY = "use-a-long-random-secret"
 ```
 
-同一密钥使用 Argon2 派生 session 独立密钥，并以 XChaCha20-Poly1305 加密会话 transcript、memory 正文和 memory audit；密文被认证，错误密钥会在载入时失败。启用后，既有 memory 正文在首次维护时原子迁移，既有 session transcript 在下次保存时迁移。为支持启动索引与结构化过滤，memory ID、类型、时间戳、token 数、pin 状态以及 tool/path/command 等 metadata 仍为明文。Zex 不持久化密钥，也尚不提供密钥轮换；删除或更换环境变量会使已有密文不可读。
+同一密钥使用 Argon2 派生 session 独立密钥，并以 XChaCha20-Poly1305 加密会话 transcript、memory 正文和 memory audit；密文被认证，错误密钥会在载入时失败。启用后，既有 memory 正文在首次维护时原子迁移，既有 session transcript 在下次保存时迁移。为支持启动索引与结构化过滤，memory ID、类型、时间戳、token 数、pin 状态以及 tool/path/command 等 metadata 仍为明文。去重用的 fingerprint 也必须留在明文里（否则重启时无法在不解密全库的情况下重建去重索引），因此它改用从 session 密钥派生的子密钥做 BLAKE2 MAC，并带 `k1:` 前缀：明文摘要会让拿到文件的人验证「某段已知内容是否被观察过」，加密钥后不再可行。迁移旧库时未加密钥的老摘要会被丢弃而不是沿用——这些记录因此失去去重，但泄露更糟。Zex 不持久化密钥，也尚不提供密钥轮换；删除或更换环境变量会使已有密文不可读。
 
 ### Store 扩展边界
 
@@ -399,7 +403,7 @@ Provider 返回的 `usage` 不再被当作陈旧 baseline，但会作为校准�
 
 预算取模型 context window（models.dev `limit.context` 或模型配置的 `context_window` 覆盖）扣除输出预留，未知时用 `max_context_tokens` 作为输入预算兜底：
 
-1. system prompt 始终完整保留，且在整个会话中逐字节稳定。启用 ARC 时它只包含静态策略文本；每轮都会变化的 pointer manifest 作为请求末尾的一条临时 system 消息追加，不写入消息历史，因此 provider 的前缀缓存不会被每次工具调用打断。
+1. system prompt 始终完整保留，且在整个会话中逐字节稳定。启用 ARC 时它只包含静态策略文本；每轮都会变化的 pointer manifest 作为请求末尾的一条临时 system 消息追加，不写入消息历史，因此 provider 的前缀缓存不会被每次工具调用打断。manifest 上限 24 条，其中 pinned 最多占一半，另一半始终留给 active 指针。
 2. 最近 `compact_keep_turns` 个用户轮次及其 assistant/tool 消息完整保留。
 3. `pointer_priority` / `hybrid` 下，更早轮次在移除前写入 Store；摘要保留唯一的 Original request、关键流程和 `§turn_...` / `§obs_...` citation，工具结果不再退化成不可恢复的首尾片段。摘要不重新注入 assistant thinking/provider reasoning；摘要 token 上限按当前输入预算动态计算，保留原始任务锚点与最新结构化条目。`summary` 模式使用相同的动态预算规则。
 4. 上下文达到预算的 85% 时，先把较旧的超长 tool 输出替换为已存在 ID 的 citation，保留最近 4 条；仍超阈值再走全量 compact。只要记录仍可寻址，`summary` 模式同样保留 citation 而不是写成不可恢复的占位；只有在没有任何可用 ID 时才退回占位文本，且此时 `pointer_priority` / `hybrid` 会保留原文而非销毁唯一副本。`/compact` 与 auto-compact 共用同一条 prune + summary pipeline。若保留配置轮数后仍超过预算，会逐步减少完整保留轮次，但至少保留最近 1 轮。Compact 后请求仍超过输入预算时，会在调用 Provider 前返回明确错误。

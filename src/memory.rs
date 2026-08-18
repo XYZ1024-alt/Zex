@@ -21,7 +21,9 @@ use tokio::{
 
 use crate::{
     agent::{estimate_tokens, token_window},
-    secure::{Cipher as MemoryCipher, EncryptedContent as ContentEncryption},
+    secure::{
+        Cipher as MemoryCipher, EncryptedContent as ContentEncryption, KEYED_FINGERPRINT_PREFIX,
+    },
     session::atomic_write,
 };
 
@@ -41,6 +43,17 @@ const ACTIVE_POINTER_LIMIT: usize = 64;
 /// turns a single tool call into a full-store read and decrypt.
 const CONTENT_SCAN_LIMIT: usize = 256;
 const SYSTEM_POINTER_LIMIT: usize = 24;
+/// Portion of the manifest that pinned records may never take, as a divisor:
+/// `2` keeps at least half the slots reachable by active pointers. Pinning is a
+/// durability hint about the past; the active pointers describe what the model
+/// is looking at right now. Without this floor, a session that accumulates
+/// enough pins publishes a manifest that omits its own current observations.
+const ACTIVE_MANIFEST_SHARE: usize = 2;
+/// Importance at or above which a stored observation is pinned automatically.
+const AUTO_PIN_IMPORTANCE: u8 = 85;
+/// Head excerpt carried alongside a citation when an observation is too large
+/// to inline. Enough to judge relevance without spending a recall.
+const POINTER_EXCERPT_TOKENS: usize = 192;
 const RECALL_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,13 +102,21 @@ impl Default for MemoryConfig {
         Self {
             enabled: true,
             mode: MemoryMode::Hybrid,
-            recall_rate_limit: 5,
+            // The per-turn limit is what stops a single turn from spiralling.
+            // The per-minute limit only has to catch a loop that spans turns,
+            // so it is set to several turns' worth: turns are fast, and a cap
+            // near the per-turn limit would reject legitimate work in the
+            // second turn of a minute rather than any runaway.
+            recall_rate_limit: 12,
             recall_per_turn_limit: 3,
             // Two recalls cover one full inline threshold, leaving a third for
             // anything else the turn needs. Keep that relationship in mind
             // before raising `max_inline_tool_tokens` on its own: past it, a
             // pointerized observation can no longer be read back in one turn.
             max_recall_tokens: 4_096,
+            // Roughly `max_tool_output_chars` worth of ASCII. The two limits
+            // are meant to land together: below this an observation is shown
+            // in full, above it only a head plus a citation survives.
             max_inline_tool_tokens: 8_192,
             hot_cache_size: 32,
             auto_pin_important: true,
@@ -342,14 +363,22 @@ impl RecallLimiter {
             self.recent.pop_front();
         }
         let per_turn_limit = per_turn_limit.min(per_minute_limit);
+        // Say plainly that the record is still there. A rate limit and a
+        // missing ID are the same shape of error to a model, and treating a
+        // throttle as proof of absence is how it ends up reporting that
+        // content it can see a citation for no longer exists.
         if self.current_model_turn >= per_turn_limit {
             bail!(
-                "recall rate limit exceeded: at most {per_turn_limit} recall calls are allowed per model turn"
+                "recall rate limit reached: at most {per_turn_limit} recall calls are allowed per model turn. \
+                 This is temporary and does not mean the record is missing: continue with the context you \
+                 already have, and recall it in a later turn if the detail still matters"
             );
         }
         if self.recent.len() >= per_minute_limit {
             bail!(
-                "recall rate limit exceeded: at most {per_minute_limit} recall calls are allowed per minute"
+                "recall rate limit reached: at most {per_minute_limit} recall calls are allowed per minute. \
+                 This is temporary and does not mean the record is missing: continue with the context you \
+                 already have, and recall it in a later turn if the detail still matters"
             );
         }
         self.current_model_turn += 1;
@@ -707,6 +736,16 @@ impl SessionMemory {
             .remove(id);
     }
 
+    /// Dedupe fingerprint for `bytes`. Encrypted stores key it so the
+    /// plaintext metadata cannot be used to confirm a guess about what the
+    /// session observed; plain stores keep the cheap unkeyed digest.
+    fn fingerprint(&self, bytes: &[u8]) -> Result<String> {
+        match &self.cipher {
+            Some(cipher) => cipher.fingerprint(bytes),
+            None => Ok(fingerprint_bytes(bytes)),
+        }
+    }
+
     fn encode_item(
         &self,
         pointer: MemoryPointer,
@@ -810,6 +849,20 @@ impl SessionMemory {
             })
             .collect::<Vec<_>>();
 
+        // A store held over its target by pinned or active records alone has
+        // nothing evictable left, so a rewrite would put the same records back
+        // and `maintain` would reindex the whole file for nothing — once per
+        // turn, forever. Detect that before paying for the read and re-encode.
+        if retained_by_count.len() == visible_count
+            && indexed_records == visible_count
+            && !self.needs_encryption_migration
+            && retained_by_count
+                .iter()
+                .all(|pointer| pointer.pinned || protected.contains(&pointer.id))
+        {
+            return Ok(false);
+        }
+
         let mut encoded = Vec::with_capacity(retained_by_count.len());
         for mut pointer in retained_by_count {
             let (_, content) = self
@@ -818,6 +871,17 @@ impl SessionMemory {
                 .with_context(|| format!("retained memory {} disappeared", pointer.id))?;
             if self.cipher.is_some() {
                 pointer.metadata.remove("preview");
+                // A digest computed without a key is exactly the confirm-a-guess
+                // handle that keying exists to remove, so a store being
+                // migrated must not carry its old ones forward. These records
+                // lose dedupe; leaking what they contain would be worse.
+                if !pointer
+                    .metadata
+                    .get("fingerprint")
+                    .is_some_and(|fingerprint| fingerprint.starts_with(KEYED_FINGERPRINT_PREFIX))
+                {
+                    pointer.metadata.remove("fingerprint");
+                }
             }
             let item = self.encode_item(pointer.clone(), None, &content)?;
             let mut line = serde_json::to_vec(&StoreRecord::Item { item })
@@ -855,6 +919,15 @@ impl SessionMemory {
                 retained_ids.insert(pointer.id);
                 content.extend_from_slice(&line);
             }
+        }
+        // The byte pass may also have found nothing to drop. `retained_ids` is
+        // a subset of the visible set, so equal counts mean an identical set:
+        // skip the write and the full reopen it triggers.
+        if retained_ids.len() == visible_count
+            && indexed_records == visible_count
+            && !self.needs_encryption_migration
+        {
+            return Ok(false);
         }
         let overrides = {
             let overrides = self
@@ -1473,7 +1546,8 @@ impl MemoryRuntime {
     ) -> Result<MemoryPointer> {
         let session = self.active_session()?;
         let active_turn = self.active_turn_id();
-        let fingerprint = tool_result_fingerprint(tool, arguments, &content)?;
+        let fingerprint =
+            session.fingerprint(&tool_result_fingerprint_input(tool, arguments, &content)?)?;
         let _dedupe = session.dedupe_lock.lock().await;
         if let Some(pointer) =
             session.pointer_by_tool_fingerprint(&fingerprint, active_turn.as_deref())
@@ -1493,7 +1567,7 @@ impl MemoryRuntime {
                 content,
                 source_tool: Some(tool.to_owned()),
                 importance,
-                pinned: self.config.auto_pin_important && importance >= 85,
+                pinned: self.config.auto_pin_important && importance >= AUTO_PIN_IMPORTANCE,
                 parent_id: None,
                 metadata,
                 turn_id: active_turn.clone(),
@@ -1517,7 +1591,7 @@ impl MemoryRuntime {
     ) -> Result<MemoryPointer> {
         let session = self.active_session()?;
         let active_turn = self.active_turn_id();
-        let fingerprint = message_fingerprint(role, &content);
+        let fingerprint = session.fingerprint(&message_fingerprint_input(role, &content))?;
         let _dedupe = session.dedupe_lock.lock().await;
         if let Some(pointer) =
             session.pointer_by_message_fingerprint(&fingerprint, active_turn.as_deref())
@@ -1556,7 +1630,15 @@ impl MemoryRuntime {
             MemoryMode::PointerPriority | MemoryMode::Hybrid
                 if pointer.token_estimate > self.config.max_inline_tool_tokens =>
             {
-                self.citation(pointer)
+                // A citation alone says nothing about what is inside, so the
+                // model has to spend one of its few recalls just to learn
+                // whether the record is relevant. A bounded head usually
+                // answers that outright and costs far less than the recall it
+                // saves.
+                match head_excerpt(&visible_output, POINTER_EXCERPT_TOKENS) {
+                    Some(excerpt) => format!("{}\n{excerpt}", self.citation(pointer)),
+                    None => self.citation(pointer),
+                }
             }
             _ => format!(
                 "{visible_output}\n\n[addressable copy] {}",
@@ -1814,10 +1896,10 @@ impl MemoryRuntime {
                 }
             }
             if matched {
-                matches.push(pointer);
+                matches.push((pointer, content));
             }
         }
-        matches.sort_by(|left, right| {
+        matches.sort_by(|(left, _), (right, _)| {
             right
                 .pinned
                 .cmp(&left.pinned)
@@ -1832,12 +1914,18 @@ impl MemoryRuntime {
             });
         }
         let mut lines = Vec::with_capacity(matches.len());
-        for pointer in &matches {
-            let preview = session
-                .read(&pointer.id, active_turn.as_deref())
-                .await?
-                .map(|(_, content)| one_line_preview(&content, 160))
-                .unwrap_or_default();
+        for (pointer, scanned) in &matches {
+            // A text filter already read and decrypted this body. The hot cache
+            // holds far fewer entries than one listing can return, so reading
+            // it again for the preview would usually go back to disk.
+            let preview = match scanned {
+                Some(content) => one_line_preview(content, 160),
+                None => session
+                    .read(&pointer.id, active_turn.as_deref())
+                    .await?
+                    .map(|(_, content)| one_line_preview(&content, 160))
+                    .unwrap_or_default(),
+            };
             let suffix = if preview.is_empty() {
                 String::new()
             } else {
@@ -1963,7 +2051,14 @@ impl MemoryRuntime {
             return Vec::new();
         };
         let active_turn = self.active_turn_id();
+        // Resolve the active pointers first so they can claim their reserved
+        // share before pinned records are measured against what is left.
         let mut seen = HashSet::new();
+        let mut recent = ids
+            .into_iter()
+            .filter(|id| seen.insert(id.clone()))
+            .filter_map(|id| session.pointer(&id, active_turn.as_deref()))
+            .collect::<Vec<_>>();
         let mut pinned = if include_pinned {
             session
                 .pointers(active_turn.as_deref())
@@ -1973,23 +2068,11 @@ impl MemoryRuntime {
         } else {
             Vec::new()
         };
-        if pinned.len() > limit {
-            let split = pinned.len() - limit;
-            pinned.drain(0..split);
-        }
-        let remaining = limit.saturating_sub(pinned.len());
-        let mut recent = ids
-            .into_iter()
-            .filter(|id| seen.insert(id.clone()))
-            .filter_map(|id| session.pointer(&id, active_turn.as_deref()))
-            .collect::<Vec<_>>();
-        if recent.len() > remaining {
-            let split = recent.len() - remaining;
-            recent.drain(0..split);
-        }
+        let reserved = (limit / ACTIVE_MANIFEST_SHARE).min(recent.len());
+        keep_newest(&mut pinned, limit.saturating_sub(reserved));
+        keep_newest(&mut recent, limit.saturating_sub(pinned.len()));
         pinned.extend(recent);
-        let pointers = pinned;
-        pointers
+        pinned
             .iter()
             .map(|pointer| self.citation(pointer))
             .collect()
@@ -2139,7 +2222,7 @@ fn tool_metadata(arguments: &Value) -> BTreeMap<String, String> {
     metadata
 }
 
-fn tool_result_fingerprint(tool: &str, arguments: &Value, content: &str) -> Result<String> {
+fn tool_result_fingerprint_input(tool: &str, arguments: &Value, content: &str) -> Result<Vec<u8>> {
     let arguments =
         serde_json::to_vec(arguments).context("failed to serialize tool arguments for memory")?;
     let mut bytes = Vec::with_capacity(tool.len() + arguments.len() + content.len() + 2);
@@ -2148,14 +2231,46 @@ fn tool_result_fingerprint(tool: &str, arguments: &Value, content: &str) -> Resu
     bytes.extend_from_slice(&arguments);
     bytes.push(0);
     bytes.extend_from_slice(content.as_bytes());
-    Ok(fingerprint_bytes(&bytes))
+    Ok(bytes)
 }
 
+/// Leading slice of an observation, for pairing with a citation. Returns
+/// `None` when there is nothing worth showing, so the caller emits a bare
+/// citation rather than an empty header.
+fn head_excerpt(content: &str, max_tokens: usize) -> Option<String> {
+    let content = content.trim_start();
+    if content.is_empty() {
+        return None;
+    }
+    let window = token_window(content, 0, max_tokens);
+    let head = window.content.trim_end();
+    if head.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "[head ~{} tokens; recall the ID above for the rest]\n{head}",
+        window.end
+    ))
+}
+
+/// Trims a pointer list to its newest `limit` entries. Records are appended in
+/// time order, so the tail is the newest.
+fn keep_newest(pointers: &mut Vec<MemoryPointer>, limit: usize) {
+    if pointers.len() > limit {
+        pointers.drain(0..pointers.len() - limit);
+    }
+}
+
+/// Importance drives automatic pinning, which spends a scarce manifest slot
+/// and exempts the record from retention. Failures earn that: they are what
+/// later turns come back to. A successful `write` or `edit` does not — the
+/// change is already on disk, the confirmation is a few words long, and
+/// pinning every one of them fills the pin budget with records nobody recalls.
 fn tool_importance(tool: &str, content: &str) -> u8 {
-    if matches!(tool, "write" | "edit") {
+    if content.starts_with("tool error:") {
         90
-    } else if content.starts_with("tool error:") {
-        80
+    } else if matches!(tool, "write" | "edit") {
+        75
     } else if tool == "read" {
         70
     } else {
@@ -2211,12 +2326,12 @@ fn fnv1a64_seed(bytes: &[u8], seed: u64) -> u64 {
     hash
 }
 
-fn message_fingerprint(role: &str, content: &str) -> String {
+fn message_fingerprint_input(role: &str, content: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(role.len() + content.len() + 1);
     bytes.extend_from_slice(role.as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(content.as_bytes());
-    fingerprint_bytes(&bytes)
+    bytes
 }
 
 fn fingerprint_bytes(bytes: &[u8]) -> String {
@@ -2234,8 +2349,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AUDIT_ARCHIVE_LIMIT, AUDIT_FILE, MemoryConfig, MemoryEncryptionKey, MemoryKind,
-        MemoryRuntime, PIN_STATE_FILE, extract_memory_ids,
+        AUDIT_ARCHIVE_LIMIT, AUDIT_FILE, KEYED_FINGERPRINT_PREFIX, MemoryConfig,
+        MemoryEncryptionKey, MemoryKind, MemoryRuntime, PIN_STATE_FILE, POINTER_EXCERPT_TOKENS,
+        SYSTEM_POINTER_LIMIT, estimate_tokens, extract_memory_ids, fingerprint_bytes,
+        message_fingerprint_input, tool_result_fingerprint_input,
     };
 
     fn temporary_directory(label: &str) -> PathBuf {
@@ -2316,7 +2433,10 @@ mod tests {
             .recall(&pointer.id, None, None, None)
             .await
             .unwrap_err();
-        assert!(limited.to_string().contains("rate limit exceeded"));
+        assert!(limited.to_string().contains("rate limit reached"));
+        // A throttle must not read as an absent record: the model is told to
+        // treat those two very differently.
+        assert!(limited.to_string().contains("does not mean the record is missing"));
 
         let records_path = runtime.records_path().unwrap();
         let log = tokio::fs::read_to_string(&records_path).await.unwrap();
@@ -2508,7 +2628,7 @@ mod tests {
             .store_tool_result(
                 "write",
                 &json!({"path": "first.txt"}),
-                "first write".to_owned(),
+                "tool error: first write failed".to_owned(),
             )
             .await
             .unwrap();
@@ -2516,7 +2636,7 @@ mod tests {
             .store_tool_result(
                 "edit",
                 &json!({"path": "second.txt"}),
-                "second edit".to_owned(),
+                "tool error: second edit failed".to_owned(),
             )
             .await
             .unwrap();
@@ -2528,7 +2648,7 @@ mod tests {
             .store_tool_result(
                 "write",
                 &json!({"path": "third.txt"}),
-                "third write".to_owned(),
+                "tool error: third write failed".to_owned(),
             )
             .await
             .unwrap();
@@ -2541,7 +2661,7 @@ mod tests {
             .store_tool_result(
                 "edit",
                 &json!({"path": "aborted.txt"}),
-                "aborted edit".to_owned(),
+                "tool error: aborted edit failed".to_owned(),
             )
             .await
             .unwrap();
@@ -2549,6 +2669,54 @@ mod tests {
         runtime.maintain().await.unwrap();
         assert!(runtime.pointer_for_id(&aborted.id).is_none());
         assert!(runtime.pointer_for_id(&third.id).unwrap().pinned);
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_records_cannot_crowd_active_pointers_out_of_the_manifest() {
+        let directory = temporary_directory("manifest-share");
+        let runtime = MemoryRuntime::new(MemoryConfig::default());
+        runtime
+            .activate("20260815-120000-61626364", directory.clone())
+            .await
+            .unwrap();
+        for index in 0..SYSTEM_POINTER_LIMIT + 8 {
+            let pointer = runtime
+                .store_tool_result(
+                    "read",
+                    &json!({"path": format!("pinned-{index}.txt")}),
+                    format!("pinned body {index}"),
+                )
+                .await
+                .unwrap();
+            runtime.pin(&pointer.id).await.unwrap();
+        }
+        let mut active = Vec::new();
+        for index in 0..4 {
+            active.push(
+                runtime
+                    .store_tool_result(
+                        "grep",
+                        &json!({"pattern": format!("needle-{index}")}),
+                        format!("active body {index}"),
+                    )
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        runtime.set_active_pointers(active.clone());
+
+        let manifest = runtime.system_pointer_manifest();
+        assert_eq!(manifest.len(), SYSTEM_POINTER_LIMIT);
+        let rendered = manifest.join("\n");
+        for id in &active {
+            assert!(
+                rendered.contains(id),
+                "active pointer {id} was crowded out by pinned records"
+            );
+        }
 
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
@@ -2589,6 +2757,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(records.lines().count(), 2);
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_stops_rewriting_when_nothing_is_evictable() {
+        let directory = temporary_directory("retention-idle");
+        let key = MemoryEncryptionKey::new("retention idle probe".to_owned()).unwrap();
+        let runtime = MemoryRuntime::new(MemoryConfig {
+            // Far below what the records below occupy, so the size trigger
+            // fires on every maintenance pass.
+            max_store_bytes: 128,
+            encryption_key: Some(key),
+            ..MemoryConfig::default()
+        });
+        runtime
+            .activate("20260815-120000-81828384", directory.clone())
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for index in 0..4 {
+            ids.push(
+                runtime
+                    .store_tool_result(
+                        "read",
+                        &json!({"path": format!("{index}.txt")}),
+                        format!("record {index} {}", "x".repeat(400)),
+                    )
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        // Every record is active, so retention is not allowed to drop any of
+        // them and a rewrite would put the same set back.
+        runtime.set_active_pointers(ids.clone());
+        let records_path = runtime.records_path().unwrap();
+        let before = tokio::fs::read(&records_path).await.unwrap();
+
+        runtime.maintain().await.unwrap();
+        runtime.maintain().await.unwrap();
+
+        // Re-encryption draws a fresh nonce per record, so a byte-identical
+        // file proves the store was left alone rather than rewritten and
+        // reindexed once per turn.
+        let after = tokio::fs::read(&records_path).await.unwrap();
+        assert_eq!(before, after);
+        for id in &ids {
+            assert!(runtime.contains(id));
+        }
 
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
@@ -2706,7 +2924,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_outputs_past_the_inline_threshold_lose_their_body() {
+    async fn only_outputs_past_the_inline_threshold_are_reduced_to_a_head() {
         let directory = temporary_directory("inline-threshold");
         let runtime = MemoryRuntime::new(MemoryConfig {
             max_inline_tool_tokens: 1_000,
@@ -2737,8 +2955,12 @@ mod tests {
             .unwrap();
         assert!(pointer.token_estimate > 1_000);
         let rendered = runtime.render_tool_result(&pointer, huge);
-        assert!(!rendered.contains("huge line of output"));
         assert!(rendered.contains(&pointer.id));
+        // The bulk is gone, but a bounded head survives so the model can tell
+        // whether the record is worth a recall without spending one first.
+        assert!(rendered.contains("huge line of output"));
+        assert!(estimate_tokens(&rendered) < POINTER_EXCERPT_TOKENS + 128);
+        assert!(estimate_tokens(&rendered) < pointer.token_estimate / 4);
 
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
@@ -2767,6 +2989,19 @@ mod tests {
             .unwrap();
         assert!(!stored.contains(secret));
         assert!(stored.contains("\"encryption\""));
+        // The dedupe fingerprint stays in plaintext so the index can be rebuilt
+        // without decrypting the store, so it has to be keyed: an unkeyed
+        // digest would let anyone holding this file confirm a guess about what
+        // the session observed.
+        assert!(stored.contains(KEYED_FINGERPRINT_PREFIX));
+        assert!(
+            !stored.contains(&fingerprint_bytes(&tool_result_fingerprint_input(
+                "read",
+                &json!({"path": "secret.txt"}),
+                secret
+            )
+            .unwrap()))
+        );
         drop(runtime);
 
         let reopened = MemoryRuntime::new(config);
@@ -2839,6 +3074,9 @@ mod tests {
             .await
             .unwrap();
         assert!(!stored.contains(secret));
+        // Migration must not carry the old unkeyed digest forward: it is a
+        // plaintext handle on content that is now encrypted.
+        assert!(!stored.contains(&fingerprint_bytes(&message_fingerprint_input("user", secret))));
         assert!(
             encrypted
                 .recall(&pointer.id, None, None, None)
@@ -2863,7 +3101,7 @@ mod tests {
             .store_tool_result(
                 "write",
                 &json!({"path": "first.txt"}),
-                "wrote first".to_owned(),
+                "tool error: first write failed".to_owned(),
             )
             .await
             .unwrap();
@@ -2891,7 +3129,7 @@ mod tests {
             .store_tool_result(
                 "edit",
                 &json!({"path": "second.txt"}),
-                "edited second".to_owned(),
+                "tool error: second edit failed".to_owned(),
             )
             .await
             .unwrap();

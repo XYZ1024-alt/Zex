@@ -2694,6 +2694,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "base64",
+ "blake2",
  "chacha20poly1305",
  "clap",
  "crossterm",
