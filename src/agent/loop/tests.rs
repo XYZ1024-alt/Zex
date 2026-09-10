@@ -1828,7 +1828,7 @@ async fn summary_mode_pruning_keeps_the_record_addressable() {
         .unwrap();
     let body = "summary mode body\n".repeat(400);
     let pointer = memory
-        .store_tool_result("grep", &json!({"pattern": "s"}), body.clone())
+        .store_tool_result("grep", &json!({"pattern": "s"}), body.clone(), false)
         .await
         .unwrap();
     memory.set_active_pointers([pointer.id.clone()]);

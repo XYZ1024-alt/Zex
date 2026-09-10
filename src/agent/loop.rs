@@ -356,7 +356,7 @@ where
             .collect::<Vec<_>>();
         for (index, name, arguments, content) in pending {
             let pointer = memory
-                .store_tool_result(&name, &arguments, content.clone())
+                .store_tool_result(&name, &arguments, content.clone(), false)
                 .await?;
             if let Some(Message::Tool {
                 content: current, ..
@@ -536,7 +536,7 @@ where
                     } else {
                         Some(
                             memory
-                                .store_tool_result(name, arguments, content.clone())
+                                .store_tool_result(name, arguments, content.clone(), false)
                                 .await?,
                         )
                     }
@@ -832,7 +832,7 @@ where
                             && !MemoryRuntime::is_control_tool(&name)
                         {
                             let pointer = memory
-                                .store_tool_result(&name, &memory_arguments, output.clone())
+                                .store_tool_result(&name, &memory_arguments, output.clone(), true)
                                 .await?;
                             memory.render_tool_result(&pointer, output.clone())
                         } else {

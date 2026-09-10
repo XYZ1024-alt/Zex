@@ -493,6 +493,7 @@ mod execution_tests {
                 "read",
                 &serde_json::json!({"path": "resume.txt"}),
                 "exact resumed observation".to_owned(),
+                false,
             )
             .await
             .unwrap();

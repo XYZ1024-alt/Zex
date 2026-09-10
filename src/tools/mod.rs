@@ -146,7 +146,12 @@ impl ToolRegistry {
             && !MemoryRuntime::is_control_tool(name)
         {
             let pointer = memory
-                .store_tool_result(name, &memory_arguments, outcome.output.clone())
+                .store_tool_result(
+                    name,
+                    &memory_arguments,
+                    outcome.output.clone(),
+                    outcome.is_error,
+                )
                 .await?;
             outcome.memory = Some(pointer);
         }
@@ -316,6 +321,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_shell_result_is_pinned_and_survives_retention_and_reopen() {
+        let directory = temporary_directory("failed-shell-memory");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let config = MemoryConfig {
+            max_records: 1,
+            ..MemoryConfig::default()
+        };
+        let memory = Arc::new(MemoryRuntime::new(config.clone()));
+        memory
+            .activate("failed-shell-memory", directory.clone())
+            .await
+            .unwrap();
+        let mut tools = ToolRegistry::new(Duration::from_secs(5), 32_000);
+        tools.set_memory(Arc::clone(&memory));
+        tools.register(BashTool::new(directory.clone()));
+        memory.begin_turn().unwrap();
+        let failed = tools
+            .execute("bash", json!({"command":"echo diagnostic && exit 7"}))
+            .await
+            .unwrap();
+        assert!(failed.is_error);
+        let failed = failed.memory.unwrap();
+        assert!(failed.pinned);
+        assert_eq!(
+            failed.metadata.get("is_error").map(String::as_str),
+            Some("true")
+        );
+        let succeeded = tools
+            .execute(
+                "bash",
+                json!({"command":"echo tool error: this is only text && exit 0"}),
+            )
+            .await
+            .unwrap();
+        assert!(!succeeded.is_error);
+        let succeeded = succeeded.memory.unwrap();
+        assert!(!succeeded.pinned);
+        memory.commit_turn().await.unwrap();
+        memory.maintain().await.unwrap();
+        assert!(memory.contains(&failed.id));
+        assert!(!memory.contains(&succeeded.id));
+        drop(tools);
+        drop(memory);
+        let reopened = MemoryRuntime::new(config);
+        reopened
+            .activate("failed-shell-memory", directory.clone())
+            .await
+            .unwrap();
+        assert!(reopened.pointer_for_id(&failed.id).unwrap().pinned);
+        let content = reopened.recall(&failed.id, None, None, None).await.unwrap();
+        assert!(content.contains("exit_code: 7"));
+        assert!(content.contains("diagnostic"));
+        drop(reopened);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_deduplication_distinguishes_success_from_failure() {
+        let directory = temporary_directory("memory-result-status");
+        let memory = MemoryRuntime::new(MemoryConfig::default());
+        memory
+            .activate("memory-result-status", directory.clone())
+            .await
+            .unwrap();
+        let args = json!({"command":"same command"});
+        let succeeded = memory
+            .store_tool_result("bash", &args, "same output".to_owned(), false)
+            .await
+            .unwrap();
+        let failed = memory
+            .store_tool_result("bash", &args, "same output".to_owned(), true)
+            .await
+            .unwrap();
+        assert_ne!(succeeded.id, failed.id);
+        assert!(!succeeded.pinned);
+        assert!(failed.pinned);
+        let repeated = memory
+            .store_tool_result("bash", &args, "same output".to_owned(), true)
+            .await
+            .unwrap();
+        assert_eq!(failed.id, repeated.id);
+        drop(memory);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn registry_stores_full_output_before_active_view_truncation() {
         let working_dir = temporary_directory("memory-before-truncation");
         tokio::fs::create_dir_all(&working_dir).await.unwrap();
@@ -366,6 +457,7 @@ mod tests {
                 "read",
                 &json!({"path": "small.txt"}),
                 "exact body".to_owned(),
+                false,
             )
             .await
             .unwrap();

@@ -1543,19 +1543,22 @@ impl MemoryRuntime {
         tool: &str,
         arguments: &Value,
         content: String,
+        is_error: bool,
     ) -> Result<MemoryPointer> {
         let session = self.active_session()?;
         let active_turn = self.active_turn_id();
-        let fingerprint =
-            session.fingerprint(&tool_result_fingerprint_input(tool, arguments, &content)?)?;
+        let mut fingerprint_input = tool_result_fingerprint_input(tool, arguments, &content)?;
+        fingerprint_input.push(u8::from(is_error));
+        let fingerprint = session.fingerprint(&fingerprint_input)?;
         let _dedupe = session.dedupe_lock.lock().await;
         if let Some(pointer) =
             session.pointer_by_tool_fingerprint(&fingerprint, active_turn.as_deref())
         {
             return Ok(pointer);
         }
-        let importance = tool_importance(tool, &content);
+        let importance = tool_importance(tool, is_error);
         let mut metadata = tool_metadata(arguments);
+        metadata.insert("is_error".to_owned(), is_error.to_string());
         metadata.insert("fingerprint".to_owned(), fingerprint);
         let pointer = session
             .store(NewMemoryItem {
@@ -2266,8 +2269,8 @@ fn keep_newest(pointers: &mut Vec<MemoryPointer>, limit: usize) {
 /// later turns come back to. A successful `write` or `edit` does not — the
 /// change is already on disk, the confirmation is a few words long, and
 /// pinning every one of them fills the pin budget with records nobody recalls.
-fn tool_importance(tool: &str, content: &str) -> u8 {
-    if content.starts_with("tool error:") {
+fn tool_importance(tool: &str, is_error: bool) -> u8 {
+    if is_error {
         90
     } else if matches!(tool, "write" | "edit") {
         75
@@ -2379,7 +2382,12 @@ mod tests {
             .unwrap();
         let content = "precise observation".repeat(4);
         let pointer = runtime
-            .store_tool_result("read", &json!({"path": "src/main.rs"}), content.clone())
+            .store_tool_result(
+                "read",
+                &json!({"path": "src/main.rs"}),
+                content.clone(),
+                false,
+            )
             .await
             .unwrap();
 
@@ -2488,6 +2496,7 @@ mod tests {
                 "read",
                 &json!({"path": "large.txt"}),
                 "large ".repeat(2_000),
+                false,
             )
             .await
             .unwrap();
@@ -2513,7 +2522,7 @@ mod tests {
             .unwrap();
         let content = format!("{}TAIL_SENTINEL", "pageable-content ".repeat(200));
         let pointer = runtime
-            .store_tool_result("read", &json!({"path": "paged.txt"}), content)
+            .store_tool_result("read", &json!({"path": "paged.txt"}), content, false)
             .await
             .unwrap();
 
@@ -2563,6 +2572,7 @@ mod tests {
                 "read",
                 &json!({"path": "src/main.rs"}),
                 "same source".to_owned(),
+                false,
             )
             .await
             .unwrap();
@@ -2571,6 +2581,7 @@ mod tests {
                 "read",
                 &json!({"path": "src/main.rs"}),
                 "same source".to_owned(),
+                false,
             )
             .await
             .unwrap();
@@ -2579,6 +2590,7 @@ mod tests {
                 "grep",
                 &json!({"pattern": "needle", "path": "src"}),
                 "src/main.rs:1:needle".to_owned(),
+                false,
             )
             .await
             .unwrap();
@@ -2633,6 +2645,7 @@ mod tests {
                 "write",
                 &json!({"path": "first.txt"}),
                 "tool error: first write failed".to_owned(),
+                true,
             )
             .await
             .unwrap();
@@ -2641,6 +2654,7 @@ mod tests {
                 "edit",
                 &json!({"path": "second.txt"}),
                 "tool error: second edit failed".to_owned(),
+                true,
             )
             .await
             .unwrap();
@@ -2653,6 +2667,7 @@ mod tests {
                 "write",
                 &json!({"path": "third.txt"}),
                 "tool error: third write failed".to_owned(),
+                true,
             )
             .await
             .unwrap();
@@ -2666,6 +2681,7 @@ mod tests {
                 "edit",
                 &json!({"path": "aborted.txt"}),
                 "tool error: aborted edit failed".to_owned(),
+                true,
             )
             .await
             .unwrap();
@@ -2691,6 +2707,7 @@ mod tests {
                     "read",
                     &json!({"path": format!("pinned-{index}.txt")}),
                     format!("pinned body {index}"),
+                    false,
                 )
                 .await
                 .unwrap();
@@ -2704,6 +2721,7 @@ mod tests {
                         "grep",
                         &json!({"pattern": format!("needle-{index}")}),
                         format!("active body {index}"),
+                        false,
                     )
                     .await
                     .unwrap()
@@ -2745,6 +2763,7 @@ mod tests {
                         "read",
                         &json!({"path": format!("{index}.txt")}),
                         format!("record {index} {}", "x".repeat(1_600)),
+                        false,
                     )
                     .await
                     .unwrap(),
@@ -2788,6 +2807,7 @@ mod tests {
                         "read",
                         &json!({"path": format!("{index}.txt")}),
                         format!("record {index} {}", "x".repeat(400)),
+                        false,
                     )
                     .await
                     .unwrap()
@@ -2837,6 +2857,7 @@ mod tests {
                         "read",
                         &json!({"path": format!("{index}.txt")}),
                         format!("record {index} {}", "x".repeat(1_600)),
+                        false,
                     )
                     .await
                     .unwrap(),
@@ -2855,6 +2876,7 @@ mod tests {
                         "grep",
                         &json!({"pattern": format!("p{index}")}),
                         format!("fresh {index}"),
+                        false,
                     )
                     .await
                     .expect("storing after retention must not collide"),
@@ -2893,7 +2915,12 @@ mod tests {
             .await
             .unwrap();
         let original = runtime
-            .store_tool_result("read", &json!({"path": "a.txt"}), "first body".to_owned())
+            .store_tool_result(
+                "read",
+                &json!({"path": "a.txt"}),
+                "first body".to_owned(),
+                false,
+            )
             .await
             .unwrap();
 
@@ -2919,7 +2946,7 @@ mod tests {
             .unwrap();
         assert!(recalled.contains("second body"));
         let next = reopened
-            .store_tool_result("grep", &json!({"pattern": "x"}), "later".to_owned())
+            .store_tool_result("grep", &json!({"pattern": "x"}), "later".to_owned(), false)
             .await
             .unwrap();
         assert_ne!(next.id, original.id);
@@ -2944,7 +2971,7 @@ mod tests {
         // trip and more total context than simply showing them.
         let moderate = "moderate line\n".repeat(100);
         let pointer = runtime
-            .store_tool_result("grep", &json!({"pattern": "m"}), moderate.clone())
+            .store_tool_result("grep", &json!({"pattern": "m"}), moderate.clone(), false)
             .await
             .unwrap();
         assert!(pointer.token_estimate < 1_000);
@@ -2954,7 +2981,7 @@ mod tests {
 
         let huge = "huge line of output\n".repeat(1_000);
         let pointer = runtime
-            .store_tool_result("grep", &json!({"pattern": "h"}), huge.clone())
+            .store_tool_result("grep", &json!({"pattern": "h"}), huge.clone(), false)
             .await
             .unwrap();
         assert!(pointer.token_estimate > 1_000);
@@ -2985,7 +3012,12 @@ mod tests {
             .unwrap();
         let secret = "private observation that must stay encrypted";
         let pointer = runtime
-            .store_tool_result("read", &json!({"path": "secret.txt"}), secret.to_owned())
+            .store_tool_result(
+                "read",
+                &json!({"path": "secret.txt"}),
+                secret.to_owned(),
+                false,
+            )
             .await
             .unwrap();
         let stored = tokio::fs::read_to_string(runtime.records_path().unwrap())
@@ -3105,11 +3137,17 @@ mod tests {
                 "write",
                 &json!({"path": "first.txt"}),
                 "tool error: first write failed".to_owned(),
+                true,
             )
             .await
             .unwrap();
         let manually_pinned = runtime
-            .store_tool_result("read", &json!({"path": "source.txt"}), "source".to_owned())
+            .store_tool_result(
+                "read",
+                &json!({"path": "source.txt"}),
+                "source".to_owned(),
+                false,
+            )
             .await
             .unwrap();
         runtime.unpin(&manually_unpinned.id).await.unwrap();
@@ -3133,6 +3171,7 @@ mod tests {
                 "edit",
                 &json!({"path": "second.txt"}),
                 "tool error: second edit failed".to_owned(),
+                true,
             )
             .await
             .unwrap();
@@ -3167,6 +3206,7 @@ mod tests {
                 "read",
                 &json!({"path": "rotate.txt"}),
                 "rotation source".to_owned(),
+                false,
             )
             .await
             .unwrap();
