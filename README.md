@@ -384,7 +384,7 @@ enabled = false
 - `edit`：在 UTF-8 文件中执行一次精确文本替换；目标缺失或出现多次时拒绝修改，避免含糊编辑。与 `write` 一样捕获修改前后内容用于 diff 展示。
 - `grep`：使用 Rust `regex` + `ignore` 递归搜索 UTF-8 文件内容，返回 `path:line:content`。主要 schema：`pattern`、`path`、`case_sensitive`、`file_glob`、`hidden`、`max_results`。默认尊重 `.gitignore`、全局 gitignore 和 `.git/info/exclude`；二进制或非 UTF-8 文件跳过。
 - `glob`：使用 Rust `globset` + `ignore` 按路径 glob 查找文件或目录。主要 schema：`pattern`、`path`、`hidden`、`max_results`。无 `/` 的模式在任意深度匹配，目录结果带 `/`；默认尊重 Git ignore。
-- `bash`：仅用于其他系统命令。在启动工作目录中通过系统 shell 执行；Windows 使用 `cmd /D /S /C`，其他平台使用 `sh -c`。stdout/stderr 合并为结构化文本后执行统一截断。
+- `bash`：仅用于其他系统命令。在启动工作目录中通过系统 shell 执行；Windows 使用 `cmd /D /S /C`，其他平台使用 `sh -c`。Windows Job Object / Unix 进程组管理命令及其后代；超时覆盖进程等待和 stdout/stderr 读取，取消时清理进程树。stdout/stderr 合并为结构化文本后执行统一截断。
 - `recall`：按精确 ID 取回原始内容；超大内容返回受 token 上限控制的片段，不存在或格式错误的 ID 明确报错。
 - `pin` / `unpin`：设置或移除已有 ID 的高优先级状态，不删除记录。
 - `list_pointers`：列出 active/pinned citation 与有界正文预览；普通文本 filter 精确扫描 metadata 和完整正文，或使用 `id`、`kind`、`tool`、`role`、`path`、`pattern`、`file_glob`、`command`、`pinned` 结构化字段；多个条件按 AND 组合。
