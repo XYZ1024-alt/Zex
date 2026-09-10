@@ -62,6 +62,7 @@ impl Tool for WriteTool {
                     .with_context(|| format!("failed to write {}", path.display()))?;
 
                 Ok(ToolOutcome {
+                    is_error: false,
                     output: format!(
                         "wrote {} bytes to {}",
                         arguments.content.len(),

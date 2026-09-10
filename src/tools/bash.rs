@@ -112,7 +112,10 @@ impl Tool for BashTool {
                 stdout,
                 stderr
             );
-            Ok(ToolOutcome::output_only(result))
+            Ok(ToolOutcome {
+                is_error: !status.success(),
+                ..ToolOutcome::output_only(result)
+            })
         })
     }
 }

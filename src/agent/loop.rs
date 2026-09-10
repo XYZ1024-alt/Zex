@@ -824,7 +824,7 @@ where
                             }
                             _ => outcome.output.clone(),
                         };
-                        (outcome.output, content, false, outcome.change)
+                        (outcome.output, content, outcome.is_error, outcome.change)
                     }
                     Err(error) => {
                         let output = format!("tool error: {error:#}");

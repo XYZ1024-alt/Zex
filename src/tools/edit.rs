@@ -78,6 +78,7 @@ impl Tool for EditTool {
                     .await
                     .with_context(|| format!("failed to write {}", path.display()))?;
                 Ok(ToolOutcome {
+                    is_error: false,
                     output: format!("edited {}", path.display()),
                     change: FileChange::capture(path.clone(), Some(content), edited),
                     memory: None,

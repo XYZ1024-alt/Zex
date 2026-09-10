@@ -38,6 +38,7 @@ pub use write::WriteTool;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutcome {
     pub output: String,
+    pub is_error: bool,
     pub change: Option<FileChange>,
     pub memory: Option<MemoryPointer>,
 }
@@ -46,6 +47,7 @@ impl ToolOutcome {
     pub fn output_only(output: String) -> Self {
         Self {
             output,
+            is_error: false,
             change: None,
             memory: None,
         }

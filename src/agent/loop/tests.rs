@@ -1104,6 +1104,61 @@ async fn provider_failure_after_compaction_keeps_archived_history_addressable() 
 
 struct PausingTool(Arc<tokio::sync::Notify>);
 
+#[tokio::test]
+async fn nonzero_shell_exit_emits_failure_and_returns_diagnostics_to_model() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = SequenceProvider {
+        requests: Arc::clone(&requests),
+        messages: Mutex::new(VecDeque::from([
+            AssistantMessage {
+                content: String::new(),
+                thinking: None,
+                provider_state: None,
+                usage: None,
+                tool_calls: vec![ToolCall {
+                    id: "failed-command".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({"command":"echo diagnostic && exit 7"}).to_string(),
+                }],
+            },
+            AssistantMessage {
+                content: "test failed".to_owned(),
+                thinking: None,
+                provider_state: None,
+                usage: None,
+                tool_calls: Vec::new(),
+            },
+        ])),
+    };
+    let mut tools = ToolRegistry::new(Duration::from_secs(5), 32_000);
+    tools.register(crate::tools::BashTool::new(
+        std::env::current_dir().unwrap(),
+    ));
+    let (events, mut receiver) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        provider,
+        tools,
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(10),
+            max_turns: 2,
+            max_context_tokens: 120_000,
+            compact_keep_turns: 2,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+    agent.prompt("run the failing command").await.unwrap();
+    assert!(std::iter::from_fn(|| receiver.try_recv().ok()).any(|event| matches!(event,
+        AgentEvent::ToolEnd { is_error: true, output, .. } if output.contains("exit_code: 7") && output.contains("diagnostic")
+    )));
+    let requests = requests.lock().unwrap();
+    assert!(requests[1].iter().any(|message| matches!(message,
+        crate::agent::Message::Tool { content, .. } if content.contains("exit_code: 7") && content.contains("diagnostic")
+    )));
+}
+
 impl Tool for PausingTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
