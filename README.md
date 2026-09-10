@@ -262,7 +262,7 @@ Provider 与模型都可声明 `[thinking]`（`min_level`、`max_level`、可选
 | Ctrl-E | 展开 / 折叠最近一条错误详情 | 同左 |
 | Ctrl-T | 循环当前模型声明的可用级别并持久化 | — |
 
-粘贴使用终端 bracketed paste，允许直接粘贴多行内容。当前 turn 运行时输入区锁定，避免草稿与执行中状态混淆；Ctrl-C 中断后，已输入的用户消息保留，未完成的 assistant/tool 状态不会进入后续 Provider 上下文。
+粘贴使用终端 bracketed paste，允许直接粘贴多行内容。当前 turn 运行时输入区锁定，避免草稿与执行中状态混淆；Ctrl-C 中断、超时或 Provider 失败后，保留用户消息、已完成的工具结果和可回读的压缩历史，并保存会话。未返回结果的工具调用会补充中断说明，后续尚未开始的调用标记为未执行；文件和外部状态不会回滚，重试前应检查结果不确定的操作。
 
 ### 斜杠命令
 
@@ -420,7 +420,7 @@ OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两�
 - `ToolEnd { call_id, name, output, is_error }`：工具完成、输出与失败状态；`write` / `edit` 成功时附带 `change`（修改前后内容），供消费者渲染真实 diff，不进入模型上下文。
 - `Error { message }`：Provider、超时、步数上限等轮次错误。
 - `ContextCompacted { stats }`：core 自动 compact 后的字符数、释放量和保留轮次统计。
-- `TurnCancelled`：调用方中断当前轮；核心丢弃未完成的 assistant/tool 上下文并恢复可继续输入状态。
+- `TurnCancelled`：调用方中断当前轮；核心保留已完成的操作记录，为未返回结果的调用补充中断说明，并恢复可继续输入状态。
 - `TurnEnd`：一轮正常结束。
 
 模块边界：

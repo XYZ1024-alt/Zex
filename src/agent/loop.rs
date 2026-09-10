@@ -621,7 +621,6 @@ where
     where
         F: Future<Output = ()>,
     {
-        let checkpoint = self.messages.len();
         let prompt = prompt.into();
         if let Some(memory) = &self.memory {
             memory.begin_turn()?;
@@ -658,13 +657,8 @@ where
 
         match resolution {
             None => {
-                if let Some(memory) = &self.memory {
-                    memory
-                        .abort_turn()
-                        .await
-                        .context("failed to abort the cancelled memory turn")?;
-                }
-                retain_user_prompt(&mut self.messages, checkpoint);
+                self.finish_interrupted_turn("cancelled by the user")
+                    .await?;
                 let _ = self.events.send(AgentEvent::TurnCancelled);
                 Ok(PromptOutcome::Cancelled)
             }
@@ -673,14 +667,7 @@ where
                     if let Some(memory) = &self.memory
                         && let Err(error) = memory.commit_turn().await
                     {
-                        let abort_error = memory.abort_turn().await.err();
-                        retain_user_prompt(&mut self.messages, checkpoint);
-                        return Err(match abort_error {
-                            Some(abort_error) => error.context(format!(
-                                "failed to commit memory turn; abort also failed: {abort_error:#}"
-                            )),
-                            None => error.context("failed to commit memory turn"),
-                        });
+                        return Err(error.context("failed to commit memory turn"));
                     }
                     if let Some(memory) = &self.memory
                         && let Err(error) = memory.maintain().await
@@ -689,30 +676,20 @@ where
                             message: format!("addressable memory maintenance failed: {error:#}"),
                         });
                     }
+                    let _ = self.events.send(AgentEvent::TurnEnd);
                     Ok(PromptOutcome::Completed(message))
                 }
                 Ok(Err(error)) => {
-                    if let Some(memory) = &self.memory {
-                        memory
-                            .abort_turn()
-                            .await
-                            .context("failed to abort memory turn after agent error")?;
-                    }
-                    retain_user_prompt(&mut self.messages, checkpoint);
+                    self.finish_interrupted_turn(&format!("failed: {error:#}"))
+                        .await?;
                     Err(error)
                 }
                 Err(_) => {
-                    if let Some(memory) = &self.memory {
-                        memory
-                            .abort_turn()
-                            .await
-                            .context("failed to abort timed-out memory turn")?;
-                    }
-                    retain_user_prompt(&mut self.messages, checkpoint);
                     let message = format!(
                         "agent turn exceeded its {} second timeout",
                         self.turn_timeout.as_secs()
                     );
+                    self.finish_interrupted_turn(&message).await?;
                     let _ = self.events.send(AgentEvent::Error {
                         message: message.clone(),
                     });
@@ -720,6 +697,45 @@ where
                 }
             },
         }
+    }
+
+    async fn finish_interrupted_turn(&mut self, reason: &str) -> Result<()> {
+        // Completed tool effects cannot be rolled back. Close only unanswered calls,
+        // retaining both the compacted history and its addressable records.
+        if let Some(index) = self.messages.iter().rposition(|message| {
+            matches!(message, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty())
+        }) {
+            let pending = match &self.messages[index] {
+                Message::Assistant { tool_calls, .. } => tool_calls
+                    .iter()
+                    .filter(|call| !self.messages[index + 1..].iter().any(|message| {
+                        matches!(message, Message::Tool { tool_call_id, .. } if tool_call_id == &call.id)
+                    }))
+                    .map(|call| call.id.clone())
+                    .collect::<Vec<_>>(),
+                _ => unreachable!(),
+            };
+            for (position, tool_call_id) in pending.into_iter().enumerate() {
+                self.messages.push(Message::Tool {
+                    tool_call_id,
+                    content: if position == 0 {
+                        "Tool interrupted without a confirmed result. It may have changed external state; inspect that state before retrying.".to_owned()
+                    } else {
+                        "Tool was not executed because the turn was interrupted.".to_owned()
+                    },
+                });
+            }
+        }
+        self.messages.push(Message::System {
+            content: format!("[Turn interrupted: {reason}] Completed tool results remain valid. External changes have not been rolled back."),
+        });
+        self.sync_memory_context();
+        if let Some(memory) = &self.memory {
+            memory.commit_turn().await.with_context(|| {
+                format!("failed to preserve memory after the turn was {reason}")
+            })?;
+        }
+        Ok(())
     }
 
     /// Repeats provider completion and tool execution until the model returns text only.
@@ -769,7 +785,6 @@ where
             self.messages.push(assistant_message);
 
             if assistant.tool_calls.is_empty() {
-                let _ = self.events.send(AgentEvent::TurnEnd);
                 return Ok(assistant);
             }
 
@@ -889,14 +904,6 @@ where
             budget,
             request.max_output_tokens()
         )
-    }
-}
-
-fn retain_user_prompt(messages: &mut Vec<Message>, checkpoint: usize) {
-    let user_prompt = messages.get(checkpoint).cloned();
-    messages.truncate(checkpoint);
-    if let Some(user_prompt) = user_prompt {
-        messages.push(user_prompt);
     }
 }
 

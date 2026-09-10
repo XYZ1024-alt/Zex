@@ -834,7 +834,7 @@ async fn emits_provider_errors() {
 }
 
 #[tokio::test]
-async fn cancellation_keeps_user_prompt_and_discards_partial_turn_state() {
+async fn cancellation_keeps_user_prompt_and_records_interruption() {
     let (events, mut receiver) = mpsc::unbounded_channel();
     let mut agent = Agent::new(
         PendingProvider,
@@ -864,7 +864,7 @@ async fn cancellation_keeps_user_prompt_and_discards_partial_turn_state() {
     .unwrap();
 
     assert_eq!(outcome, crate::agent::PromptOutcome::Cancelled);
-    assert_eq!(agent.messages().len(), 2);
+    assert_eq!(agent.messages().len(), 3);
     assert!(matches!(
         &agent.messages()[1],
         crate::agent::Message::User { content } if content == "stop this"
@@ -880,7 +880,7 @@ async fn cancellation_keeps_user_prompt_and_discards_partial_turn_state() {
 }
 
 #[tokio::test]
-async fn failed_turn_hides_pending_memory_records_after_reopen() {
+async fn failed_turn_preserves_completed_memory_records_after_reopen() {
     let directory = std::env::temp_dir().join(format!(
         "zex-agent-aborted-memory-{}-{}",
         std::process::id(),
@@ -923,9 +923,9 @@ async fn failed_turn_hides_pending_memory_records_after_reopen() {
             .to_string()
             .contains("provider failed after tool execution")
     );
-    assert_eq!(agent.messages().len(), 2);
+    assert_eq!(agent.messages().len(), 5);
     assert!(
-        memory
+        !memory
             .list_pointers(Some("tool=echo"))
             .await
             .unwrap()
@@ -934,7 +934,7 @@ async fn failed_turn_hides_pending_memory_records_after_reopen() {
     let records = tokio::fs::read_to_string(memory.records_path().unwrap())
         .await
         .unwrap();
-    assert!(records.contains(r#""state":"aborted""#));
+    assert!(records.contains(r#""state":"committed""#));
 
     drop(agent);
     drop(memory);
@@ -944,7 +944,7 @@ async fn failed_turn_hides_pending_memory_records_after_reopen() {
         .await
         .unwrap();
     assert!(
-        reopened
+        !reopened
             .list_pointers(Some("tool=echo"))
             .await
             .unwrap()
@@ -1044,6 +1044,203 @@ async fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
     assert!(agent.messages().iter().any(
             |message| matches!(message, crate::agent::Message::User { content } if content == "recent two")
         ));
+}
+
+#[tokio::test]
+async fn provider_failure_after_compaction_keeps_archived_history_addressable() {
+    let directory =
+        std::env::temp_dir().join(format!("zex-compact-failure-{}", std::process::id()));
+    let memory = Arc::new(MemoryRuntime::new(MemoryConfig::default()));
+    memory
+        .activate("compact-failure", directory.clone())
+        .await
+        .unwrap();
+    let mut tools = ToolRegistry::new(Duration::from_secs(1), 32_000);
+    tools.set_memory(Arc::clone(&memory));
+    let (events, mut receiver) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        FailingProvider,
+        tools,
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(5),
+            max_turns: 2,
+            max_context_tokens: 4_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        Some(vec![crate::agent::Message::User {
+            content: "old evidence ".repeat(4_000),
+        }]),
+    );
+    assert!(agent.prompt("current task").await.is_err());
+    assert!(
+        std::iter::from_fn(|| receiver.try_recv().ok())
+            .any(|event| matches!(event, AgentEvent::ContextCompacted { .. }))
+    );
+    assert!(agent.messages().iter().any(|message| matches!(message, crate::agent::Message::User { content } if content == "current task")));
+    let ids = agent
+        .messages()
+        .iter()
+        .flat_map(|message| extract_memory_ids(super::message_content(message)))
+        .collect::<Vec<_>>();
+    assert!(!ids.is_empty());
+    drop(agent);
+    drop(memory);
+    let reopened = MemoryRuntime::new(MemoryConfig::default());
+    reopened
+        .activate("compact-failure", directory.clone())
+        .await
+        .unwrap();
+    for id in ids {
+        assert!(
+            reopened.contains(&id),
+            "compacted pointer lost after failure: {id}"
+        );
+    }
+    tokio::fs::remove_dir_all(directory).await.unwrap();
+}
+
+struct PausingTool(Arc<tokio::sync::Notify>);
+
+impl Tool for PausingTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "pause".to_owned(),
+            description: "Waits for cancellation.".to_owned(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+
+    fn execute(&self, _arguments: Value, _timeout: Duration) -> ToolFuture<'_> {
+        Box::pin(async move {
+            self.0.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+#[tokio::test]
+async fn interrupted_tool_batch_preserves_writes_and_closes_pending_calls() {
+    for cancel in [true, false] {
+        let directory = std::env::temp_dir().join(format!(
+            "zex-interrupted-write-{}-{cancel}",
+            std::process::id()
+        ));
+        let memory = Arc::new(MemoryRuntime::new(MemoryConfig::default()));
+        memory
+            .activate("interrupted-write", directory.join("memory"))
+            .await
+            .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut tools = ToolRegistry::new(Duration::from_secs(2), 32_000);
+        tools.set_memory(Arc::clone(&memory));
+        tools.register(crate::tools::WriteTool::new(directory.clone()));
+        tools.register(PausingTool(Arc::clone(&started)));
+        let provider = SequenceProvider {
+            messages: Mutex::new(VecDeque::from([AssistantMessage {
+                content: String::new(),
+                thinking: None,
+                provider_state: None,
+                usage: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "written".to_owned(),
+                        name: "write".to_owned(),
+                        arguments: json!({"path":"done.txt","content":"completed"}).to_string(),
+                    },
+                    ToolCall {
+                        id: "pending".to_owned(),
+                        name: "pause".to_owned(),
+                        arguments: "{}".to_owned(),
+                    },
+                    ToolCall {
+                        id: "unstarted".to_owned(),
+                        name: "write".to_owned(),
+                        arguments: json!({"path":"never.txt","content":"wrong"}).to_string(),
+                    },
+                ],
+            }])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (events, _) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            provider,
+            tools,
+            events,
+            AgentOptions {
+                model: "test-model".to_owned(),
+                turn_timeout: Duration::from_millis(500),
+                max_turns: 2,
+                max_context_tokens: 120_000,
+                compact_keep_turns: 1,
+                thinking_level: crate::provider::ThinkingLevel::Medium,
+            },
+            None,
+        );
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let (result, ()) = tokio::join!(
+            agent.prompt_cancellable("write then pause", receiver),
+            async {
+                started.notified().await;
+                if cancel {
+                    sender.send(true).unwrap();
+                }
+            }
+        );
+        if cancel {
+            assert_eq!(result.unwrap(), crate::agent::PromptOutcome::Cancelled);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("timeout"));
+        }
+        assert_eq!(
+            tokio::fs::read_to_string(directory.join("done.txt"))
+                .await
+                .unwrap(),
+            "completed"
+        );
+        assert!(!directory.join("never.txt").exists());
+        let results = agent
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                crate::agent::Message::Tool {
+                    tool_call_id,
+                    content,
+                } => Some((tool_call_id.as_str(), content.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].1.contains("wrote"));
+        assert!(results[1].1.contains("without a confirmed result"));
+        assert!(results[2].1.contains("not executed"));
+        let store = crate::session::SessionStore::new(directory.join("sessions"));
+        let id = store
+            .save(
+                None,
+                agent.model(),
+                agent.thinking_preference(),
+                agent.messages(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load(Some(&id)).await.unwrap().unwrap().messages,
+            agent.messages()
+        );
+        assert!(
+            !memory
+                .list_pointers(Some("tool=write"))
+                .await
+                .unwrap()
+                .starts_with("No addressable pointers")
+        );
+        drop(agent);
+        drop(memory);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
 }
 
 #[test]

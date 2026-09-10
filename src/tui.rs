@@ -383,7 +383,7 @@ async fn run_loop(
                                     }
                                 }
                                 Ok(None) => {
-                                    let completed = run_turn(
+                                    run_turn(
                                         terminal,
                                         &mut app,
                                         agent,
@@ -392,7 +392,6 @@ async fn run_loop(
                                         prompt,
                                     )
                                     .await?;
-                                    if completed {
                                         *session_id = Some(
                                             session_store
                                                 .save(
@@ -403,7 +402,6 @@ async fn run_loop(
                                                 )
                                                 .await?,
                                         );
-                                    }
                                     app.sync_agent_status(agent, session_id.as_deref());
                                 }
                                 Err(error) => app.record_error(format!("{error:#}")),

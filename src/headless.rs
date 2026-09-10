@@ -40,8 +40,9 @@ where
             Ok(())
         }
         None => {
-            agent.prompt(prompt).await?;
-            checkpoint_session(agent, session_store, session_id).await
+            let result = agent.prompt(prompt).await;
+            checkpoint_session(agent, session_store, session_id).await?;
+            result.map(|_| ())
         }
     }
 }
@@ -96,10 +97,13 @@ where
                     Err(error) => eprintln!("Zex command error: {error:#}"),
                 }
             }
-            Ok(None) => match agent.prompt(input).await {
-                Ok(_) => checkpoint_session(agent, session_store, session_id).await?,
-                Err(_) => continue,
-            },
+            Ok(None) => {
+                let result = agent.prompt(input).await;
+                checkpoint_session(agent, session_store, session_id).await?;
+                if let Err(error) = result {
+                    eprintln!("Zex turn error: {error:#}");
+                }
+            }
             Err(error) => eprintln!("Zex command error: {error:#}"),
         }
     }
