@@ -286,6 +286,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_prompt_is_checkpointed_before_returning() {
+        let directory = temporary_directory();
+        let store = SessionStore::new(directory.clone());
+        let (events, _) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            ReplyProvider,
+            ToolRegistry::new(Duration::from_secs(1), 32_000),
+            events,
+            AgentOptions {
+                model: "test-model".to_owned(),
+                turn_timeout: Duration::from_secs(1),
+                max_turns: 0,
+                max_context_tokens: 8_192,
+                compact_keep_turns: 2,
+                thinking_level: ThinkingLevel::Medium,
+            },
+            None,
+        );
+        let mut session_id = None;
+        let result = run_prompt(
+            &mut agent,
+            "persist interrupted turn".to_owned(),
+            &store,
+            &mut session_id,
+            &directory,
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("configured limit"));
+        assert!(session_id.is_some());
+        let loaded = store.load(session_id.as_deref()).await.unwrap().unwrap();
+        assert_eq!(loaded.messages, agent.messages());
+        assert!(loaded.messages.iter().any(|message| matches!(message, Message::System { content } if content.contains("Turn interrupted:"))));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn successful_prompt_is_checkpointed_before_returning() {
         let directory = temporary_directory();
         let store = SessionStore::new(directory.clone());

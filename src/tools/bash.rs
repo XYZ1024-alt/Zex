@@ -227,6 +227,21 @@ fn decode_legacy_console(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+#[cfg(windows)]
+fn shell_command(command: &str) -> Command {
+    let mut process = Command::new("cmd");
+    process.args(["/D", "/S", "/C"]);
+    process.raw_arg(format!("\"{command}\""));
+    process
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> Command {
+    let mut process = Command::new("sh");
+    process.args(["-c", command]);
+    process
+}
+
 #[cfg(test)]
 mod tests {
     use crate::tools::Tool;
@@ -269,6 +284,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::zombie_processes,
+        reason = "fixture deliberately exits first to test cleanup of orphaned descendants"
+    )]
     fn process_tree_fixture() {
         let Some(directory) = std::env::var_os("ZEX_PROCESS_FIXTURE") else {
             return;
@@ -417,19 +436,4 @@ mod tests {
         ];
         assert_eq!(super::decode_shell_output(&gbk), "'pwd' 不是内部或外部命令");
     }
-}
-
-#[cfg(windows)]
-fn shell_command(command: &str) -> Command {
-    let mut process = Command::new("cmd");
-    process.args(["/D", "/S", "/C"]);
-    process.raw_arg(format!("\"{command}\""));
-    process
-}
-
-#[cfg(not(windows))]
-fn shell_command(command: &str) -> Command {
-    let mut process = Command::new("sh");
-    process.args(["-c", command]);
-    process
 }
