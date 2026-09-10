@@ -1,12 +1,10 @@
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{collections::VecDeque, path::PathBuf, process::Stdio, time::Duration};
 
 use anyhow::{Context, bail};
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{
-    io::AsyncReadExt,
-    process::{Child, Command},
-};
+use tokio::{io::AsyncReadExt, process::Command};
 
 use crate::{
     provider::ToolDefinition,
@@ -16,6 +14,8 @@ use crate::{
 pub struct BashTool {
     working_dir: PathBuf,
 }
+
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
 impl BashTool {
     pub fn new(working_dir: PathBuf) -> Self {
@@ -51,38 +51,57 @@ impl Tool for BashTool {
                 .current_dir(&self.working_dir)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
+                .stderr(Stdio::piped());
 
+            let mut command = CommandWrap::from(command);
+            command.wrap(KillOnDrop);
             #[cfg(unix)]
-            command.process_group(0);
+            command.wrap(process_wrap::tokio::ProcessGroup::leader());
+            #[cfg(windows)]
+            command.wrap(process_wrap::tokio::JobObject);
 
-            let mut child = command.spawn().context("failed to execute shell command")?;
-            let process_id = child.id();
-            let stdout = child.stdout.take().context("failed to capture stdout")?;
-            let stderr = child.stderr.take().context("failed to capture stderr")?;
-            let stdout_reader = tokio::spawn(read_output(stdout));
-            let stderr_reader = tokio::spawn(read_output(stderr));
-
-            let status = match tokio::time::timeout(timeout, child.wait()).await {
-                Ok(status) => status.context("failed to wait for shell command")?,
+            let mut process = RunningShell {
+                child: command.spawn().context("failed to execute shell command")?,
+                completed: false,
+            };
+            let stdout = process
+                .child
+                .stdout()
+                .take()
+                .context("failed to capture stdout")?;
+            let stderr = process
+                .child
+                .stderr()
+                .take()
+                .context("failed to capture stderr")?;
+            let execution = async {
+                tokio::try_join!(
+                    process.child.wait(),
+                    read_output(stdout),
+                    read_output(stderr)
+                )
+            };
+            let (status, stdout, stderr) = match tokio::time::timeout(timeout, execution).await {
+                Ok(result) => {
+                    result.context("failed to wait for shell command or read its output")?
+                }
                 Err(_) => {
-                    terminate_process_tree(&mut child, process_id).await;
-                    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                    process
+                        .child
+                        .start_kill()
+                        .context("shell timed out; failed to terminate its process tree")?;
+                    tokio::time::timeout(Duration::from_secs(5), process.child.wait())
+                        .await
+                        .context("shell timed out; process tree cleanup timed out")?
+                        .context("shell timed out; failed to reap its process tree")?;
+                    process.completed = true;
                     bail!(
                         "shell command exceeded its {} second timeout",
                         timeout.as_secs()
                     );
                 }
             };
-            let stdout = stdout_reader
-                .await
-                .context("stdout reader task failed")?
-                .context("failed to read stdout")?;
-            let stderr = stderr_reader
-                .await
-                .context("stderr reader task failed")?
-                .context("failed to read stderr")?;
+            process.completed = true;
 
             let stdout = decode_shell_output(&stdout);
             let stderr = decode_shell_output(&stderr);
@@ -95,8 +114,31 @@ impl Tool for BashTool {
                 stdout,
                 stderr
             );
-            Ok(ToolOutcome::output_only(result))
+            Ok(ToolOutcome {
+                is_error: !status.success(),
+                ..ToolOutcome::output_only(result)
+            })
         })
+    }
+}
+
+struct RunningShell {
+    child: Box<dyn ChildWrapper>,
+    completed: bool,
+}
+
+impl Drop for RunningShell {
+    fn drop(&mut self) {
+        if !self.completed
+            && let Err(error) = self.child.start_kill()
+        {
+            // On Unix the entire group may already have exited before cancellation.
+            #[cfg(unix)]
+            if error.raw_os_error() == Some(3) {
+                return;
+            }
+            eprintln!("failed to terminate interrupted shell process tree: {error}");
+        }
     }
 }
 
@@ -109,9 +151,39 @@ async fn read_output<R>(mut reader: R) -> std::io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut output = Vec::new();
-    reader.read_to_end(&mut output).await?;
-    Ok(output)
+    let half = MAX_CAPTURE_BYTES / 2;
+    let mut head = Vec::new();
+    let mut tail = VecDeque::<u8>::new();
+    let mut total = 0usize;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        total = total.saturating_add(count);
+        let prefix = count.min(half - head.len());
+        head.extend_from_slice(&chunk[..prefix]);
+        let rest = &chunk[prefix..count];
+        let excess = (tail.len() + rest.len()).saturating_sub(half);
+        tail.drain(..excess);
+        tail.extend(rest);
+    }
+    if total > MAX_CAPTURE_BYTES {
+        // A byte limit can split a UTF-8 character at either edge of the gap.
+        if let Err(error) = std::str::from_utf8(&head)
+            && error.error_len().is_none()
+        {
+            head.truncate(error.valid_up_to());
+        }
+        while tail.front().is_some_and(|byte| byte & 0xc0 == 0x80) {
+            tail.pop_front();
+        }
+        let omitted = total - head.len() - tail.len();
+        head.extend_from_slice(format!("\n[shell output truncated: {omitted} bytes omitted; capture limit {MAX_CAPTURE_BYTES} bytes per stream]\n").as_bytes());
+    }
+    head.extend(tail);
+    Ok(head)
 }
 
 /// Decode child-process output. Fast path: strict UTF-8 (unix shells,
@@ -155,8 +227,191 @@ fn decode_legacy_console(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+#[cfg(windows)]
+fn shell_command(command: &str) -> Command {
+    let mut process = Command::new("cmd");
+    process.args(["/D", "/S", "/C"]);
+    process.raw_arg(format!("\"{command}\""));
+    process
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> Command {
+    let mut process = Command::new("sh");
+    process.args(["-c", command]);
+    process
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::tools::Tool;
+    use std::{path::PathBuf, time::Duration};
+
+    #[tokio::test]
+    async fn capture_is_bounded_and_preserves_head_and_tail() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let producer = async move {
+            writer.write_all(b"first diagnostic\n").await.unwrap();
+            let chunk = [b'x'; 8192];
+            for _ in 0..1024 {
+                writer.write_all(&chunk).await.unwrap();
+            }
+            writer.write_all(b"\nlast diagnostic").await.unwrap();
+        };
+        let ((), result) = tokio::join!(producer, super::read_output(reader));
+        let output = result.unwrap();
+        assert!(output.len() <= super::MAX_CAPTURE_BYTES + 160);
+        assert!(output.starts_with(b"first diagnostic\n"));
+        assert!(output.ends_with(b"\nlast diagnostic"));
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("shell output truncated:")
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_preserves_short_output_and_utf8_at_truncated_edges() {
+        let short = b"unmodified output\n";
+        assert_eq!(super::read_output(&short[..]).await.unwrap(), short);
+        let text = "中".repeat(super::MAX_CAPTURE_BYTES);
+        let output = super::read_output(text.as_bytes()).await.unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with("中"));
+        assert!(output.ends_with("中"));
+        assert!(output.contains("shell output truncated:"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::zombie_processes,
+        reason = "fixture deliberately exits first to test cleanup of orphaned descendants"
+    )]
+    fn process_tree_fixture() {
+        let Some(directory) = std::env::var_os("ZEX_PROCESS_FIXTURE") else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        if std::env::var_os("ZEX_PROCESS_DESCENDANT").is_some() {
+            std::fs::write(directory.join("ready"), std::process::id().to_string()).unwrap();
+            std::thread::sleep(Duration::from_secs(15));
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::bash::tests::process_tree_fixture",
+                "--nocapture",
+            ])
+            .env("ZEX_PROCESS_DESCENDANT", "1")
+            .spawn()
+            .unwrap();
+        if std::env::var_os("ZEX_PROCESS_PARENT_EXITS").is_none() {
+            child.wait().unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    fn process_running(pid: u32) -> bool {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, WAIT_TIMEOUT},
+            System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if handle == 0 {
+                return false;
+            }
+            let status = WaitForSingleObject(handle, 0);
+            CloseHandle(handle);
+            status == WAIT_TIMEOUT
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_running(pid: u32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8(output.stdout).unwrap();
+        !state.trim().is_empty() && !state.trim().starts_with('Z')
+    }
+
+    async fn check_process_tree_cleanup(cancel: bool, parent_exits: bool) {
+        let directory = std::env::temp_dir().join(format!(
+            "zex-tree-{}-{cancel}-{parent_exits}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let exe = std::env::current_exe().unwrap();
+        #[cfg(windows)]
+        let command = format!(
+            "set \"ZEX_PROCESS_FIXTURE={}\"&&set \"ZEX_PROCESS_PARENT_EXITS={}\"&&\"{}\" --exact tools::bash::tests::process_tree_fixture --nocapture",
+            directory.display(),
+            if parent_exits { "1" } else { "" },
+            exe.display()
+        );
+        #[cfg(unix)]
+        let command = format!(
+            "ZEX_PROCESS_FIXTURE='{}' {} '{}' --exact tools::bash::tests::process_tree_fixture --nocapture",
+            directory.display(),
+            if parent_exits {
+                "ZEX_PROCESS_PARENT_EXITS=1"
+            } else {
+                ""
+            },
+            exe.display()
+        );
+        let tool = super::BashTool::new(directory.clone());
+        let execution = tool.execute(
+            serde_json::json!({"command":command}),
+            Duration::from_secs(2),
+        );
+        let mut execution = Some(execution);
+        let started = tokio::time::Instant::now();
+        let pid = loop {
+            tokio::select! {
+                result = execution.as_mut().unwrap() => panic!("shell ended before descendant started: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    if let Ok(text) = tokio::fs::read_to_string(directory.join("ready")).await
+                        && let Ok(pid) = text.parse::<u32>() { break pid; }
+                    assert!(started.elapsed() < Duration::from_secs(5), "descendant did not start");
+                }
+            }
+        };
+        assert!(process_running(pid));
+        if cancel {
+            drop(execution.take());
+        } else {
+            let error = execution.take().unwrap().await.unwrap_err();
+            assert!(format!("{error:#}").contains("timeout"));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+        for _ in 0..100 {
+            if !process_running(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !process_running(pid),
+            "descendant survived shell cancellation/timeout"
+        );
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_execution_kills_descendants() {
+        check_process_tree_cleanup(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn timeout_covers_descendant_output_after_parent_exits() {
+        check_process_tree_cleanup(false, true).await;
+    }
+
     #[test]
     fn utf8_output_passes_through_unchanged() {
         assert_eq!(
@@ -181,46 +436,4 @@ mod tests {
         ];
         assert_eq!(super::decode_shell_output(&gbk), "'pwd' 不是内部或外部命令");
     }
-}
-
-#[cfg(windows)]
-async fn terminate_process_tree(child: &mut Child, process_id: Option<u32>) {
-    if let Some(process_id) = process_id {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &process_id.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
-    let _ = child.kill().await;
-}
-
-#[cfg(unix)]
-async fn terminate_process_tree(child: &mut Child, process_id: Option<u32>) {
-    if let Some(process_id) = process_id {
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{process_id}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
-    let _ = child.kill().await;
-}
-
-#[cfg(windows)]
-fn shell_command(command: &str) -> Command {
-    let mut process = Command::new("cmd");
-    process.args(["/D", "/S", "/C", command]);
-    process
-}
-
-#[cfg(not(windows))]
-fn shell_command(command: &str) -> Command {
-    let mut process = Command::new("sh");
-    process.args(["-c", command]);
-    process
 }

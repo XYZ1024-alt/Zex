@@ -2,7 +2,7 @@
 
 Zex 是一个极简、可单二进制运行的通用 coding harness。它提供最小 Agent 循环与可观测终端界面，而不是大而全的 IDE 或实验管理平台。
 
-Zex 当前只包含 OpenAI 兼容模型接入、ReAct 循环、六个开箱可用的本地工具、核心事件流、ratatui TUI、headless 模式、斜杠命令、规则式上下文 compact、TOML 配置和 JSONL 会话管理。它不包含 MCP、子 Agent、Plan Mode、权限审批流、插件市场、IDE、科研指标、实验记录、向量库、RAG 或长期记忆。
+Zex 当前包含 OpenAI 兼容模型接入、ReAct 循环、六个本地工具、四个地址化回忆工具、核心事件流、ratatui TUI、headless 模式、斜杠命令、Addressable Recall Compaction（ARC）、TOML 配置和 JSONL 会话管理。它不包含 MCP、子 Agent、Plan Mode、权限审批流、插件市场、IDE、科研指标、向量检索或跨会话共享记忆。
 
 ## 构建
 
@@ -30,7 +30,7 @@ Zex 按以下顺序合并配置，后者覆盖前者：
 
 可用 `ZEX_CONFIG_DIR` 覆盖整个全局目录，便于便携安装和隔离测试。
 
-会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建/更新时间、保存时的 model 和当前 `thinking_level`；后续每行是一条 Agent 消息。会话不保存 API Key、base URL 或其他敏感运行配置。恢复会话会恢复消息与思考级别，但不改变当前通过 `/model` 选择的模型。
+会话默认保存在同一全局目录下的 `sessions/<id>.jsonl`。每个文件第一行是格式版本、会话 ID、创建/更新时间、保存时的 model 和当前 `thinking_level`；后续每行是一条 Agent 消息。启用 ARC 时，原始观察和被 compact 的历史另存于 `sessions/<id>/memory/records.jsonl`，pin 覆盖状态保存在紧凑的 `pin-state.json`，recall/pin 审计写入独立的 `audit.jsonl`。审计文件达到 4 MiB 后轮转，最多保留 4 个归档；session resume 只需扫描内容记录并载入 pin 快照。会话不保存 API Key、base URL 或其他敏感运行配置。恢复会话会恢复消息、地址化 Store 和思考级别，但不改变当前通过 `/model` 选择的模型。
 
 项目配置示例：
 
@@ -45,6 +45,20 @@ max_context_tokens = 128000
 compact_keep_turns = 6
 default_thinking_level = "medium"
 hide_thinking_block = false
+
+[memory]
+enabled = true
+mode = "hybrid"
+recall_rate_limit = 12
+recall_per_turn_limit = 3
+max_recall_tokens = 4096
+max_inline_tool_tokens = 8192
+hot_cache_size = 32
+auto_pin_important = true
+max_auto_pins = 32
+max_records = 10000
+max_store_bytes = 67108864
+retention_days = 30
 
 [[providers]]
 id = "openai"
@@ -87,6 +101,18 @@ max = "max"
 | `max_tool_output_chars` | `32000` | 所有内置工具返回内容的统一字符上限；超限时保留头尾 |
 | `max_context_tokens` | `128000` | 上下文 token 预算兜底值；模型窗口已知（models.dev 或模型的 `context_window` 覆盖）时优先使用模型窗口并预留输出空间，达到 85% 时自动 compact。旧键 `max_context_chars` 仍被接受 |
 | `compact_keep_turns` | `6` | compact 时完整保留的最近用户轮次数 |
+| `memory.enabled` | `true` | ARC 总开关；关闭后不注册 memory 工具，并回退到原有工具输出与 summary compact 路径 |
+| `memory.mode` | `"hybrid"` | `pointer_priority` 优先 citation、`summary` 使用传统摘要、`hybrid` 保留轻量流程摘要并用 citation 保存精确恢复路径 |
+| `memory.recall_rate_limit` | `12` | 每分钟 recall 上限。真正约束单轮的是 `recall_per_turn_limit`；这个值只用于拦截跨轮次的循环，因此设为若干轮的额度，避免一分钟内的第二轮就被拒 |
+| `memory.recall_per_turn_limit` | `3` | 每个模型工具轮的 recall 上限；实际生效值取它与 `recall_rate_limit` 的较小者 |
+| `memory.max_recall_tokens` | `4096` | 单次 recall 返回 token 上限；超限返回受控窗口片段，全文继续保留在原 ID |
+| `memory.max_inline_tool_tokens` | `8192` | 工具结果保持原样进入 Active View 的 token 上限；超过则只留 citation 加一段有界头部摘录。默认约等于 `max_tool_output_chars` 的 ASCII token 数，也是 `max_recall_tokens` 的两倍，因此被指针化的观察仍可在一个模型轮内读回。调高它会让上下文更完整但更占预算，调低会更早触发 recall 往返 |
+| `memory.hot_cache_size` | `32` | 进程内最近访问内容的 LRU 条目数；重启后由 Store 按需重建 |
+| `memory.auto_pin_important` | `true` | 自动 pin 失败类工具结果（后续轮次真正会回头查的记录）；写入/编辑成功确认不再自动 pin，可用 `pin` / `unpin` 手动调整 |
+| `memory.max_auto_pins` | `32` | 每个 session 最多保留的自动 pin 数；超限时按最旧优先解除，手动 pin 不受影响 |
+| `memory.max_records` | `10000` | 每个 session Store 的目标记录上限；active/pinned 记录始终保留，因此可能暂时超过 |
+| `memory.max_store_bytes` | `67108864` | 每个 session `records.jsonl` 的目标字节上限；维护时保留 active/pinned 记录并原子重写 |
+| `memory.retention_days` | `30` | 未被 active/pinned 引用的记录保留天数；维护在载入上下文及成功轮次后执行 |
 | `default_thinking_level` | `medium` | 新会话默认思考强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
 | `hide_thinking_block` | `false` | 是否隐藏 TUI 中默认折叠的思考卡片；隐藏不删除会话数据，也不影响模型实际思考 |
 | `session_dir` | 全局 `sessions` 目录 | 自定义会话目录；相对路径基于项目工作目录 |
@@ -128,6 +154,19 @@ Zex 启动时从 `https://models.dev/api.json` 刷新模型思考能力，并把
 | `ZEX_MAX_TOOL_OUTPUT_CHARS` | 无 | `max_tool_output_chars` |
 | `ZEX_MAX_CONTEXT_TOKENS` | 无 | `max_context_tokens`（旧变量 `ZEX_MAX_CONTEXT_CHARS` 仍被接受） |
 | `ZEX_COMPACT_KEEP_TURNS` | 无 | `compact_keep_turns` |
+| `ZEX_MEMORY_ENABLED` | 无 | `memory.enabled` |
+| `ZEX_MEMORY_MODE` | 无 | `memory.mode` |
+| `ZEX_MEMORY_RECALL_RATE_LIMIT` | 无 | `memory.recall_rate_limit` |
+| `ZEX_MEMORY_RECALL_PER_TURN_LIMIT` | 无 | `memory.recall_per_turn_limit` |
+| `ZEX_MEMORY_MAX_RECALL_TOKENS` | 无 | `memory.max_recall_tokens` |
+| `ZEX_MEMORY_MAX_INLINE_TOOL_TOKENS` | 无 | `memory.max_inline_tool_tokens` |
+| `ZEX_MEMORY_HOT_CACHE_SIZE` | 无 | `memory.hot_cache_size` |
+| `ZEX_MEMORY_AUTO_PIN_IMPORTANT` | 无 | `memory.auto_pin_important` |
+| `ZEX_MEMORY_MAX_AUTO_PINS` | 无 | `memory.max_auto_pins` |
+| `ZEX_MEMORY_MAX_RECORDS` | 无 | `memory.max_records` |
+| `ZEX_MEMORY_MAX_STORE_BYTES` | 无 | `memory.max_store_bytes` |
+| `ZEX_MEMORY_RETENTION_DAYS` | 无 | `memory.retention_days` |
+| `ZEX_MEMORY_ENCRYPTION_KEY` | 无 | 启用 session transcript、memory content 与 memory audit 的认证加密；只从环境变量读取 |
 | `ZEX_DEFAULT_THINKING_LEVEL` | 无 | `default_thinking_level` |
 | `ZEX_HIDE_THINKING_BLOCK` | 无 | `hide_thinking_block` |
 | `ZEX_SESSION_DIR` | 无 | `session_dir` |
@@ -223,7 +262,7 @@ Provider 与模型都可声明 `[thinking]`（`min_level`、`max_level`、可选
 | Ctrl-E | 展开 / 折叠最近一条错误详情 | 同左 |
 | Ctrl-T | 循环当前模型声明的可用级别并持久化 | — |
 
-粘贴使用终端 bracketed paste，允许直接粘贴多行内容。当前 turn 运行时输入区锁定，避免草稿与执行中状态混淆；Ctrl-C 中断后，已输入的用户消息保留，未完成的 assistant/tool 状态不会进入后续 Provider 上下文。
+粘贴使用终端 bracketed paste，允许直接粘贴多行内容。当前 turn 运行时输入区锁定，避免草稿与执行中状态混淆；Ctrl-C 中断、超时或 Provider 失败后，保留用户消息、已完成的工具结果和可回读的压缩历史，并保存会话。未返回结果的工具调用会补充中断说明，后续尚未开始的调用标记为未执行；文件和外部状态不会回滚，重试前应检查结果不确定的操作。
 
 ### 斜杠命令
 
@@ -237,7 +276,7 @@ TUI 输入框、非 TTY REPL 和一次性 `zex -p` 使用同一个命令注册�
 | `/clear` | 清空当前 TUI/REPL 上下文；TUI 同时清空对话视图。不删除磁盘会话，下一条普通消息创建新会话 |
 | `/sessions` | 查看保存的会话；复用 `SessionStore::list` 列出 ID、更新时间、消息数和预览 |
 | `/resume [id]` | 无参数时打开历史会话选择列表；有参数时直接恢复指定会话。只恢复消息，不改变当前模型 |
-| `/compact` | 立即压缩旧上下文，显示压缩前后字符数、约释放字符数、保留轮次和摘要数量 |
+| `/compact` | 立即压缩旧上下文；ARC 模式先持久化原文并用 citation 替换大观察，再显示压缩前后 token、保留轮次和摘要数量 |
 | `/think [off\|minimal\|low\|medium\|high\|xhigh\|max]` | 无参数时显示当前请求值、有效值与模型可用级别；有参数时设置并自动 clamp/map。写入项目默认值及活跃会话 |
 | `/thinking [show\|hide]` | 无参数时显示当前思考卡片可见性；有参数时独立设置并写入项目 `.zex/config.toml` |
 
@@ -249,12 +288,18 @@ echo "解释当前目录" | zex
 
 非 TTY REPL 沿用 `zex>` 提示；Unix 上 Ctrl-D，Windows 上 Ctrl-Z 后回车退出。
 
-### 会话列表与恢复
+### 会话列表、恢复与删除
 
 列出会话；输出包含 ID、最后更新时间、消息数和首条用户消息摘要：
 
 ```bash
 zex sessions
+```
+
+删除指定会话及其地址化记忆：
+
+```bash
+zex delete 20260812-143012-1a2b3c4d
 ```
 
 恢复最近更新的会话并进入交互模式：
@@ -281,18 +326,68 @@ zex resume 20260812-143012-1a2b3c4d -p "继续上一轮工作并给出结论"
 zex resume -p "继续上一轮工作并给出结论"
 ```
 
-新运行在退出时创建一个 JSONL 文件；恢复已有会话时原位更新同一文件，不复制分叉会话。若 Provider 或工具报错，Zex 仍会保存当前消息历史，再返回错误；无效斜杠命令只在当前界面显示错误，不写入模型上下文。
+每个成功轮次结束后立即 checkpoint 会话，退出时再保存一次；恢复已有会话时原位更新同一文件，不复制分叉会话。写入先同步同目录临时文件，再用原子替换提交，避免 Windows 上的“先删除旧文件再重命名”丢失窗口。`/clear` 或 `/new` 保存旧会话及其 Store，并切换到新的独立 session 地址空间，不删除旧 Store。若 Provider 或工具报错，Zex 仍会保存当前消息历史，再返回错误；无效斜杠命令只在当前界面显示错误，不写入模型上下文。
+
+### Addressable Recall Compaction
+
+默认 `memory.mode = "hybrid"`。每个普通工具结果先以稳定 ID 写入 session Store，再决定进入模型 Active View 的形式：
+
+```text
+[file snapshot] read → §obs_8f2c… (~6.2k tokens, path=src/main.rs; recall available)
+[head ~192 tokens; recall the ID above for the rest]
+use std::collections::HashMap;
+…
+```
+
+- 超过 `memory.max_inline_tool_tokens`（默认 8192）的结果才降级为 citation；其余保留当前可见文本并附带 addressable copy。指针化会多花一次 recall 往返，因此只对真正威胁预算的输出这样做；中等结果留在上下文里，等预算真正吃紧时再由 prune 阶段降级为 citation。
+- 被指针化的结果不是只剩一行元数据：citation 后面跟一段 token 有界的头部摘录（约 192 token），让模型不必先花一次 recall 才知道这条记录是否相关。
+- `/compact` 和 auto-compact 在删除旧轮次前，把用户/assistant 原消息写为 `§turn_...`，把工具观察保留为 `§obs_...`，再生成有界 structured summary 和 pointer manifest。
+- `recall({"id":"§obs_...","reason":"该诊断直接决定修复"})` 精确取回未超上限的原文；大内容返回受控片段，全文仍保留在同一 ID。
+- 相同工具、参数和完整输出只保存一次，重复观察复用已有 ID。
+- `pin` / `unpin` 调整 compact 和 pointer manifest 的优先级；自动 pin 只作用于失败类结果（`write` / `edit` 的成功确认不再自动 pin——它们的改动已经落盘，却会把 pin 额度占满），默认最多 32 个，最旧自动 pin 会被解除，手动 pin 不被自动驱逐。pinned 记录在 pointer manifest 中最多占一半名额，剩下的名额始终留给当前 active 指针，避免长会话里积累的 pin 把模型自己刚产生的观察挤出清单。
+- `list_pointers` 无 filter 时列出 active/pinned ID 和有界内容预览；普通文本 filter 会扫描 metadata 与 Store 内容，结构化 filter 支持 `tool=read path=src/main.rs kind=file_snapshot pinned=true` 等 AND 组合。它是精确子串检索，不是语义检索。内容扫描按由新到旧最多读取 256 条记录，超出部分在输出末尾明确标注，避免一次工具调用变成全量读取与解密。
+- 不存在或格式错误的 ID 会返回明确错误；recall 默认每个模型工具轮最多 3 次（`memory.recall_per_turn_limit`）、每分钟最多 12 次。限流错误明确说明这是临时的、记录并未丢失，避免模型把节流当成内容不存在。recall、失败、限流和 pin 操作写入独立轮转审计日志，内容 Store 不混入操作事件。
+- 记录 ID 的序号来自已有记录本身而非计数：retention 会从中间淘汰记录，按数量恢复会重新发放存活记录仍持有的序号。ID 在写盘前先在索引中预占，冲突不会进入 `records.jsonl`。若旧版本已写入重复 ID，载入时按后写优先恢复，会话不会因此永久打不开。
+- Store 在上下文载入和成功轮次后执行保留维护：过期、超记录数或超字节预算的非 active/non-pinned 记录被淘汰，保留集通过 crash-safe 原子替换重写。active/pinned 是安全豁免项，因此目标容量不是会破坏当前引用的硬上限。当保留集与当前可见集完全相同（例如超出预算的部分全部被 pin 或正在被引用）时跳过重写：此时重写只会把同一批记录写回去，再让维护逻辑重新索引整个文件，等于每轮付一次全量 I/O。这种情况下 Store 只是停在目标之上，需要 `unpin` 才会继续收缩。
+
+可选的本地内容加密只通过环境变量启用：
+
+```powershell
+$env:ZEX_MEMORY_ENCRYPTION_KEY = "use-a-long-random-secret"
+```
+
+同一密钥使用 Argon2 派生 session 独立密钥，并以 XChaCha20-Poly1305 加密会话 transcript、memory 正文和 memory audit；密文被认证，错误密钥会在载入时失败。启用后，既有 memory 正文在首次维护时原子迁移，既有 session transcript 在下次保存时迁移。为支持启动索引与结构化过滤，memory ID、类型、时间戳、token 数、pin 状态以及 tool/path/command 等 metadata 仍为明文。去重用的 fingerprint 也必须留在明文里（否则重启时无法在不解密全库的情况下重建去重索引），因此它改用从 session 密钥派生的子密钥做 BLAKE2 MAC，并带 `k1:` 前缀：明文摘要会让拿到文件的人验证「某段已知内容是否被观察过」，加密钥后不再可行。迁移旧库时未加密钥的老摘要会被丢弃而不是沿用——这些记录因此失去去重，但泄露更糟。Zex 不持久化密钥，也尚不提供密钥轮换；删除或更换环境变量会使已有密文不可读。
+
+### Store 扩展边界
+
+当前 Store 仍是 session-scoped JSONL，而不是数据库：
+
+- 启动索引构建是 $O(n)$；普通全文 filter 也是 $O(n)$ 扫描，但只按需解密/读取正文，结果最多显示 64 条。
+- `records.jsonl` 采用 append + 周期性原子重写；默认 10,000 条或 64 MiB 的目标上限用于约束单 session 的重启成本与全文扫描延迟。
+- active/pinned 数据可能使文件超过目标上限。大量长期手动 pin 会直接扩大启动、维护和检索成本，必须主动 `unpin`。
+- audit 独立按 4 MiB 轮转并最多保留 4 个归档；热缓存仅保留最近 32 条正文，不改变磁盘容量。
+- 当单 session 需要持续超过约 10,000 条、64 MiB，或需要跨 session 检索、并发写入、排序分页和稳定亚线性全文搜索时，应迁移到 SQLite WAL + FTS；当前 JSONL 不应继续叠加二级索引或自制查询层。
+
+需要完全回退时设置：
+
+```toml
+[memory]
+enabled = false
+```
 
 ## 内置工具
 
-工具通过统一的 `Tool` trait 注册，Agent loop 不包含工具名称分支。六个工具全部编译进 Zex，不调用 `rg`、`fd` 或其他可选外部二进制。每个 schema 都接受可选正整数 `timeout_seconds`；未指定时使用 `tool_timeout_seconds`。Registry 对所有成功输出统一执行 `max_tool_output_chars` 截断，并给参数、超时、I/O 和执行错误补充工具名上下文。
+工具通过统一的 `Tool` trait 注册，Agent loop 不包含普通本地工具名称分支。六个文件/系统工具与启用 ARC 时的四个 memory 工具全部编译进 Zex，不调用 `rg`、`fd` 或其他可选外部二进制。每个 schema 都接受可选正整数 `timeout_seconds`；未指定时使用 `tool_timeout_seconds`。普通工具成功输出先写 Store，再统一执行 `max_tool_output_chars` 截断；Registry 同时给参数、超时、I/O 和执行错误补充工具名上下文。
 
 - `read`：读取 UTF-8 文件；相对路径基于启动 Zex 时的工作目录。长内容会截断。
 - `write`：创建或完整覆盖 UTF-8 文件，并自动创建父目录。写入前捕获旧内容，供 TUI/headless 展示真实 diff（覆盖可见被删行）；变更记录不进入模型上下文。
 - `edit`：在 UTF-8 文件中执行一次精确文本替换；目标缺失或出现多次时拒绝修改，避免含糊编辑。与 `write` 一样捕获修改前后内容用于 diff 展示。
 - `grep`：使用 Rust `regex` + `ignore` 递归搜索 UTF-8 文件内容，返回 `path:line:content`。主要 schema：`pattern`、`path`、`case_sensitive`、`file_glob`、`hidden`、`max_results`。默认尊重 `.gitignore`、全局 gitignore 和 `.git/info/exclude`；二进制或非 UTF-8 文件跳过。
 - `glob`：使用 Rust `globset` + `ignore` 按路径 glob 查找文件或目录。主要 schema：`pattern`、`path`、`hidden`、`max_results`。无 `/` 的模式在任意深度匹配，目录结果带 `/`；默认尊重 Git ignore。
-- `bash`：仅用于其他系统命令。在启动工作目录中通过系统 shell 执行；Windows 使用 `cmd /D /S /C`，其他平台使用 `sh -c`。stdout/stderr 合并为结构化文本后执行统一截断。
+- `bash`：仅用于其他系统命令。在启动工作目录中通过系统 shell 执行；Windows 使用 `cmd /D /S /C`，其他平台使用 `sh -c`。Windows Job Object / Unix 进程组管理命令及其后代；超时覆盖进程等待和 stdout/stderr 读取，取消时清理进程树。每条输出流在读取阶段最多保留 1 MiB 的首尾内容，超出部分继续排空并标注省略字节数，不会保存进记忆。stdout/stderr 合并为结构化文本后执行统一字符截断。非零退出码会标记为工具失败，同时保留诊断文本供模型继续处理。
+- `recall`：按精确 ID 取回原始内容；超大内容返回受 token 上限控制的片段，不存在或格式错误的 ID 明确报错。
+- `pin` / `unpin`：设置或移除已有 ID 的高优先级状态，不删除记录。
+- `list_pointers`：列出 active/pinned citation 与有界正文预览；普通文本 filter 精确扫描 metadata 和完整正文，或使用 `id`、`kind`、`tool`、`role`、`path`、`pattern`、`file_glob`、`command`、`pinned` 结构化字段；多个条件按 AND 组合。
 
 工具描述明确约定：搜文件内容用 `grep`；找文件或目录用 `glob`；其他系统命令才用 `bash`。
 
@@ -302,15 +397,19 @@ zex resume -p "继续上一轮工作并给出结论"
 
 ### 上下文 compact
 
-Compact 是 core 的确定性规则，不调用外部总结模型。已用 tokens ≈ 最近一次 API 返回的 usage（chat 的 `prompt_tokens` / responses 的 `input_tokens`，含 system prompt 与工具定义等开销）+ 之后新增消息用内置 tiktoken o200k_base 的本地估算；会话开始或 compact 后没有基线时退化为全量本地估算，tokenizer 不可用时再回退字符启发式。历史 thinking 不计入本地估算；预算取模型 context window（models.dev `limit.context` 或模型配置的 `context_window` 覆盖）扣除输出预留，未知时用 `max_context_tokens` 兜底：
+Compact 是 core 的确定性规则，不调用外部总结模型。每次 Provider 调用前先生成一次 `PreparedRequest`：按当前模型能力移除不会回传的历史 reasoning，构造 Chat Completions 或 Responses 的实际 JSON 请求，加入完整工具定义和需要连续传递的 interleaved reasoning/provider state，再对整个 wire payload 使用轻量、模型无关的字符估算：连续 ASCII 文本约每 4 个字符计 1 token，非 ASCII 字符按每个 1 token 计；不依赖 tiktoken、BPE 或某个模型的专用词表。同一份序列化请求直接发送，相同 body 的估算结果会被小容量缓存复用，避免一轮内状态刷新、预算判定和 compact 重试重复扫描。
 
-1. system prompt 始终完整保留。
+Provider 返回的 `usage` 不再被当作陈旧 baseline，但会作为权威反馈校准本地估算：实际计费输入 token 与本次估算的比值在 0.7–4.0 之间时按指数平滑更新一个系数，之后所有预算判定都用校准后的数值。上限允许不同词表、标点密集 JSON 和不透明 provider state 对轻量估算产生较大偏差；过低样本（典型如只报未命中缓存部分的 provider）仍会被丢弃而不是错误缩小上下文，切换模型时系数清零。
+
+预算取模型 context window（models.dev `limit.context` 或模型配置的 `context_window` 覆盖）扣除输出预留，未知时用 `max_context_tokens` 作为输入预算兜底：
+
+1. system prompt 始终完整保留，且在整个会话中逐字节稳定。启用 ARC 时它只包含静态策略文本；每轮都会变化的 pointer manifest 作为请求末尾的一条临时 system 消息追加，不写入消息历史，因此 provider 的前缀缓存不会被每次工具调用打断。manifest 上限 24 条，其中 pinned 最多占一半，另一半始终留给 active 指针。
 2. 最近 `compact_keep_turns` 个用户轮次及其 assistant/tool 消息完整保留。
-3. 更早轮次压成一条 system 摘要：首条用户消息作为 Original request 原文锚点保留；其余用户和 assistant 文本保留首尾关键片段；旧 tool 输出优先压成工具名、首尾各 180 字符、原省略长度。
-4. 上下文达到预算的 85% 时，先把较旧的超长 tool 输出替换为占位符（保留最近 4 条原文）；仍超阈值再走全量 compact。`/compact` 可随时手动触发；若保留配置轮数后仍超过预算，会逐步减少完整保留轮次，但至少保留最近 1 轮。
+3. `pointer_priority` / `hybrid` 下，更早轮次在移除前写入 Store；摘要保留唯一的 Original request、关键流程和 `§turn_...` / `§obs_...` citation，工具结果不再退化成不可恢复的首尾片段。摘要不重新注入 assistant thinking/provider reasoning；摘要 token 上限按当前输入预算动态计算，保留原始任务锚点与最新结构化条目。`summary` 模式使用相同的动态预算规则。
+4. 上下文达到预算的 85% 时，先把较旧的超长 tool 输出替换为已存在 ID 的 citation，保留最近 4 条；仍超阈值再走全量 compact。只要记录仍可寻址，`summary` 模式同样保留 citation 而不是写成不可恢复的占位；只有在没有任何可用 ID 时才退回占位文本，且此时 `pointer_priority` / `hybrid` 会保留原文而非销毁唯一副本。`/compact` 与 auto-compact 共用同一条 prune + summary pipeline。若保留配置轮数后仍超过预算，会逐步减少完整保留轮次，但至少保留最近 1 轮。Compact 后请求仍超过输入预算时，会在调用 Provider 前返回明确错误。
 5. TUI/REPL 反馈约释放 token 数、compact 前后占用、保留完整轮次、摘要旧轮次和清理的 tool 输出数量。Compact 后的消息直接用于后续 Provider 请求和会话持久化。
 
-OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两种协议都优先请求流式响应，并兼容网关忽略 `stream` 后返回普通 JSON。Responses 模式使用扁平 function tool 定义、`function_call`/`function_call_output` 输入项，并保留 Provider 输出项以支持推理模型的连续工具调用。
+OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两种协议都优先请求流式响应，并兼容网关忽略 `stream` 后返回普通 JSON。Chat Completions 的 `max_completion_tokens` 和 Responses 的 `max_output_tokens` 与上下文预算预留使用同一数值，保证预算和实际输出上限一致。Responses 模式使用扁平 function tool 定义、`function_call`/`function_call_output` 输入项，并保留 Provider 输出项以支持推理模型的连续工具调用。
 
 ## 事件设计与模块划分
 
@@ -321,7 +420,7 @@ OpenAI 兼容 Provider 支持 Chat Completions 和 Responses 两种协议。两�
 - `ToolEnd { call_id, name, output, is_error }`：工具完成、输出与失败状态；`write` / `edit` 成功时附带 `change`（修改前后内容），供消费者渲染真实 diff，不进入模型上下文。
 - `Error { message }`：Provider、超时、步数上限等轮次错误。
 - `ContextCompacted { stats }`：core 自动 compact 后的字符数、释放量和保留轮次统计。
-- `TurnCancelled`：调用方中断当前轮；核心丢弃未完成的 assistant/tool 上下文并恢复可继续输入状态。
+- `TurnCancelled`：调用方中断当前轮；核心保留已完成的操作记录，为未返回结果的调用补充中断说明，并恢复可继续输入状态。
 - `TurnEnd`：一轮正常结束。
 
 模块边界：

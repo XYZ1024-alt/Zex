@@ -3,6 +3,7 @@ mod edit;
 mod glob;
 mod grep;
 mod read;
+mod recall;
 mod write;
 
 use std::{
@@ -17,13 +18,18 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::{agent::FileChange, provider::ToolDefinition};
+use crate::{
+    agent::FileChange,
+    memory::{MemoryPointer, MemoryRuntime},
+    provider::ToolDefinition,
+};
 
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
+pub use recall::{ListPointersTool, PinTool, RecallTool, UnpinTool};
 pub use write::WriteTool;
 
 /// Tool execution result. `output` is fed back to the model; `change`
@@ -32,14 +38,18 @@ pub use write::WriteTool;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutcome {
     pub output: String,
+    pub is_error: bool,
     pub change: Option<FileChange>,
+    pub memory: Option<MemoryPointer>,
 }
 
 impl ToolOutcome {
     pub fn output_only(output: String) -> Self {
         Self {
             output,
+            is_error: false,
             change: None,
+            memory: None,
         }
     }
 }
@@ -55,6 +65,7 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     default_timeout: Duration,
     max_output_chars: usize,
+    memory: Option<Arc<MemoryRuntime>>,
 }
 
 impl ToolRegistry {
@@ -63,7 +74,16 @@ impl ToolRegistry {
             tools: HashMap::new(),
             default_timeout,
             max_output_chars,
+            memory: None,
         }
+    }
+
+    pub fn set_memory(&mut self, memory: Arc<MemoryRuntime>) {
+        self.memory = Some(memory);
+    }
+
+    pub fn memory(&self) -> Option<&Arc<MemoryRuntime>> {
+        self.memory.as_ref()
     }
 
     pub fn register<T>(&mut self, tool: T)
@@ -115,12 +135,26 @@ impl ToolRegistry {
             bail!("unknown tool '{name}'");
         };
 
+        let memory_arguments = arguments.clone();
         let timeout = timeout_from_arguments(&arguments, self.default_timeout)
             .with_context(|| format!("tool '{name}' received invalid arguments"))?;
         let mut outcome = tool
             .execute(arguments, timeout)
             .await
             .with_context(|| format!("tool '{name}' failed"))?;
+        if let Some(memory) = &self.memory
+            && !MemoryRuntime::is_control_tool(name)
+        {
+            let pointer = memory
+                .store_tool_result(
+                    name,
+                    &memory_arguments,
+                    outcome.output.clone(),
+                    outcome.is_error,
+                )
+                .await?;
+            outcome.memory = Some(pointer);
+        }
         outcome.output = truncate_output(outcome.output, self.max_output_chars);
         Ok(outcome)
     }
@@ -183,12 +217,17 @@ mod tests {
     use std::{
         path::PathBuf,
         process,
+        sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use serde_json::json;
 
-    use super::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, ToolRegistry, WriteTool};
+    use super::{
+        BashTool, EditTool, GlobTool, GrepTool, ListPointersTool, PinTool, ReadTool, RecallTool,
+        ToolRegistry, UnpinTool, WriteTool,
+    };
+    use crate::memory::{MemoryConfig, MemoryRuntime};
 
     #[tokio::test]
     async fn registry_executes_all_builtin_tools() {
@@ -278,6 +317,178 @@ mod tests {
         assert!(output.contains("exit_code: 0"));
         assert!(output.contains("zex"));
 
+        tokio::fs::remove_dir_all(working_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_shell_result_is_pinned_and_survives_retention_and_reopen() {
+        let directory = temporary_directory("failed-shell-memory");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let config = MemoryConfig {
+            max_records: 1,
+            ..MemoryConfig::default()
+        };
+        let memory = Arc::new(MemoryRuntime::new(config.clone()));
+        memory
+            .activate("failed-shell-memory", directory.clone())
+            .await
+            .unwrap();
+        let mut tools = ToolRegistry::new(Duration::from_secs(5), 32_000);
+        tools.set_memory(Arc::clone(&memory));
+        tools.register(BashTool::new(directory.clone()));
+        memory.begin_turn().unwrap();
+        let failed = tools
+            .execute("bash", json!({"command":"echo diagnostic && exit 7"}))
+            .await
+            .unwrap();
+        assert!(failed.is_error);
+        let failed = failed.memory.unwrap();
+        assert!(failed.pinned);
+        assert_eq!(
+            failed.metadata.get("is_error").map(String::as_str),
+            Some("true")
+        );
+        let succeeded = tools
+            .execute(
+                "bash",
+                json!({"command":"echo tool error: this is only text && exit 0"}),
+            )
+            .await
+            .unwrap();
+        assert!(!succeeded.is_error);
+        let succeeded = succeeded.memory.unwrap();
+        assert!(!succeeded.pinned);
+        memory.commit_turn().await.unwrap();
+        memory.maintain().await.unwrap();
+        assert!(memory.contains(&failed.id));
+        assert!(!memory.contains(&succeeded.id));
+        drop(tools);
+        drop(memory);
+        let reopened = MemoryRuntime::new(config);
+        reopened
+            .activate("failed-shell-memory", directory.clone())
+            .await
+            .unwrap();
+        assert!(reopened.pointer_for_id(&failed.id).unwrap().pinned);
+        let content = reopened.recall(&failed.id, None, None, None).await.unwrap();
+        assert!(content.contains("exit_code: 7"));
+        assert!(content.contains("diagnostic"));
+        drop(reopened);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_deduplication_distinguishes_success_from_failure() {
+        let directory = temporary_directory("memory-result-status");
+        let memory = MemoryRuntime::new(MemoryConfig::default());
+        memory
+            .activate("memory-result-status", directory.clone())
+            .await
+            .unwrap();
+        let args = json!({"command":"same command"});
+        let succeeded = memory
+            .store_tool_result("bash", &args, "same output".to_owned(), false)
+            .await
+            .unwrap();
+        let failed = memory
+            .store_tool_result("bash", &args, "same output".to_owned(), true)
+            .await
+            .unwrap();
+        assert_ne!(succeeded.id, failed.id);
+        assert!(!succeeded.pinned);
+        assert!(failed.pinned);
+        let repeated = memory
+            .store_tool_result("bash", &args, "same output".to_owned(), true)
+            .await
+            .unwrap();
+        assert_eq!(failed.id, repeated.id);
+        drop(memory);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn registry_stores_full_output_before_active_view_truncation() {
+        let working_dir = temporary_directory("memory-before-truncation");
+        tokio::fs::create_dir_all(&working_dir).await.unwrap();
+        let original = "addressable-source-".repeat(100);
+        tokio::fs::write(working_dir.join("long.txt"), &original)
+            .await
+            .unwrap();
+        let memory = Arc::new(MemoryRuntime::new(MemoryConfig {
+            max_recall_tokens: 4_096,
+            ..MemoryConfig::default()
+        }));
+        memory
+            .activate(
+                "20260815-120000-aabbccdd",
+                working_dir.join("session-memory"),
+            )
+            .await
+            .unwrap();
+        let mut tools = ToolRegistry::new(Duration::from_secs(5), 32);
+        tools.set_memory(Arc::clone(&memory));
+        tools.register(ReadTool::new(working_dir.clone()));
+
+        let outcome = tools
+            .execute("read", json!({"path": "long.txt"}))
+            .await
+            .unwrap();
+        let pointer = outcome.memory.expect("read result should be addressable");
+
+        assert!(outcome.output.contains("[truncated:"));
+        let recalled = memory.recall(&pointer.id, None, None, None).await.unwrap();
+        assert!(recalled.ends_with(&original));
+        tokio::fs::remove_dir_all(working_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_control_tools_validate_and_return_stored_content() {
+        let working_dir = temporary_directory("memory-tools");
+        let memory = Arc::new(MemoryRuntime::new(MemoryConfig::default()));
+        memory
+            .activate(
+                "20260815-120000-11223344",
+                working_dir.join("session-memory"),
+            )
+            .await
+            .unwrap();
+        let pointer = memory
+            .store_tool_result(
+                "read",
+                &json!({"path": "small.txt"}),
+                "exact body".to_owned(),
+                false,
+            )
+            .await
+            .unwrap();
+        memory.set_active_pointers([pointer.id.clone()]);
+        let mut tools = ToolRegistry::new(Duration::from_secs(5), 32_000);
+        tools.set_memory(Arc::clone(&memory));
+        tools.register(RecallTool::new(Arc::clone(&memory)));
+        tools.register(PinTool::new(Arc::clone(&memory)));
+        tools.register(UnpinTool::new(Arc::clone(&memory)));
+        tools.register(ListPointersTool::new(Arc::clone(&memory)));
+
+        let names = tools
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["list_pointers", "pin", "recall", "unpin"]);
+        let recalled = tools
+            .execute(
+                "recall",
+                json!({"id": pointer.id, "reason": "exact verification"}),
+            )
+            .await
+            .unwrap()
+            .output;
+        assert!(recalled.ends_with("exact body"));
+        let missing = tools
+            .execute("recall", json!({"id": "§obs_000000000000000000000000"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{missing:#}").contains("does not exist"));
         tokio::fs::remove_dir_all(working_dir).await.unwrap();
     }
 

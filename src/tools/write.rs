@@ -62,12 +62,14 @@ impl Tool for WriteTool {
                     .with_context(|| format!("failed to write {}", path.display()))?;
 
                 Ok(ToolOutcome {
+                    is_error: false,
                     output: format!(
                         "wrote {} bytes to {}",
                         arguments.content.len(),
                         path.display()
                     ),
                     change: FileChange::capture(path.clone(), before, arguments.content),
+                    memory: None,
                 })
             })
             .await

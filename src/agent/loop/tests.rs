@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -10,30 +13,54 @@ use tokio::sync::mpsc;
 
 use crate::{
     agent::{AgentEvent, AssistantMessage, MessageRole, ToolCall},
-    provider::{Provider, ToolDefinition},
+    memory::{MemoryConfig, MemoryRuntime, extract_memory_ids},
+    provider::{PreparedRequest, Provider, ToolDefinition},
     tools::{Tool, ToolFuture, ToolRegistry},
 };
 
-use super::{AUTO_COMPACT_PERCENT, Agent, AgentOptions};
+use super::{AUTO_COMPACT_PERCENT, Agent, AgentOptions, bounded_summary_lines};
 
 struct SequenceProvider {
     messages: Mutex<VecDeque<AssistantMessage>>,
     requests: Arc<Mutex<Vec<Vec<crate::agent::Message>>>>,
 }
 
+fn prepare_messages(
+    messages: &[crate::agent::Message],
+    tools: &[ToolDefinition],
+    max_output_tokens: usize,
+) -> Result<PreparedRequest<Vec<crate::agent::Message>>> {
+    let serialized = serde_json::to_string(&(messages, tools))?;
+    Ok(PreparedRequest::new(
+        crate::agent::estimate_tokens(&serialized),
+        max_output_tokens,
+        messages.to_vec(),
+    ))
+}
+
 impl Provider for SequenceProvider {
-    async fn complete(
+    type Request = Vec<crate::agent::Message>;
+
+    fn prepare_request(
         &self,
         _model: &str,
         _thinking_level: crate::provider::ThinkingLevel,
         messages: &[crate::agent::Message],
-        _tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        prepare_messages(messages, tools, max_output_tokens)
+    }
+
+    async fn complete(
+        &self,
+        messages: Self::Request,
         events: &crate::agent::EventSender,
     ) -> Result<AssistantMessage> {
         self.requests
             .lock()
             .expect("sequence provider requests mutex poisoned")
-            .push(messages.to_vec());
+            .push(messages);
         let message = self
             .messages
             .lock()
@@ -58,12 +85,22 @@ impl Provider for SequenceProvider {
 struct FailingProvider;
 
 impl Provider for FailingProvider {
-    async fn complete(
+    type Request = Vec<crate::agent::Message>;
+
+    fn prepare_request(
         &self,
         _model: &str,
         _thinking_level: crate::provider::ThinkingLevel,
-        _messages: &[crate::agent::Message],
-        _tools: &[ToolDefinition],
+        messages: &[crate::agent::Message],
+        tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        prepare_messages(messages, tools, max_output_tokens)
+    }
+
+    async fn complete(
+        &self,
+        _request: Self::Request,
         _events: &crate::agent::EventSender,
     ) -> Result<AssistantMessage> {
         bail!("provider unavailable")
@@ -73,15 +110,65 @@ impl Provider for FailingProvider {
 struct PendingProvider;
 
 impl Provider for PendingProvider {
-    async fn complete(
+    type Request = Vec<crate::agent::Message>;
+
+    fn prepare_request(
         &self,
         _model: &str,
         _thinking_level: crate::provider::ThinkingLevel,
-        _messages: &[crate::agent::Message],
-        _tools: &[ToolDefinition],
+        messages: &[crate::agent::Message],
+        tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        prepare_messages(messages, tools, max_output_tokens)
+    }
+
+    async fn complete(
+        &self,
+        _request: Self::Request,
         _events: &crate::agent::EventSender,
     ) -> Result<AssistantMessage> {
         std::future::pending().await
+    }
+}
+
+struct ToolThenFailProvider {
+    calls: AtomicUsize,
+}
+
+impl Provider for ToolThenFailProvider {
+    type Request = Vec<crate::agent::Message>;
+
+    fn prepare_request(
+        &self,
+        _model: &str,
+        _thinking_level: crate::provider::ThinkingLevel,
+        messages: &[crate::agent::Message],
+        tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        prepare_messages(messages, tools, max_output_tokens)
+    }
+
+    async fn complete(
+        &self,
+        _request: Self::Request,
+        _events: &crate::agent::EventSender,
+    ) -> Result<AssistantMessage> {
+        if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            return Ok(AssistantMessage {
+                content: String::new(),
+                thinking: None,
+                tool_calls: vec![ToolCall {
+                    id: "aborted-call".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: r#"{"value":"aborted observation"}"#.to_owned(),
+                }],
+                provider_state: None,
+                usage: None,
+            });
+        }
+        bail!("provider failed after tool execution")
     }
 }
 
@@ -138,6 +225,235 @@ impl Tool for EchoTool {
             ))
         })
     }
+}
+
+/// Reports billed input tokens as a fixed multiple of whatever the agent
+/// measured, so a test can pin the exact calibration ratio.
+struct CalibratingProvider {
+    ratio: f64,
+    last_estimate: Arc<AtomicUsize>,
+}
+
+impl Provider for CalibratingProvider {
+    type Request = Vec<crate::agent::Message>;
+
+    fn prepare_request(
+        &self,
+        _model: &str,
+        _thinking_level: crate::provider::ThinkingLevel,
+        messages: &[crate::agent::Message],
+        tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        let prepared = prepare_messages(messages, tools, max_output_tokens)?;
+        self.last_estimate
+            .store(prepared.input_tokens(), Ordering::Relaxed);
+        Ok(prepared)
+    }
+
+    async fn complete(
+        &self,
+        _request: Self::Request,
+        _events: &crate::agent::EventSender,
+    ) -> Result<AssistantMessage> {
+        let estimate = self.last_estimate.load(Ordering::Relaxed) as f64;
+        Ok(AssistantMessage {
+            content: "done".to_owned(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            provider_state: None,
+            usage: Some(crate::agent::CompletionUsage {
+                input_tokens: Some((estimate * self.ratio).round() as u64),
+                output_tokens: Some(16),
+            }),
+        })
+    }
+}
+
+async fn calibrated_agent(ratio: f64) -> (Agent<CalibratingProvider>, Arc<AtomicUsize>) {
+    let last_estimate = Arc::new(AtomicUsize::new(0));
+    let provider = CalibratingProvider {
+        ratio,
+        last_estimate: Arc::clone(&last_estimate),
+    };
+    let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(Duration::from_secs(1), 32_000),
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(5),
+            max_turns: 2,
+            max_context_tokens: 200_000,
+            compact_keep_turns: 6,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+    agent.prompt("task").await.unwrap();
+    (agent, last_estimate)
+}
+
+#[tokio::test]
+async fn billed_usage_calibrates_later_context_estimates() {
+    let (agent, last_estimate) = calibrated_agent(1.2).await;
+
+    // context_tokens re-prepares the current history, so the raw estimate it
+    // just recorded is the one the reported number should scale.
+    let reported = agent.context_tokens();
+    let raw = last_estimate.load(Ordering::Relaxed);
+    assert!(raw > 0);
+    assert_eq!(reported, (raw as f64 * 1.2).round() as usize);
+}
+
+#[tokio::test]
+async fn plausible_large_ratio_calibrates_the_lightweight_estimate() {
+    let (agent, last_estimate) = calibrated_agent(2.5).await;
+
+    let reported = agent.context_tokens();
+    let raw = last_estimate.load(Ordering::Relaxed);
+    assert!(raw > 0);
+    assert_eq!(reported, (raw as f64 * 2.5).round() as usize);
+}
+
+#[tokio::test]
+async fn implausible_billing_is_ignored_rather_than_trusted() {
+    // A provider that reports cache-excluded input tokens looks like this.
+    // Scaling the budget by it would badly under-count the real context.
+    let (agent, last_estimate) = calibrated_agent(0.1).await;
+
+    let reported = agent.context_tokens();
+    let raw = last_estimate.load(Ordering::Relaxed);
+    assert!(raw > 0);
+    assert_eq!(reported, raw);
+}
+
+#[tokio::test]
+async fn switching_models_drops_the_previous_calibration() {
+    let (mut agent, last_estimate) = calibrated_agent(1.2).await;
+    assert_ne!(
+        agent.context_tokens(),
+        last_estimate.load(Ordering::Relaxed)
+    );
+
+    agent.set_model("other-model".to_owned());
+
+    let reported = agent.context_tokens();
+    let raw = last_estimate.load(Ordering::Relaxed);
+    assert_eq!(reported, raw);
+}
+
+#[tokio::test]
+async fn the_cacheable_prefix_survives_every_turn() {
+    let directory = std::env::temp_dir().join(format!(
+        "zex-agent-prefix-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let memory = Arc::new(MemoryRuntime::new(MemoryConfig::default()));
+    memory
+        .activate("20260815-120000-deadbeef", directory.clone())
+        .await
+        .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let large = |label: &str| "detail ".repeat(4_000) + label;
+    let provider = SequenceProvider {
+        messages: Mutex::new(VecDeque::from([
+            AssistantMessage {
+                content: String::new(),
+                thinking: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-a".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: serde_json::to_string(&json!({"value": large("a")})).unwrap(),
+                }],
+                provider_state: None,
+                usage: None,
+            },
+            AssistantMessage {
+                content: "first done".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+                usage: None,
+            },
+            AssistantMessage {
+                content: String::new(),
+                thinking: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-b".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: serde_json::to_string(&json!({"value": large("b")})).unwrap(),
+                }],
+                provider_state: None,
+                usage: None,
+            },
+            AssistantMessage {
+                content: "second done".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+                usage: None,
+            },
+        ])),
+        requests: Arc::clone(&requests),
+    };
+    let mut tools = ToolRegistry::new(Duration::from_secs(1), 32_000);
+    tools.set_memory(Arc::clone(&memory));
+    tools.register(EchoTool);
+    let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        provider,
+        tools,
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(5),
+            max_turns: 4,
+            max_context_tokens: 400_000,
+            compact_keep_turns: 6,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+    agent.initialize_memory().await.unwrap();
+    agent.prompt("first task").await.unwrap();
+    agent.prompt("second task").await.unwrap();
+
+    let sent = requests.lock().unwrap().clone();
+    assert!(sent.len() >= 4);
+    let manifest_of = |request: &Vec<crate::agent::Message>| match request.last() {
+        Some(crate::agent::Message::System { content })
+            if content.starts_with("[Current valid addressable pointers]") =>
+        {
+            Some(content.clone())
+        }
+        _ => None,
+    };
+
+    // The system prompt is the cache anchor: if it moves, no provider can
+    // reuse anything at all.
+    for request in &sent {
+        assert_eq!(request.first(), sent[0].first());
+    }
+    // The manifest still tracks new observations, it just does so at the tail.
+    let manifests = sent.iter().filter_map(manifest_of).collect::<Vec<_>>();
+    assert!(manifests.len() >= 2);
+    assert_ne!(manifests.first(), manifests.last());
+
+    // Everything the earlier request sent, minus its trailing manifest, is a
+    // prefix of the later request.
+    let first = &sent[1];
+    let last = sent.last().unwrap();
+    let reusable = first.len() - usize::from(manifest_of(first).is_some());
+    assert!(reusable > 1);
+    assert_eq!(&first[..reusable], &last[..reusable]);
+
+    tokio::fs::remove_dir_all(directory).await.unwrap();
 }
 
 #[tokio::test]
@@ -265,6 +581,223 @@ async fn emits_message_tool_and_turn_events_in_order() {
 }
 
 #[tokio::test]
+async fn large_tool_result_compacts_to_a_recallable_citation() {
+    let directory = std::env::temp_dir().join(format!(
+        "zex-agent-memory-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let memory = Arc::new(MemoryRuntime::new(MemoryConfig {
+        max_recall_tokens: 32_768,
+        // Pin the threshold the test is actually about instead of riding on
+        // whatever the shipped default happens to be.
+        max_inline_tool_tokens: 2_048,
+        ..MemoryConfig::default()
+    }));
+    memory
+        .activate("20260815-120000-cafebabe", directory.clone())
+        .await
+        .unwrap();
+    let original = "precise-large-observation\n".repeat(600);
+    let old_prompt = "old task context ".repeat(2_000);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = SequenceProvider {
+        messages: Mutex::new(VecDeque::from([
+            AssistantMessage {
+                content: String::new(),
+                thinking: Some("Need the large observation.".to_owned()),
+                tool_calls: vec![ToolCall {
+                    id: "call-big".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: serde_json::to_string(&json!({"value": original.clone()})).unwrap(),
+                }],
+                provider_state: None,
+                usage: None,
+            },
+            AssistantMessage {
+                content: "old turn complete".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+                usage: None,
+            },
+            AssistantMessage {
+                content: "recent turn complete".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+                usage: None,
+            },
+        ])),
+        requests: Arc::clone(&requests),
+    };
+    let mut tools = ToolRegistry::new(Duration::from_secs(1), 32_000);
+    tools.set_memory(Arc::clone(&memory));
+    tools.register(EchoTool);
+    let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        provider,
+        tools,
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(5),
+            max_turns: 3,
+            max_context_tokens: 120_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+    agent.initialize_memory().await.unwrap();
+
+    agent.prompt(old_prompt.clone()).await.unwrap();
+    agent.prompt("recent task").await.unwrap();
+
+    let tool_content = agent
+        .messages()
+        .iter()
+        .find_map(|message| match message {
+            crate::agent::Message::Tool { content, .. } => Some(content),
+            _ => None,
+        })
+        .unwrap();
+    let id = extract_memory_ids(tool_content).pop().unwrap();
+    assert!(tool_content.contains("recall available"));
+    // The bulk is gone, but a bounded head rides along with the citation so the
+    // model can judge relevance without spending a recall to find out.
+    assert!(tool_content.contains("precise-large-observation"));
+    assert!(tool_content.matches("precise-large-observation").count() < 100);
+    assert!(tool_content.len() * 4 < original.len());
+    // The system prompt carries the static policy only. The volatile pointer
+    // manifest rides at the end of the wire request so the cached prefix
+    // survives every turn.
+    assert!(matches!(
+        agent.messages().first(),
+        Some(crate::agent::Message::System { content })
+            if content.contains("Never invent")
+                && content.contains("A missing or invalid ID means that content is unavailable")
+                && content.contains("A rate-limit error is temporary")
+                && !content.contains("[Current valid addressable pointers]")
+                && !content.contains(&id)
+    ));
+    let sent = requests
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the provider must have received a request");
+    assert!(matches!(
+        sent.last(),
+        Some(crate::agent::Message::System { content })
+            if content.starts_with("[Current valid addressable pointers]")
+                && content.contains(&id)
+    ));
+    assert_eq!(agent.messages().first(), sent.first());
+    let stored_history = memory.list_pointers(Some("old task")).await.unwrap();
+    let turn_id = extract_memory_ids(&stored_history).pop().unwrap();
+    assert!(turn_id.starts_with("§turn_"));
+
+    let before = agent.context_tokens();
+    let stats = agent.compact().await.unwrap();
+    assert!(stats.freed_tokens > 0);
+    assert!(agent.context_tokens() * 2 < before);
+    assert!(matches!(
+        agent.messages().get(1),
+        Some(crate::agent::Message::System { content })
+            if content.contains("[Available addressable pointers]")
+                && content.contains(&id)
+    ));
+    let recalled_turn = memory
+        .recall(
+            &turn_id,
+            Some("recover compacted request".to_owned()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(recalled_turn.ends_with(&old_prompt));
+    let recalled = memory
+        .recall(
+            &id,
+            Some("continue from exact evidence".to_owned()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(recalled.ends_with(&original));
+    tokio::fs::remove_dir_all(directory).await.unwrap();
+}
+
+#[tokio::test]
+async fn disabled_memory_preserves_the_original_tool_and_prompt_contract() {
+    let original = "legacy-full-output".repeat(200);
+    let provider = SequenceProvider {
+        messages: Mutex::new(VecDeque::from([
+            AssistantMessage {
+                content: String::new(),
+                thinking: None,
+                tool_calls: vec![ToolCall {
+                    id: "legacy-call".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: serde_json::to_string(&json!({"value": original.clone()})).unwrap(),
+                }],
+                provider_state: None,
+                usage: None,
+            },
+            AssistantMessage {
+                content: "done".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+                usage: None,
+            },
+        ])),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut tools = ToolRegistry::new(Duration::from_secs(1), 32_000);
+    tools.register(EchoTool);
+    let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        provider,
+        tools,
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(5),
+            max_turns: 2,
+            max_context_tokens: 120_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+
+    agent.prompt("legacy behavior").await.unwrap();
+
+    assert!(matches!(
+        agent.messages().first(),
+        Some(crate::agent::Message::System { content })
+            if !content.contains("[Addressable memory policy]")
+    ));
+    assert!(agent.messages().iter().any(|message| matches!(
+        message,
+        crate::agent::Message::Tool { content, .. } if content == &original
+    )));
+    assert!(
+        !agent
+            .messages()
+            .iter()
+            .any(|message| !extract_memory_ids(super::message_content(message)).is_empty())
+    );
+}
+
+#[tokio::test]
 async fn emits_provider_errors() {
     let (events, mut receiver) = mpsc::unbounded_channel();
     let mut agent = Agent::new(
@@ -301,7 +834,7 @@ async fn emits_provider_errors() {
 }
 
 #[tokio::test]
-async fn cancellation_keeps_user_prompt_and_discards_partial_turn_state() {
+async fn cancellation_keeps_user_prompt_and_records_interruption() {
     let (events, mut receiver) = mpsc::unbounded_channel();
     let mut agent = Agent::new(
         PendingProvider,
@@ -331,7 +864,7 @@ async fn cancellation_keeps_user_prompt_and_discards_partial_turn_state() {
     .unwrap();
 
     assert_eq!(outcome, crate::agent::PromptOutcome::Cancelled);
-    assert_eq!(agent.messages().len(), 2);
+    assert_eq!(agent.messages().len(), 3);
     assert!(matches!(
         &agent.messages()[1],
         crate::agent::Message::User { content } if content == "stop this"
@@ -346,8 +879,83 @@ async fn cancellation_keeps_user_prompt_and_discards_partial_turn_state() {
     assert_eq!(receiver.try_recv().unwrap(), AgentEvent::TurnCancelled);
 }
 
-#[test]
-fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
+#[tokio::test]
+async fn failed_turn_preserves_completed_memory_records_after_reopen() {
+    let directory = std::env::temp_dir().join(format!(
+        "zex-agent-aborted-memory-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config = MemoryConfig::default();
+    let memory = Arc::new(MemoryRuntime::new(config.clone()));
+    memory
+        .activate("20260815-120000-abcd1234", directory.clone())
+        .await
+        .unwrap();
+    let mut tools = ToolRegistry::new(Duration::from_secs(1), 32_000);
+    tools.set_memory(Arc::clone(&memory));
+    tools.register(EchoTool);
+    let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        ToolThenFailProvider {
+            calls: AtomicUsize::new(0),
+        },
+        tools,
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(5),
+            max_turns: 2,
+            max_context_tokens: 120_000,
+            compact_keep_turns: 6,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+
+    let error = agent.prompt("run a failing tool turn").await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("provider failed after tool execution")
+    );
+    assert_eq!(agent.messages().len(), 5);
+    assert!(
+        !memory
+            .list_pointers(Some("tool=echo"))
+            .await
+            .unwrap()
+            .starts_with("No addressable pointers")
+    );
+    let records = tokio::fs::read_to_string(memory.records_path().unwrap())
+        .await
+        .unwrap();
+    assert!(records.contains(r#""state":"committed""#));
+
+    drop(agent);
+    drop(memory);
+    let reopened = MemoryRuntime::new(config);
+    reopened
+        .activate("20260815-120000-abcd1234", directory.clone())
+        .await
+        .unwrap();
+    assert!(
+        !reopened
+            .list_pointers(Some("tool=echo"))
+            .await
+            .unwrap()
+            .starts_with("No addressable pointers")
+    );
+
+    tokio::fs::remove_dir_all(directory).await.unwrap();
+}
+
+#[tokio::test]
+async fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
     let provider = SequenceProvider {
         messages: Mutex::new(VecDeque::new()),
         requests: Arc::new(Mutex::new(Vec::new())),
@@ -405,7 +1013,7 @@ fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
     );
 
     let before = agent.context_tokens();
-    let stats = agent.compact();
+    let stats = agent.compact().await.unwrap();
 
     assert_eq!(stats.kept_turns, 2);
     assert_eq!(stats.summarized_turns, 1);
@@ -427,7 +1035,7 @@ fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
             if content.contains("Compacted earlier conversation")
                 && content.contains("Original request:\nold task")
                 && !content.contains("User: old task")
-                && content.contains("Assistant thinking")
+                && !content.contains("Need to inspect the large file.")
                 && content.contains("Tool result read")
     ));
     assert!(agent.messages().iter().any(
@@ -438,8 +1046,416 @@ fn compact_summarizes_old_tool_output_and_keeps_recent_turns() {
         ));
 }
 
+#[tokio::test]
+async fn provider_failure_after_compaction_keeps_archived_history_addressable() {
+    let directory =
+        std::env::temp_dir().join(format!("zex-compact-failure-{}", std::process::id()));
+    let memory = Arc::new(MemoryRuntime::new(MemoryConfig::default()));
+    memory
+        .activate("compact-failure", directory.clone())
+        .await
+        .unwrap();
+    let mut tools = ToolRegistry::new(Duration::from_secs(1), 32_000);
+    tools.set_memory(Arc::clone(&memory));
+    let (events, mut receiver) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        FailingProvider,
+        tools,
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(5),
+            max_turns: 2,
+            max_context_tokens: 4_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        Some(vec![crate::agent::Message::User {
+            content: "old evidence ".repeat(4_000),
+        }]),
+    );
+    assert!(agent.prompt("current task").await.is_err());
+    assert!(
+        std::iter::from_fn(|| receiver.try_recv().ok())
+            .any(|event| matches!(event, AgentEvent::ContextCompacted { .. }))
+    );
+    assert!(agent.messages().iter().any(|message| matches!(message, crate::agent::Message::User { content } if content == "current task")));
+    let ids = agent
+        .messages()
+        .iter()
+        .flat_map(|message| extract_memory_ids(super::message_content(message)))
+        .collect::<Vec<_>>();
+    assert!(!ids.is_empty());
+    drop(agent);
+    drop(memory);
+    let reopened = MemoryRuntime::new(MemoryConfig::default());
+    reopened
+        .activate("compact-failure", directory.clone())
+        .await
+        .unwrap();
+    for id in ids {
+        assert!(
+            reopened.contains(&id),
+            "compacted pointer lost after failure: {id}"
+        );
+    }
+    tokio::fs::remove_dir_all(directory).await.unwrap();
+}
+
+struct PausingTool(Arc<tokio::sync::Notify>);
+
+#[tokio::test]
+async fn nonzero_shell_exit_emits_failure_and_returns_diagnostics_to_model() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = SequenceProvider {
+        requests: Arc::clone(&requests),
+        messages: Mutex::new(VecDeque::from([
+            AssistantMessage {
+                content: String::new(),
+                thinking: None,
+                provider_state: None,
+                usage: None,
+                tool_calls: vec![ToolCall {
+                    id: "failed-command".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({"command":"echo diagnostic && exit 7"}).to_string(),
+                }],
+            },
+            AssistantMessage {
+                content: "test failed".to_owned(),
+                thinking: None,
+                provider_state: None,
+                usage: None,
+                tool_calls: Vec::new(),
+            },
+        ])),
+    };
+    let mut tools = ToolRegistry::new(Duration::from_secs(5), 32_000);
+    tools.register(crate::tools::BashTool::new(
+        std::env::current_dir().unwrap(),
+    ));
+    let (events, mut receiver) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        provider,
+        tools,
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(10),
+            max_turns: 2,
+            max_context_tokens: 120_000,
+            compact_keep_turns: 2,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+    agent.prompt("run the failing command").await.unwrap();
+    assert!(std::iter::from_fn(|| receiver.try_recv().ok()).any(|event| matches!(event,
+        AgentEvent::ToolEnd { is_error: true, output, .. } if output.contains("exit_code: 7") && output.contains("diagnostic")
+    )));
+    let requests = requests.lock().unwrap();
+    assert!(requests[1].iter().any(|message| matches!(message,
+        crate::agent::Message::Tool { content, .. } if content.contains("exit_code: 7") && content.contains("diagnostic")
+    )));
+}
+
+impl Tool for PausingTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "pause".to_owned(),
+            description: "Waits for cancellation.".to_owned(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+
+    fn execute(&self, _arguments: Value, _timeout: Duration) -> ToolFuture<'_> {
+        Box::pin(async move {
+            self.0.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+#[tokio::test]
+async fn interrupted_tool_batch_preserves_writes_and_closes_pending_calls() {
+    for cancel in [true, false] {
+        let directory = std::env::temp_dir().join(format!(
+            "zex-interrupted-write-{}-{cancel}",
+            std::process::id()
+        ));
+        let memory = Arc::new(MemoryRuntime::new(MemoryConfig::default()));
+        memory
+            .activate("interrupted-write", directory.join("memory"))
+            .await
+            .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut tools = ToolRegistry::new(Duration::from_secs(2), 32_000);
+        tools.set_memory(Arc::clone(&memory));
+        tools.register(crate::tools::WriteTool::new(directory.clone()));
+        tools.register(PausingTool(Arc::clone(&started)));
+        let provider = SequenceProvider {
+            messages: Mutex::new(VecDeque::from([AssistantMessage {
+                content: String::new(),
+                thinking: None,
+                provider_state: None,
+                usage: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "written".to_owned(),
+                        name: "write".to_owned(),
+                        arguments: json!({"path":"done.txt","content":"completed"}).to_string(),
+                    },
+                    ToolCall {
+                        id: "pending".to_owned(),
+                        name: "pause".to_owned(),
+                        arguments: "{}".to_owned(),
+                    },
+                    ToolCall {
+                        id: "unstarted".to_owned(),
+                        name: "write".to_owned(),
+                        arguments: json!({"path":"never.txt","content":"wrong"}).to_string(),
+                    },
+                ],
+            }])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (events, _) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            provider,
+            tools,
+            events,
+            AgentOptions {
+                model: "test-model".to_owned(),
+                turn_timeout: Duration::from_millis(500),
+                max_turns: 2,
+                max_context_tokens: 120_000,
+                compact_keep_turns: 1,
+                thinking_level: crate::provider::ThinkingLevel::Medium,
+            },
+            None,
+        );
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let (result, ()) = tokio::join!(
+            agent.prompt_cancellable("write then pause", receiver),
+            async {
+                started.notified().await;
+                if cancel {
+                    sender.send(true).unwrap();
+                }
+            }
+        );
+        if cancel {
+            assert_eq!(result.unwrap(), crate::agent::PromptOutcome::Cancelled);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("timeout"));
+        }
+        assert_eq!(
+            tokio::fs::read_to_string(directory.join("done.txt"))
+                .await
+                .unwrap(),
+            "completed"
+        );
+        assert!(!directory.join("never.txt").exists());
+        let results = agent
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                crate::agent::Message::Tool {
+                    tool_call_id,
+                    content,
+                } => Some((tool_call_id.as_str(), content.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].1.contains("wrote"));
+        assert!(results[1].1.contains("without a confirmed result"));
+        assert!(results[2].1.contains("not executed"));
+        let store = crate::session::SessionStore::new(directory.join("sessions"));
+        let id = store
+            .save(
+                None,
+                agent.model(),
+                agent.thinking_preference(),
+                agent.messages(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load(Some(&id)).await.unwrap().unwrap().messages,
+            agent.messages()
+        );
+        assert!(
+            !memory
+                .list_pointers(Some("tool=write"))
+                .await
+                .unwrap()
+                .starts_with("No addressable pointers")
+        );
+        drop(agent);
+        drop(memory);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+}
+
 #[test]
-fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
+fn dynamic_summary_budget_keeps_the_anchor_and_newest_entries() {
+    let lines = std::iter::once(format!(
+        "Original request:\n{}",
+        "important anchor ".repeat(40)
+    ))
+    .chain((0..24).map(|index| format!("Assistant: recent outcome {index} {}", "x".repeat(80))))
+    .collect::<Vec<_>>();
+    let budget = 96;
+    let bounded = bounded_summary_lines(lines, budget);
+    let measured = bounded
+        .iter()
+        .map(|line| crate::agent::estimate_tokens(line).saturating_add(1))
+        .sum::<usize>();
+
+    assert!(measured <= budget);
+    assert!(bounded[0].starts_with("Original request:"));
+    assert!(
+        bounded
+            .iter()
+            .any(|line| line.contains("recent outcome 23"))
+    );
+}
+
+#[tokio::test]
+async fn compact_rebudgets_an_existing_summary_after_switching_to_a_smaller_window() {
+    let (events, _) = mpsc::unbounded_channel();
+    let existing_summary = format!(
+        "[Compacted earlier conversation: 20 turn(s)]\nOriginal request:\n{}\n{}",
+        "preserve this anchor ".repeat(80),
+        (0..80)
+            .map(|index| format!("Assistant: historical outcome {index} {}", "x".repeat(120)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let mut agent = Agent::new(
+        FailingProvider,
+        ToolRegistry::new(Duration::from_secs(1), 32_000),
+        events,
+        AgentOptions {
+            model: "small-model".to_owned(),
+            turn_timeout: Duration::from_secs(1),
+            max_turns: 1,
+            max_context_tokens: 1_000,
+            compact_keep_turns: 6,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        Some(vec![
+            crate::agent::Message::System {
+                content: super::SYSTEM_PROMPT.to_owned(),
+            },
+            crate::agent::Message::System {
+                content: existing_summary,
+            },
+            crate::agent::Message::User {
+                content: "recent task".to_owned(),
+            },
+            crate::agent::Message::Assistant {
+                content: "recent answer".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+            },
+        ]),
+    );
+
+    let stats = agent.compact().await.unwrap();
+    let crate::agent::Message::System { content } = &agent.messages()[1] else {
+        panic!("expected compacted summary");
+    };
+
+    assert_eq!(stats.summarized_turns, 0);
+    assert!(stats.freed_tokens > 0);
+    assert!(content.contains("Original request:"));
+    assert!(crate::agent::estimate_tokens(content) < 320);
+}
+
+#[tokio::test]
+async fn repeated_compaction_keeps_one_canonical_original_request() {
+    let provider = SequenceProvider {
+        messages: Mutex::new(VecDeque::from([AssistantMessage {
+            content: "new answer".to_owned(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            provider_state: None,
+            usage: None,
+        }])),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(Duration::from_secs(1), 32_000),
+        events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(5),
+            max_turns: 1,
+            max_context_tokens: 120_000,
+            compact_keep_turns: 2,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        Some(vec![
+            crate::agent::Message::User {
+                content: "original task".to_owned(),
+            },
+            crate::agent::Message::Assistant {
+                content: "original answer".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+            },
+            crate::agent::Message::User {
+                content: "middle task".to_owned(),
+            },
+            crate::agent::Message::Assistant {
+                content: "middle answer".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+            },
+            crate::agent::Message::User {
+                content: "recent one".to_owned(),
+            },
+            crate::agent::Message::Assistant {
+                content: "recent answer one".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+            },
+            crate::agent::Message::User {
+                content: "recent two".to_owned(),
+            },
+            crate::agent::Message::Assistant {
+                content: "recent answer two".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+            },
+        ]),
+    );
+
+    agent.compact().await.unwrap();
+    agent.prompt("new task").await.unwrap();
+    agent.compact().await.unwrap();
+
+    let summary = match &agent.messages()[1] {
+        crate::agent::Message::System { content } => content,
+        message => panic!("expected compact summary, got {message:?}"),
+    };
+    assert_eq!(summary.matches("Original request").count(), 1);
+    assert!(summary.contains("Original request:\noriginal task"));
+    assert!(summary.contains("User: recent one"));
+    assert!(!summary.contains("Original request:\nrecent one"));
+}
+
+#[tokio::test]
+async fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
     let provider = SequenceProvider {
         messages: Mutex::new(VecDeque::new()),
         requests: Arc::new(Mutex::new(Vec::new())),
@@ -453,7 +1469,7 @@ fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
             model: "test-model".to_owned(),
             turn_timeout: Duration::from_secs(1),
             max_turns: 1,
-            max_context_tokens: 1_000,
+            max_context_tokens: 2_000,
             compact_keep_turns: 1,
             thinking_level: crate::provider::ThinkingLevel::Medium,
         },
@@ -473,13 +1489,14 @@ fn automatic_compact_emits_feedback_when_context_crosses_threshold() {
         ]),
     );
 
-    let stats = agent.compact_if_needed().expect("context should compact");
+    let definitions = agent.tools.definitions();
+    let _request = agent.prepare_with_compaction(&definitions).await.unwrap();
+    let stats = match receiver.try_recv().unwrap() {
+        AgentEvent::ContextCompacted { stats } => stats,
+        event => panic!("expected context compaction event, got {event:?}"),
+    };
 
     assert!(stats.freed_tokens > 0);
-    assert!(matches!(
-        receiver.try_recv().unwrap(),
-        AgentEvent::ContextCompacted { stats: emitted } if emitted == stats
-    ));
 }
 
 #[tokio::test]
@@ -573,6 +1590,8 @@ async fn tool_end_event_carries_the_file_change_for_mutations() {
 struct LimitedProvider;
 
 impl Provider for LimitedProvider {
+    type Request = Vec<crate::agent::Message>;
+
     fn context_limit(&self, _model: &str) -> Option<crate::provider::ModelLimit> {
         Some(crate::provider::ModelLimit {
             context: 100_000,
@@ -580,32 +1599,98 @@ impl Provider for LimitedProvider {
         })
     }
 
-    async fn complete(
+    fn prepare_request(
         &self,
         _model: &str,
         _thinking_level: crate::provider::ThinkingLevel,
-        _messages: &[crate::agent::Message],
-        _tools: &[ToolDefinition],
+        messages: &[crate::agent::Message],
+        tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        prepare_messages(messages, tools, max_output_tokens)
+    }
+
+    async fn complete(
+        &self,
+        _request: Self::Request,
         _events: &crate::agent::EventSender,
     ) -> Result<AssistantMessage> {
         bail!("not used")
     }
 }
 
+struct ModelSizedProvider;
+
+impl Provider for ModelSizedProvider {
+    type Request = ();
+
+    fn prepare_request(
+        &self,
+        model: &str,
+        _thinking_level: crate::provider::ThinkingLevel,
+        _messages: &[crate::agent::Message],
+        _tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        let input_tokens = if model == "small" { 100 } else { 200 };
+        Ok(PreparedRequest::new(input_tokens, max_output_tokens, ()))
+    }
+
+    async fn complete(
+        &self,
+        _request: Self::Request,
+        _events: &crate::agent::EventSender,
+    ) -> Result<AssistantMessage> {
+        bail!("not used")
+    }
+}
+
+struct OversizedProvider {
+    completed: Arc<AtomicBool>,
+}
+
+impl Provider for OversizedProvider {
+    type Request = ();
+
+    fn context_limit(&self, _model: &str) -> Option<crate::provider::ModelLimit> {
+        Some(crate::provider::ModelLimit {
+            context: 100,
+            output: Some(20),
+        })
+    }
+
+    fn prepare_request(
+        &self,
+        _model: &str,
+        _thinking_level: crate::provider::ThinkingLevel,
+        _messages: &[crate::agent::Message],
+        _tools: &[ToolDefinition],
+        max_output_tokens: usize,
+    ) -> Result<PreparedRequest<Self::Request>> {
+        Ok(PreparedRequest::new(90, max_output_tokens, ()))
+    }
+
+    async fn complete(
+        &self,
+        _request: Self::Request,
+        _events: &crate::agent::EventSender,
+    ) -> Result<AssistantMessage> {
+        self.completed.store(true, Ordering::Relaxed);
+        bail!("oversized request reached provider")
+    }
+}
+
 #[test]
-fn token_estimate_uses_bpe_and_skips_thinking() {
-    // o200k_base merges common ASCII runs into single tokens.
+fn fallback_message_estimate_uses_character_runs_and_skips_reasoning_state() {
     let ascii = crate::agent::Message::User {
         content: "abcdefgh".repeat(8),
     };
-    assert_eq!(ascii.token_estimate(), 8);
+    assert_eq!(ascii.token_estimate(), 16);
 
-    // CJK text tokenizes at roughly one token per two characters, far below
-    // the one-token-per-character worst case of the character heuristic.
     let cjk = crate::agent::Message::User {
         content: "你好".repeat(32),
     };
-    assert_eq!(cjk.token_estimate(), 32);
+    assert_eq!(cjk.token_estimate(), 64);
 
     let thinking = crate::agent::Message::Assistant {
         content: "answer".to_owned(),
@@ -641,6 +1726,9 @@ fn context_budget_uses_model_limit_minus_output_reserve() {
     );
 
     assert_eq!(agent.context_budget(), 96_000);
+    let definitions = agent.tools.definitions();
+    let request = agent.prepare_request(&definitions).unwrap();
+    assert_eq!(request.max_output_tokens(), 4_000);
 }
 
 #[test]
@@ -665,8 +1753,114 @@ fn context_budget_falls_back_when_no_model_limit_is_known() {
 }
 
 #[test]
-fn prune_clears_old_tool_outputs_before_full_compaction() {
+fn context_tokens_follow_the_active_model_preparation() {
     let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        ModelSizedProvider,
+        ToolRegistry::new(Duration::from_secs(1), 32_000),
+        events,
+        AgentOptions {
+            model: "small".to_owned(),
+            turn_timeout: Duration::from_secs(1),
+            max_turns: 1,
+            max_context_tokens: 42_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+
+    assert_eq!(agent.context_tokens(), 100);
+    agent.set_model("large".to_owned());
+    assert_eq!(agent.context_tokens(), 200);
+}
+
+#[tokio::test]
+async fn oversized_prepared_request_is_rejected_before_provider_execution() {
+    let completed = Arc::new(AtomicBool::new(false));
+    let provider = OversizedProvider {
+        completed: Arc::clone(&completed),
+    };
+    let (events, _) = mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(Duration::from_secs(1), 32_000),
+        events,
+        AgentOptions {
+            model: "limited".to_owned(),
+            turn_timeout: Duration::from_secs(1),
+            max_turns: 1,
+            max_context_tokens: 42_000,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        None,
+    );
+
+    let error = agent.prompt("too large").await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("exceeding the 80 token input budget")
+    );
+    assert!(error.to_string().contains("20 output tokens reserved"));
+    assert!(!completed.load(Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn summary_mode_pruning_keeps_the_record_addressable() {
+    let directory = std::env::temp_dir().join(format!(
+        "zex-agent-summary-prune-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let memory = MemoryRuntime::new(MemoryConfig {
+        mode: crate::memory::MemoryMode::Summary,
+        ..MemoryConfig::default()
+    });
+    memory
+        .activate("20260815-120000-5ummary0", directory.clone())
+        .await
+        .unwrap();
+    let body = "summary mode body\n".repeat(400);
+    let pointer = memory
+        .store_tool_result("grep", &json!({"pattern": "s"}), body.clone(), false)
+        .await
+        .unwrap();
+    memory.set_active_pointers([pointer.id.clone()]);
+
+    let mut messages = vec![crate::agent::Message::System {
+        content: super::SYSTEM_PROMPT.to_owned(),
+    }];
+    for index in 0..6 {
+        messages.push(crate::agent::Message::Tool {
+            tool_call_id: format!("call-{index}"),
+            content: memory.render_tool_result(&pointer, body.clone()),
+        });
+    }
+
+    let pruned = super::prune_tool_outputs(&mut messages, Some(&memory));
+
+    assert_eq!(pruned, 2);
+    let crate::agent::Message::Tool { content, .. } = &messages[1] else {
+        panic!("expected a tool message");
+    };
+    // Summary mode used to overwrite the citation along with the body, which
+    // stranded a record the model could no longer name.
+    assert!(!content.contains("summary mode body"));
+    assert!(content.contains(&pointer.id));
+    assert!(!content.starts_with("[tool output cleared"));
+
+    tokio::fs::remove_dir_all(directory).await.unwrap();
+}
+
+#[tokio::test]
+async fn prune_clears_old_tool_outputs_before_full_compaction() {
+    let (events, mut receiver) = mpsc::unbounded_channel();
     let mut messages = vec![crate::agent::Message::User {
         content: "task".to_owned(),
     }];
@@ -691,6 +1885,7 @@ fn prune_clears_old_tool_outputs_before_full_compaction() {
     }
     .token_estimate();
     let budget = (total - per_tool / 2) * 100 / AUTO_COMPACT_PERCENT;
+    let manual_messages = messages.clone();
     let mut agent = Agent::new(
         FailingProvider,
         ToolRegistry::new(Duration::from_secs(1), 32_000),
@@ -706,9 +1901,12 @@ fn prune_clears_old_tool_outputs_before_full_compaction() {
         Some(messages),
     );
 
-    let stats = agent
-        .compact_if_needed()
-        .expect("context should cross the threshold");
+    let definitions = agent.tools.definitions();
+    let _request = agent.prepare_with_compaction(&definitions).await.unwrap();
+    let stats = match receiver.try_recv().unwrap() {
+        AgentEvent::ContextCompacted { stats } => stats,
+        event => panic!("expected context compaction event, got {event:?}"),
+    };
 
     assert_eq!(stats.pruned_tool_outputs, 2);
     assert_eq!(stats.summarized_turns, 0, "pruning alone was enough");
@@ -729,10 +1927,41 @@ fn prune_clears_old_tool_outputs_before_full_compaction() {
         crate::agent::Message::System { content }
             if content.starts_with("[Compacted earlier conversation:")
     )));
+
+    let (manual_events, _) = mpsc::unbounded_channel();
+    let mut manual_agent = Agent::new(
+        FailingProvider,
+        ToolRegistry::new(Duration::from_secs(1), 32_000),
+        manual_events,
+        AgentOptions {
+            model: "test-model".to_owned(),
+            turn_timeout: Duration::from_secs(1),
+            max_turns: 1,
+            max_context_tokens: budget,
+            compact_keep_turns: 1,
+            thinking_level: crate::provider::ThinkingLevel::Medium,
+        },
+        Some(manual_messages),
+    );
+    let manual_stats = manual_agent.compact().await.unwrap();
+    assert_eq!(manual_stats.pruned_tool_outputs, 2);
+    assert_eq!(manual_stats.summarized_turns, 0);
+    let cleared = manual_agent
+        .messages()
+        .iter()
+        .filter(|message| {
+            matches!(
+                message,
+                crate::agent::Message::Tool { content, .. }
+                    if content.starts_with("[tool output cleared")
+            )
+        })
+        .count();
+    assert_eq!(cleared, 2);
 }
 
 #[tokio::test]
-async fn server_usage_calibrates_context_and_compaction_resets_it() {
+async fn prepared_request_measurement_recomputes_after_each_history_change() {
     let provider = SequenceProvider {
         messages: Mutex::new(VecDeque::from([AssistantMessage {
             content: "ok".to_owned(),
@@ -775,30 +2004,19 @@ async fn server_usage_calibrates_context_and_compaction_resets_it() {
         ]),
     );
 
-    let local_sum = |agent: &Agent<SequenceProvider>| {
-        agent
-            .messages()
-            .iter()
-            .map(crate::agent::Message::token_estimate)
-            .sum::<usize>()
+    let prepared_tokens = |agent: &Agent<SequenceProvider>| {
+        let definitions = agent.tools.definitions();
+        prepare_messages(agent.messages(), &definitions, 8_192)
+            .unwrap()
+            .input_tokens()
     };
-    assert_eq!(agent.context_tokens(), local_sum(&agent));
+    assert_eq!(agent.context_tokens(), prepared_tokens(&agent));
 
     agent.prompt("hello").await.unwrap();
 
-    // After a completion, context = server-reported input tokens + local
-    // estimate of the messages appended since (the assistant reply).
-    let assistant_tail = crate::agent::Message::Assistant {
-        content: "ok".to_owned(),
-        thinking: None,
-        tool_calls: Vec::new(),
-        provider_state: None,
-    }
-    .token_estimate();
-    assert_eq!(agent.context_tokens(), 5_000 + assistant_tail);
+    assert_eq!(agent.context_tokens(), prepared_tokens(&agent));
+    assert_ne!(agent.context_tokens(), 5_000);
 
-    // Compaction rewrites the history, so the server baseline is dropped and
-    // the estimate becomes fully local again.
-    agent.compact();
-    assert_eq!(agent.context_tokens(), local_sum(&agent));
+    agent.compact().await.unwrap();
+    assert_eq!(agent.context_tokens(), prepared_tokens(&agent));
 }

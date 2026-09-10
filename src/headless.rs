@@ -39,7 +39,11 @@ where
             print_command_output(&result.output)?;
             Ok(())
         }
-        None => agent.prompt(prompt).await.map(|_| ()),
+        None => {
+            let result = agent.prompt(prompt).await;
+            checkpoint_session(agent, session_store, session_id).await?;
+            result.map(|_| ())
+        }
     }
 }
 
@@ -94,14 +98,37 @@ where
                 }
             }
             Ok(None) => {
-                if agent.prompt(input).await.is_err() {
-                    continue;
+                let result = agent.prompt(input).await;
+                checkpoint_session(agent, session_store, session_id).await?;
+                if let Err(error) = result {
+                    eprintln!("Zex turn error: {error:#}");
                 }
             }
             Err(error) => eprintln!("Zex command error: {error:#}"),
         }
     }
 
+    Ok(())
+}
+
+async fn checkpoint_session<P>(
+    agent: &Agent<P>,
+    session_store: &SessionStore,
+    session_id: &mut Option<String>,
+) -> Result<()>
+where
+    P: Provider,
+{
+    *session_id = Some(
+        session_store
+            .save(
+                session_id.as_deref(),
+                agent.model(),
+                agent.thinking_preference(),
+                agent.messages(),
+            )
+            .await?,
+    );
     Ok(())
 }
 
@@ -196,4 +223,142 @@ fn print_event(event: AgentEvent) -> Result<()> {
         AgentEvent::TurnEnd => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::PathBuf,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+    use crate::{
+        agent::{AgentOptions, AssistantMessage, Message},
+        provider::{PreparedRequest, ThinkingLevel, ToolDefinition},
+        tools::ToolRegistry,
+    };
+
+    struct ReplyProvider;
+
+    impl Provider for ReplyProvider {
+        type Request = ();
+
+        fn prepare_request(
+            &self,
+            _model: &str,
+            _thinking_level: ThinkingLevel,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+            max_output_tokens: usize,
+        ) -> Result<PreparedRequest<Self::Request>> {
+            Ok(PreparedRequest::new(
+                messages.iter().map(Message::token_estimate).sum(),
+                max_output_tokens,
+                (),
+            ))
+        }
+
+        async fn complete(
+            &self,
+            _request: Self::Request,
+            _events: &crate::agent::EventSender,
+        ) -> Result<AssistantMessage> {
+            Ok(AssistantMessage {
+                content: "saved answer".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                provider_state: None,
+                usage: None,
+            })
+        }
+    }
+
+    fn temporary_directory() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "zex-headless-checkpoint-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn failed_prompt_is_checkpointed_before_returning() {
+        let directory = temporary_directory();
+        let store = SessionStore::new(directory.clone());
+        let (events, _) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            ReplyProvider,
+            ToolRegistry::new(Duration::from_secs(1), 32_000),
+            events,
+            AgentOptions {
+                model: "test-model".to_owned(),
+                turn_timeout: Duration::from_secs(1),
+                max_turns: 0,
+                max_context_tokens: 8_192,
+                compact_keep_turns: 2,
+                thinking_level: ThinkingLevel::Medium,
+            },
+            None,
+        );
+        let mut session_id = None;
+        let result = run_prompt(
+            &mut agent,
+            "persist interrupted turn".to_owned(),
+            &store,
+            &mut session_id,
+            &directory,
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("configured limit"));
+        assert!(session_id.is_some());
+        let loaded = store.load(session_id.as_deref()).await.unwrap().unwrap();
+        assert_eq!(loaded.messages, agent.messages());
+        assert!(loaded.messages.iter().any(|message| matches!(message, Message::System { content } if content.contains("Turn interrupted:"))));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_prompt_is_checkpointed_before_returning() {
+        let directory = temporary_directory();
+        let store = SessionStore::new(directory.clone());
+        let (events, _) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            ReplyProvider,
+            ToolRegistry::new(Duration::from_secs(1), 32_000),
+            events,
+            AgentOptions {
+                model: "test-model".to_owned(),
+                turn_timeout: Duration::from_secs(1),
+                max_turns: 1,
+                max_context_tokens: 8_192,
+                compact_keep_turns: 2,
+                thinking_level: ThinkingLevel::Medium,
+            },
+            None,
+        );
+        let mut session_id = None;
+
+        run_prompt(
+            &mut agent,
+            "persist this turn".to_owned(),
+            &store,
+            &mut session_id,
+            &directory,
+        )
+        .await
+        .unwrap();
+
+        let loaded = store.load(session_id.as_deref()).await.unwrap().unwrap();
+        assert!(loaded.messages.iter().any(
+            |message| matches!(message, Message::User { content } if content == "persist this turn")
+        ));
+        assert!(loaded.messages.iter().any(
+            |message| matches!(message, Message::Assistant { content, .. } if content == "saved answer")
+        ));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
 }

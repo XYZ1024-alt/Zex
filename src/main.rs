@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -6,19 +8,33 @@ use zex::{
     cli::{Cli, Command},
     config::Config,
     headless,
+    memory::{MemoryEncryptionKey, MemoryRuntime},
     provider::ProviderRegistry,
     session::{SessionStore, format_session_summaries},
-    tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, ToolRegistry, WriteTool},
+    tools::{
+        BashTool, EditTool, GlobTool, GrepTool, ListPointersTool, PinTool, ReadTool, RecallTool,
+        ToolRegistry, UnpinTool, WriteTool,
+    },
     tui,
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let session_store = SessionStore::new(Config::session_dir().await?);
+    let session_store = SessionStore::with_encryption(
+        Config::session_dir().await?,
+        MemoryEncryptionKey::from_environment(),
+    );
 
     if matches!(&cli.command, Some(Command::Sessions)) {
         print_sessions(&session_store).await?;
+        return Ok(());
+    }
+    if let Some(Command::Delete { id }) = &cli.command {
+        if !session_store.delete(id).await? {
+            anyhow::bail!("session {id:?} was not found");
+        }
+        println!("Deleted session {id}.");
         return Ok(());
     }
     let loaded_session = match &cli.command {
@@ -46,6 +62,7 @@ async fn main() -> Result<()> {
         max_tool_output_chars,
         max_context_tokens,
         compact_keep_turns,
+        memory,
         default_thinking_level,
         hide_thinking_block,
         theme,
@@ -64,6 +81,25 @@ async fn main() -> Result<()> {
     let provider_registry = provider.clone();
     let (events, event_receiver) = mpsc::unbounded_channel();
     let mut tools = ToolRegistry::new(tool_timeout, max_tool_output_chars);
+    if memory.enabled {
+        let active_id = match session_id.clone() {
+            Some(id) => id,
+            None => {
+                let id = session_store.allocate_id()?;
+                session_id = Some(id.clone());
+                id
+            }
+        };
+        let runtime = Arc::new(MemoryRuntime::new(memory));
+        runtime
+            .activate(&active_id, session_store.memory_directory(&active_id)?)
+            .await?;
+        tools.set_memory(Arc::clone(&runtime));
+        tools.register(RecallTool::new(Arc::clone(&runtime)));
+        tools.register(PinTool::new(Arc::clone(&runtime)));
+        tools.register(UnpinTool::new(Arc::clone(&runtime)));
+        tools.register(ListPointersTool::new(runtime));
+    }
     tools.register(ReadTool::new(working_dir.clone()));
     tools.register(BashTool::new(working_dir.clone()));
     tools.register(WriteTool::new(working_dir.clone()));
@@ -84,6 +120,7 @@ async fn main() -> Result<()> {
         },
         resumed_messages,
     );
+    agent.initialize_memory().await?;
 
     let (result, event_printer) = if let Some(prompt) = cli.run_prompt() {
         let printer = headless::spawn_event_printer(event_receiver);

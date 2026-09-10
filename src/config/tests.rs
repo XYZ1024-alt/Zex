@@ -25,6 +25,17 @@ const TEST_ENV: &[&str] = &[
     "ZEX_MAX_CONTEXT_CHARS",
     "ZEX_MAX_CONTEXT_TOKENS",
     "ZEX_COMPACT_KEEP_TURNS",
+    "ZEX_MEMORY_ENABLED",
+    "ZEX_MEMORY_MODE",
+    "ZEX_MEMORY_RECALL_RATE_LIMIT",
+    "ZEX_MEMORY_MAX_RECALL_TOKENS",
+    "ZEX_MEMORY_HOT_CACHE_SIZE",
+    "ZEX_MEMORY_AUTO_PIN_IMPORTANT",
+    "ZEX_MEMORY_MAX_AUTO_PINS",
+    "ZEX_MEMORY_MAX_RECORDS",
+    "ZEX_MEMORY_MAX_STORE_BYTES",
+    "ZEX_MEMORY_RETENTION_DAYS",
+    "ZEX_MEMORY_ENCRYPTION_KEY",
     "ZEX_DEFAULT_THINKING_LEVEL",
     "ZEX_HIDE_THINKING_BLOCK",
     "ZEX_SESSION_DIR",
@@ -553,6 +564,90 @@ async fn legacy_max_context_chars_key_and_environment_variable_still_work() {
     let config = Config::load_from(&project, &global).await.unwrap();
     assert_eq!(config.max_context_tokens, 96_000);
 
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_config_merges_and_environment_overrides_runtime_limits() {
+    let _environment = EnvGuard::clear();
+    let root = temp_directory("memory-config");
+    let project = root.join("project");
+    let global = root.join("global");
+    write_config(
+        &global.join("config.toml"),
+        r#"
+[memory]
+enabled = true
+mode = "summary"
+recall_rate_limit = 4
+max_recall_tokens = 1024
+max_inline_tool_tokens = 3000
+hot_cache_size = 8
+auto_pin_important = false
+max_auto_pins = 16
+max_records = 500
+max_store_bytes = 1048576
+retention_days = 60
+"#,
+    )
+    .await;
+    write_config(
+        &project.join(".zex/config.toml"),
+        r#"
+[memory]
+enabled = false
+mode = "pointer_priority"
+max_recall_tokens = 2048
+max_records = 250
+"#,
+    )
+    .await;
+    unsafe {
+        std::env::set_var("ZEX_MEMORY_ENABLED", "true");
+        std::env::set_var("ZEX_MEMORY_RECALL_RATE_LIMIT", "7");
+        std::env::set_var("ZEX_MEMORY_RECALL_PER_TURN_LIMIT", "5");
+        std::env::set_var("ZEX_MEMORY_MAX_AUTO_PINS", "8");
+        std::env::set_var("ZEX_MEMORY_ENCRYPTION_KEY", "test-only-secret");
+    }
+
+    let config = Config::load_from(&project, &global).await.unwrap();
+
+    assert!(config.memory.enabled);
+    assert_eq!(
+        config.memory.mode,
+        crate::memory::MemoryMode::PointerPriority
+    );
+    assert_eq!(config.memory.recall_rate_limit, 7);
+    assert_eq!(config.memory.recall_per_turn_limit, 5);
+    assert_eq!(config.memory.max_recall_tokens, 2_048);
+    // Inline size is independent of the recall window size, and inherits from
+    // the global file when the project does not override it.
+    assert_eq!(config.memory.max_inline_tool_tokens, 3_000);
+    assert_eq!(config.memory.hot_cache_size, 8);
+    assert!(!config.memory.auto_pin_important);
+    assert_eq!(config.memory.max_auto_pins, 8);
+    assert_eq!(config.memory.max_records, 250);
+    assert_eq!(config.memory.max_store_bytes, 1_048_576);
+    assert_eq!(config.memory.retention_days, 60);
+    assert!(config.memory.encryption_key.is_some());
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_can_be_disabled_for_traditional_behavior() {
+    let _environment = EnvGuard::clear();
+    let root = temp_directory("memory-disabled");
+    let project = root.join("project");
+    let global = root.join("global");
+    write_config(
+        &project.join(".zex/config.toml"),
+        "[memory]\nenabled = false\n",
+    )
+    .await;
+
+    let config = Config::load_from(&project, &global).await.unwrap();
+
+    assert!(!config.memory.enabled);
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
