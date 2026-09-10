@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{collections::VecDeque, path::PathBuf, process::Stdio, time::Duration};
 
 use anyhow::{Context, bail};
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
@@ -14,6 +14,8 @@ use crate::{
 pub struct BashTool {
     working_dir: PathBuf,
 }
+
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
 impl BashTool {
     pub fn new(working_dir: PathBuf) -> Self {
@@ -149,9 +151,39 @@ async fn read_output<R>(mut reader: R) -> std::io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut output = Vec::new();
-    reader.read_to_end(&mut output).await?;
-    Ok(output)
+    let half = MAX_CAPTURE_BYTES / 2;
+    let mut head = Vec::new();
+    let mut tail = VecDeque::<u8>::new();
+    let mut total = 0usize;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        total = total.saturating_add(count);
+        let prefix = count.min(half - head.len());
+        head.extend_from_slice(&chunk[..prefix]);
+        let rest = &chunk[prefix..count];
+        let excess = (tail.len() + rest.len()).saturating_sub(half);
+        tail.drain(..excess);
+        tail.extend(rest);
+    }
+    if total > MAX_CAPTURE_BYTES {
+        // A byte limit can split a UTF-8 character at either edge of the gap.
+        if let Err(error) = std::str::from_utf8(&head)
+            && error.error_len().is_none()
+        {
+            head.truncate(error.valid_up_to());
+        }
+        while tail.front().is_some_and(|byte| byte & 0xc0 == 0x80) {
+            tail.pop_front();
+        }
+        let omitted = total - head.len() - tail.len();
+        head.extend_from_slice(format!("\n[shell output truncated: {omitted} bytes omitted; capture limit {MAX_CAPTURE_BYTES} bytes per stream]\n").as_bytes());
+    }
+    head.extend(tail);
+    Ok(head)
 }
 
 /// Decode child-process output. Fast path: strict UTF-8 (unix shells,
@@ -199,6 +231,42 @@ fn decode_legacy_console(bytes: &[u8]) -> String {
 mod tests {
     use crate::tools::Tool;
     use std::{path::PathBuf, time::Duration};
+
+    #[tokio::test]
+    async fn capture_is_bounded_and_preserves_head_and_tail() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let producer = async move {
+            writer.write_all(b"first diagnostic\n").await.unwrap();
+            let chunk = [b'x'; 8192];
+            for _ in 0..1024 {
+                writer.write_all(&chunk).await.unwrap();
+            }
+            writer.write_all(b"\nlast diagnostic").await.unwrap();
+        };
+        let ((), result) = tokio::join!(producer, super::read_output(reader));
+        let output = result.unwrap();
+        assert!(output.len() <= super::MAX_CAPTURE_BYTES + 160);
+        assert!(output.starts_with(b"first diagnostic\n"));
+        assert!(output.ends_with(b"\nlast diagnostic"));
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("shell output truncated:")
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_preserves_short_output_and_utf8_at_truncated_edges() {
+        let short = b"unmodified output\n";
+        assert_eq!(super::read_output(&short[..]).await.unwrap(), short);
+        let text = "中".repeat(super::MAX_CAPTURE_BYTES);
+        let output = super::read_output(text.as_bytes()).await.unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with("中"));
+        assert!(output.ends_with("中"));
+        assert!(output.contains("shell output truncated:"));
+    }
 
     #[test]
     fn process_tree_fixture() {
