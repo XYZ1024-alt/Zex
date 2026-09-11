@@ -3,6 +3,7 @@ mod edit;
 mod glob;
 mod grep;
 mod read;
+mod read_skill;
 mod recall;
 mod write;
 
@@ -29,6 +30,7 @@ pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
+pub use read_skill::ReadSkillTool;
 pub use recall::{ListPointersTool, PinTool, RecallTool, UnpinTool};
 pub use write::WriteTool;
 

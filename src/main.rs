@@ -12,8 +12,8 @@ use zex::{
     provider::ProviderRegistry,
     session::{SessionStore, format_session_summaries},
     tools::{
-        BashTool, EditTool, GlobTool, GrepTool, ListPointersTool, PinTool, ReadTool, RecallTool,
-        ToolRegistry, UnpinTool, WriteTool,
+        BashTool, EditTool, GlobTool, GrepTool, ListPointersTool, PinTool, ReadSkillTool, ReadTool,
+        RecallTool, ToolRegistry, UnpinTool, WriteTool,
     },
     tui,
 };
@@ -106,6 +106,8 @@ async fn main() -> Result<()> {
     tools.register(EditTool::new(working_dir.clone()));
     tools.register(GrepTool::new(working_dir.clone()));
     tools.register(GlobTool::new(working_dir.clone()));
+    let skill_catalog = instructions::catalog(&working_dir).await?;
+    tools.register(ReadSkillTool::new(skill_catalog.into_entries()));
     let system_prompt = instructions::load(&working_dir).await?;
     let mut agent = Agent::new(
         provider,
