@@ -4807,7 +4807,7 @@ fn welcome_wide_uses_hero_box_and_night_palette() {
     write_screen_dump("welcome-wide", &screen);
     let regions = landing_regions(ratatui::layout::Rect::new(0, 0, 104, 24), &app);
 
-    assert!(104 >= HERO_BOX_MIN_WIDTH);
+    assert!(const { 104 >= HERO_BOX_MIN_WIDTH });
     assert!(
         !regions.hero.is_empty(),
         "wide welcome must use the hero box"
@@ -4969,7 +4969,7 @@ fn expanded_tool_and_answer_keep_base_background_and_ascii_glyphs() {
 
     let output_row = screen
         .lines()
-        .position(|row| row.contains("Cargo.toml") && row.contains("path") == false)
+        .position(|row| row.contains("Cargo.toml") && !row.contains("path"))
         .or_else(|| screen.lines().position(|row| row.contains("Cargo.toml")))
         .expect("tool body row") as u16;
     assert_eq!(

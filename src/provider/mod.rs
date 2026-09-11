@@ -922,6 +922,7 @@ pub trait Provider: Send + Sync {
         max_output_tokens: usize,
     ) -> Result<PreparedRequest<Self::Request>>;
 
+    #[allow(async_fn_in_trait)]
     async fn complete(
         &self,
         request: Self::Request,

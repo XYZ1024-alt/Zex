@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 
@@ -63,7 +63,14 @@ pub async fn load(working_dir: &Path) -> Result<String> {
 
 async fn collect_catalog(dir: &Path, entries: &mut BTreeMap<String, PathBuf>) -> Result<()> {
     let mut pending = vec![dir.to_owned()];
+    let mut visited = HashSet::new();
     while let Some(current) = pending.pop() {
+        let identity = tokio::fs::canonicalize(&current)
+            .await
+            .unwrap_or(current.clone());
+        if !visited.insert(identity) {
+            continue;
+        }
         let mut it = tokio::fs::read_dir(&current)
             .await
             .with_context(|| format!("failed to scan skills directory {}", current.display()))?;
@@ -75,14 +82,13 @@ async fn collect_catalog(dir: &Path, entries: &mut BTreeMap<String, PathBuf>) ->
             let path = entry.path();
             if path.is_dir() {
                 pending.push(path);
-            } else if path.file_name().is_some_and(|n| n == "SKILL.md") {
-                if let Some(name) = path
+            } else if path.file_name().is_some_and(|n| n == "SKILL.md")
+                && let Some(name) = path
                     .parent()
                     .and_then(Path::file_name)
                     .and_then(|n| n.to_str())
-                {
-                    entries.insert(name.to_owned(), path);
-                }
+            {
+                entries.insert(name.to_owned(), path);
             }
         }
     }

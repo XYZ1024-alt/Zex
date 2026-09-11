@@ -2040,8 +2040,10 @@ fn transcript_text(app: &App, width: usize) -> TranscriptRender {
                         }
                         pad_line_band(line, content_width);
                     }
-                    let mut padding = Line::default();
-                    padding.style = Style::default().bg(theme().surface);
+                    let mut padding = Line {
+                        style: Style::default().bg(theme().surface),
+                        ..Line::default()
+                    };
                     pad_line_band(&mut padding, content_width);
                     lines.insert(start_line, padding.clone());
                     lines.push(padding);
@@ -2916,6 +2918,7 @@ fn paint_composer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_box_edge(
     frame: &mut Frame<'_>,
     x: u16,
