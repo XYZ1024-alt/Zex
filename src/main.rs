@@ -7,7 +7,7 @@ use zex::{
     agent::{Agent, AgentOptions},
     cli::{Cli, Command},
     config::Config,
-    headless,
+    headless, instructions,
     memory::{MemoryEncryptionKey, MemoryRuntime},
     provider::ProviderRegistry,
     session::{SessionStore, format_session_summaries},
@@ -106,6 +106,7 @@ async fn main() -> Result<()> {
     tools.register(EditTool::new(working_dir.clone()));
     tools.register(GrepTool::new(working_dir.clone()));
     tools.register(GlobTool::new(working_dir.clone()));
+    let system_prompt = instructions::load(&working_dir).await?;
     let mut agent = Agent::new(
         provider,
         tools,
@@ -119,7 +120,8 @@ async fn main() -> Result<()> {
             thinking_level,
         },
         resumed_messages,
-    );
+    )
+    .new_with_system_prompt(system_prompt);
     agent.initialize_memory().await?;
 
     let (result, event_printer) = if let Some(prompt) = cli.run_prompt() {

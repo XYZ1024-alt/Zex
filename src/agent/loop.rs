@@ -129,6 +129,13 @@ where
         agent
     }
 
+    pub fn new_with_system_prompt(mut self, system_prompt: String) -> Self {
+        if let Some(Message::System { content }) = self.messages.first_mut() {
+            *content = system_prompt;
+        }
+        self
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }

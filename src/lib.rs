@@ -3,6 +3,7 @@ pub mod cli;
 pub mod command;
 pub mod config;
 pub mod headless;
+pub mod instructions;
 pub mod memory;
 pub mod provider;
 mod secure;
